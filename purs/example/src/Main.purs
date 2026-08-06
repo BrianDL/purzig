@@ -12,4 +12,4 @@ greet :: String -> String
 greet name = concatString "Hello, " name
 
 main :: Effect Unit
-main = log (greet "test")
+main = log (greet "Zig")

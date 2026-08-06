@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // What the example is expected to print. Both the hand-written target and
+    // the generated code are checked against this, so the two are kept honest
+    // by behaviour rather than by text -- a diff would break on comments,
+    // whitespace, and any edit to Main.purs.
+    const expected_output = "Hello, Zig\n";
+
     // -----------------------------------------------------------------
     // 1. Hand-written Zig modules. No PureScript dependency at all, so
     //    they build and test in parallel with everything else.
@@ -23,9 +29,10 @@ pub fn build(b: *std.Build) void {
     ffi.addImport("runtime", runtime);
 
     // -----------------------------------------------------------------
-    // 2. The hand-written target: what codegen must eventually produce.
-    //    Buildable TODAY, with no spago, purs or node involved. This is
-    //    what validates the runtime API against a real consumer.
+    // 2. The hand-written reference implementation. Buildable with no
+    //    spago, purs or node present -- it is what validated the runtime
+    //    API before codegen existed, and it stays as a fallback way to
+    //    exercise the runtime when the PureScript side is broken.
     // -----------------------------------------------------------------
 
     const expected_exe = b.addExecutable(.{
@@ -40,15 +47,19 @@ pub fn build(b: *std.Build) void {
     expected_exe.root_module.addImport("ffi", ffi);
 
     const run_expected = b.addRunArtifact(expected_exe);
-    const run_expected_step = b.step("run-expected", "Build and run the hand-written target Zig");
+    const run_expected_step = b.step("run-expected", "Build and run the hand-written reference Zig");
     run_expected_step.dependOn(&run_expected.step);
+
+    const check_expected = b.addRunArtifact(expected_exe);
+    check_expected.expectStdOutEqual(expected_output);
+    const check_expected_step = b.step("test-expected", "Check the hand-written reference output");
+    check_expected_step.dependOn(&check_expected.step);
 
     // -----------------------------------------------------------------
     // 3. Build the backend compiler: PureScript -> JavaScript, run on Node.
     //
     //    `spago bundle`, not `spago build`: the example's spago.yaml points
     //    backend.cmd at ../compiler/bundle.js, and only `bundle` produces it.
-    //    Bundling also implies compiling, so this is one step, not two.
     //
     //    `has_side_effects` because spago writes into its own project tree
     //    rather than somewhere Zig controls; spago does its own caching.
@@ -63,10 +74,6 @@ pub fn build(b: *std.Build) void {
 
     // -----------------------------------------------------------------
     // 4. Compile the example through that backend.
-    //
-    //    purs/example/spago.yaml sets `workspace.backend.cmd: node` with the
-    //    compiler bundle as an arg, so spago finds the backend by path and we
-    //    need no PATH shim and no `npm link`.
     // -----------------------------------------------------------------
 
     const codegen = b.addSystemCommand(&.{ "spago", "build" });
@@ -107,17 +114,16 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run.step);
 
     // -----------------------------------------------------------------
-    // 6. Golden check: does the emitter reproduce the hand-written target?
-    //    Expected to FAIL until Zig/Emit.purs is written. That is the point --
-    //    it is the definition of done for the emitter.
+    // 6. End-to-end check: does PureScript source, run through the whole
+    //    pipeline, behave the same as the hand-written reference?
+    //
+    //    Requires purs/example/src/Main.purs to be the unmodified example.
     // -----------------------------------------------------------------
 
-    const golden = b.addSystemCommand(&.{
-        "diff", "-u", "purs/example/expected/Main.zig", "purs/example/output-zig/Main.zig",
-    });
-    golden.step.dependOn(&codegen.step);
-    const golden_step = b.step("test-codegen", "Diff generated Zig against the hand-written target");
-    golden_step.dependOn(&golden.step);
+    const check_generated = b.addRunArtifact(exe);
+    check_generated.expectStdOutEqual(expected_output);
+    const e2e_step = b.step("test-e2e", "Run the full pipeline and check the output");
+    e2e_step.dependOn(&check_generated.step);
 
     // -----------------------------------------------------------------
     // 7. Runtime tests. Independent of the PureScript pipeline:
@@ -137,15 +143,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_tests.step);
 
     // -----------------------------------------------------------------
-    // 8. Housekeeping.
+    // 8. Everything.
+    // -----------------------------------------------------------------
+
+    const all_tests = b.step("test", "Run every check");
+    all_tests.dependOn(&run_runtime_tests.step);
+    all_tests.dependOn(&check_expected.step);
+    all_tests.dependOn(&check_generated.step);
+
+    // -----------------------------------------------------------------
+    // 9. Housekeeping.
     // -----------------------------------------------------------------
 
     const clean = b.addSystemCommand(&.{
-        "rm",                   "-rf",
-        "purs/compiler/output", "purs/compiler/.spago",
-        "purs/compiler/bundle.js",
-        "purs/example/output",  "purs/example/output-zig",
-        "purs/example/.spago",
+        "rm",                       "-rf",
+        "purs/compiler/output",     "purs/compiler/.spago",
+        "purs/compiler/bundle.js",  "purs/example/output",
+        "purs/example/output-zig",  "purs/example/.spago",
     });
     const clean_step = b.step("clean-purs", "Remove PureScript build artefacts");
     clean_step.dependOn(&clean.step);
