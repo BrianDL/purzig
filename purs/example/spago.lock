@@ -5,7 +5,9 @@
         "path": "./",
         "core": {
           "dependencies": [
-            "zig-prelude"
+            {
+              "zig-prelude": "*"
+            }
           ]
         },
         "test": {

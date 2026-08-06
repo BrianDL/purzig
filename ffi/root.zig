@@ -1,9 +1,7 @@
 //! Aggregates every FFI implementation into one module.
 //!
-//! Generated code never imports this directly. Instead, the generated module
-//! for a PureScript module containing `foreign import`s re-exports from here,
-//! which keeps the foreign-import resolution rule in one place.
+//! Keyed by PURESCRIPT MODULE NAME, because that is all the emitter knows at a
+//! use site -- CoreFn carries no package information. Where the Zig file lives
+//! on disk is this file's business alone.
 
-pub const zig_prelude = struct {
-    pub const prim = @import("zig-prelude/prim.zig");
-};
+pub const @"Zig.Prelude" = @import("zig-prelude/prim.zig");
