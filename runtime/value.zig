@@ -125,17 +125,19 @@ pub const Value = union(enum) {
         };
     }
 
+    pub fn asRecord(self: Value) []const Field {
+        return switch (self) {
+            .record => |fields| fields,
+            else => @panic("runtime: expected Record"),
+        };
+    }
+
     /// Record field access, for CoreFn `Accessor`.
     pub fn field(self: Value, name: []const u8) Value {
-        switch (self) {
-            .record => |fields| {
-                for (fields) |f| {
-                    if (std.mem.eql(u8, f.name, name)) return f.value;
-                }
-                @panic("runtime: no such record field");
-            },
-            else => @panic("runtime: expected Record"),
+        for (self.asRecord()) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.value;
         }
+        @panic("runtime: no such record field");
     }
 
     /// Constructor tag test, for CoreFn `ConstructorBinder`.
@@ -168,6 +170,7 @@ test "record field lookup" {
     };
     const rec = Value.mkRecord(&fields);
     try std.testing.expectEqual(@as(i32, 2), rec.field("y").asInt());
+    try std.testing.expectEqual(@as(usize, 2), rec.asRecord().len);
 }
 
 test "data constructor tag and fields" {

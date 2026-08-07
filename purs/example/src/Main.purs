@@ -7,9 +7,10 @@
 module Main where
 
 import Zig.Prelude (Effect, Unit, concatString, log)
+import Scratch (target)
 
 greet :: String -> String
 greet name = concatString "Hello, " name
 
 main :: Effect Unit
-main = log (greet "Zig")
+main = log (greet (target "Zig") )

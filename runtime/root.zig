@@ -25,6 +25,8 @@ pub const apply2 = apply_mod.apply2;
 pub const apply3 = apply_mod.apply3;
 pub const runEffect = apply_mod.runEffect;
 pub const copyValues = apply_mod.copyValues;
+pub const copyFields = apply_mod.copyFields;
+pub const updateRecord = apply_mod.updateRecord;
 pub const concatString = apply_mod.concatString;
 pub const writeLine = apply_mod.writeLine;
 

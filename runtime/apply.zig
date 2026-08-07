@@ -11,6 +11,7 @@ const std = @import("std");
 const value = @import("value.zig");
 
 const Value = value.Value;
+const Field = value.Field;
 
 var io_inst: ?std.Io = null;
 var alloc_inst: ?std.mem.Allocator = null;
@@ -64,6 +65,46 @@ pub fn copyValues(items: []const Value) []const Value {
     const out = alloc().alloc(Value, items.len) catch @panic("runtime: out of memory");
     @memcpy(out, items);
     return out;
+}
+
+/// Copy record fields into the arena. The emitter's field slices are struct
+/// literals -- field NAMES are comptime-known, but the VALUES are not, so
+/// `&.{ ... }` points at a temporary in the enclosing stack frame. Anything
+/// storing that slice in a returned Value must copy it first.
+pub fn copyFields(fields: []const Field) []const Field {
+    if (fields.len == 0) return &.{};
+    const out = alloc().alloc(Field, fields.len) catch @panic("runtime: out of memory");
+    @memcpy(out, fields);
+    return out;
+}
+
+/// CoreFn `ObjectUpdate`: a fresh record with some fields replaced.
+///
+/// Copy-on-write over the field slice, preserving the base record's field
+/// order. PureScript's record update syntax is type-checked, so every update
+/// key must already exist in the base -- a miss is a backend bug, and panics
+/// like the accessors do rather than silently adding or dropping a field.
+///
+/// Quadratic in field count, which is fine: records are small, and the inner
+/// loop is over the updates, which are usually one.
+pub fn updateRecord(base: Value, updates: []const Field) Value {
+    const fields = base.asRecord();
+    const out = alloc().alloc(Field, fields.len) catch @panic("runtime: out of memory");
+
+    var matched: usize = 0;
+    for (fields, out) |f, *slot| {
+        slot.* = f;
+        for (updates) |u| {
+            if (std.mem.eql(u8, u.name, f.name)) {
+                slot.* = u;
+                matched += 1;
+                break;
+            }
+        }
+    }
+    if (matched != updates.len) @panic("runtime: record update names a field the record does not have");
+
+    return Value.mkRecord(out);
 }
 
 /// Concatenate two strings into the arena. Backs `Semigroup String`.
@@ -120,4 +161,39 @@ test "string concatenation" {
     defer arena.deinit();
     init(std.testing.io, arena.allocator());
     try std.testing.expectEqualStrings("ab", concatString("a", "b"));
+}
+
+test "copyFields survives its source going out of scope" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const rec = blk: {
+        // A stack temporary, exactly like the emitter's `&.{ ... }`.
+        const literal = [_]Field{.{ .name = "x", .value = Value.mkInt(1) }};
+        break :blk Value.mkRecord(copyFields(&literal));
+    };
+    try std.testing.expectEqual(@as(i32, 1), rec.field("x").asInt());
+    try std.testing.expectEqual(@as(usize, 0), copyFields(&.{}).len);
+}
+
+test "updateRecord overrides in place and leaves the base alone" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const base = Value.mkRecord(&[_]Field{
+        .{ .name = "x", .value = Value.mkInt(1) },
+        .{ .name = "y", .value = Value.mkInt(2) },
+        .{ .name = "z", .value = Value.mkInt(3) },
+    });
+    const updated = updateRecord(base, &.{.{ .name = "y", .value = Value.mkInt(20) }});
+
+    try std.testing.expectEqual(@as(i32, 1), updated.field("x").asInt());
+    try std.testing.expectEqual(@as(i32, 20), updated.field("y").asInt());
+    try std.testing.expectEqual(@as(i32, 3), updated.field("z").asInt());
+    try std.testing.expectEqual(@as(i32, 2), base.field("y").asInt());
+
+    // Field order is the base's, not the update's.
+    try std.testing.expectEqualStrings("y", updated.asRecord()[1].name);
 }

@@ -8,8 +8,9 @@
 -- |    plus a captured `[]const rt.Value`. Computing which locals to capture
 -- |    (`freeVars` below) is the only real algorithm here.
 -- |
--- | Not yet implemented: Case, ObjectUpdate, recursive let. Each returns a
--- | Left naming itself rather than emitting something subtly wrong.
+-- | Case is partially implemented: Boolean literal binders, VarBinder and
+-- | NullBinder only, which is enough for `if`. Other binders and guards return
+-- | a Left naming themselves rather than emitting something subtly wrong.
 -- |
 -- | NAMING HAZARD: nothing in this module may be called `bind` or `discard`.
 -- | Do-notation desugars to functions of exactly those names, so a parameter
@@ -19,7 +20,7 @@ module Zig.Emit (emitModule) where
 
 import Prelude
 
-import CoreFn.Types (Bind(..), Binder(..), Expr(..), Literal(..), Module, Result(..))
+import CoreFn.Types (Bind(..), Binder(..), CaseAlternative, Expr(..), Literal(..), Module, Result(..))
 import Data.Array (concat, cons, elem, filter, findMap, length, mapWithIndex, nub, null, snoc, sort, uncons)
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), isJust)
@@ -182,9 +183,14 @@ emitExpr ctx st expr = case expr of
 
   Let l -> emitLet ctx st l.binds l.expression
 
-  Case _ -> Left "Case is not implemented yet"
+  Case c -> emitCase ctx st c.caseExpressions c.caseAlternatives
 
-  ObjectUpdate _ -> Left "ObjectUpdate is not implemented yet (needs rt.updateRecord)"
+  -- rt.updateRecord copies into the arena itself, so the literal slice of
+  -- updates does not need copyFields the way a bare record literal does.
+  ObjectUpdate o -> do
+    e <- emitExpr ctx st o.expression
+    fs <- emitFields ctx e.st o.updates
+    pure { text: "rt.updateRecord(" <> e.text <> ", " <> fs.text <> ")", st: fs.st }
 
 emitLit :: Ctx -> St -> Literal Expr -> Either String Out
 emitLit ctx st literal = case literal of
@@ -202,14 +208,24 @@ emitLit ctx st literal = case literal of
       }
 
   LitObject fields -> do
-    parts <- emitList ctx st (map _.value fields)
-    let
-      renderField k v = ".{ .name = " <> Ident.stringLit k <> ", .value = " <> v <> " }"
-      pairs = mapWithIndex (\i k -> renderField k (indexOr "" parts.texts i)) (map _.key fields)
+    fs <- emitFields ctx st fields
     pure
-      { text: "rt.Value.mkRecord(&.{ " <> joinWith ", " pairs <> " })"
-      , st: parts.st
+      { text: "rt.Value.mkRecord(rt.copyFields(" <> fs.text <> "))"
+      , st: fs.st
       }
+
+-- | The Zig syntax for a field slice, shared by record literals and record
+-- | update. Field NAMES are comptime-known, so this can be a struct literal --
+-- | but the VALUES are not, so `&.{ ... }` points at a stack temporary in the
+-- | enclosing function. Whatever consumes it must copy into the arena first,
+-- | exactly as LitArray already does via copyValues.
+emitFields :: Ctx -> St -> Array { key :: String, value :: Expr } -> Either String Out
+emitFields ctx st fields = do
+  parts <- emitList ctx st (map _.value fields)
+  let
+    renderField k v = ".{ .name = " <> Ident.stringLit k <> ", .value = " <> v <> " }"
+    pairs = mapWithIndex (\i k -> renderField k (indexOr "" parts.texts i)) (map _.key fields)
+  pure { text: "&.{ " <> joinWith ", " pairs <> " }", st: parts.st }
 
 indexOr :: String -> Array String -> Int -> String
 indexOr fallback xs i =
@@ -253,7 +269,7 @@ emitAbs ctx st argument body = do
         )
     envExpr =
       if null captured then "rt.no_env"
-      else "rt.copyValues(&.{ " <> joinWith ", " (map Ident.local captured) <> " })"
+      else "rt.copyValues(&.{ " <> joinWith ", " (map (scopeText ctx) captured) <> " })"
 
   pure
     { text: "rt.Value.mkClosure(" <> fnName <> ", " <> envExpr <> ")"
@@ -308,14 +324,19 @@ type LetAcc =
 
 emitLet :: Ctx -> St -> Array Bind -> Expr -> Either String Out
 emitLet ctx st binds body = do
-  acc <- emitLetBinds ctx st binds
+  let
+    -- Zig block labels share one namespace within a function, so a fixed "blk"
+    -- collides as soon as one Let nests inside another. Take a fresh one from
+    -- the same counter the lifted lambdas use.
+    label = "blk" <> show st.counter
+  acc <- emitLetBinds ctx (st { counter = st.counter + 1 }) binds
   bodyOut <- emitExpr acc.ctx acc.st body
   pure
     { text:
         joinWith "\n"
-          ( [ "blk: {" ]
+          ( [ label <> ": {" ]
               <> acc.lines
-              <> [ "        break :blk " <> bodyOut.text <> ";", "    }" ]
+              <> [ "        break :" <> label <> " " <> bodyOut.text <> ";", "    }" ]
           )
     , st: bodyOut.st
     }
@@ -324,7 +345,10 @@ emitLetBinds :: Ctx -> St -> Array Bind -> Either String LetAcc
 emitLetBinds ctx st binds = case uncons binds of
   Nothing -> Right { ctx, st, lines: [] }
   Just { head, tail } -> case head of
-    Rec _ -> Left "recursive let bindings are not implemented yet"
+    Rec group -> do
+      one <- emitRecLet ctx st group
+      rest <- emitLetBinds one.ctx one.st tail
+      pure { ctx: rest.ctx, st: rest.st, lines: one.lines <> rest.lines }
     NonRec ident expr -> do
       o <- emitExpr ctx st expr
       let
@@ -340,8 +364,239 @@ emitLetBinds ctx st binds = case uncons binds of
         , lines: cons ("        const " <> zig <> " = " <> o.text <> ";") rest.lines
         }
 
+-- | Pattern matching, structured after the compiler's own JS backend: bind the
+-- | scrutinees to temporaries, then emit each alternative as a nested chain of
+-- | tests that falls through to the next alternative on failure, with a panic
+-- | at the end.
+-- |
+-- | The key borrowed idea is that a binder does not produce a (test,
+-- | destructure) pair. It WRAPS a continuation -- the code to run once this
+-- | binder has matched. Nested binders then compose for free, because a
+-- | sub-binder is emitted inside the bindings its parent introduced.
+-- |
+-- | A Zig labelled block gives us the equivalent of the JS backend's
+-- | immediately-invoked function: `break :label` plays the part of `return`.
+emitCase :: Ctx -> St -> Array Expr -> Array CaseAlternative -> Either String Out
+emitCase ctx st scrutinees alts = do
+  let
+    n = st.counter
+    label = "case" <> show n
+    tmpFor i = Ident.local ("c." <> show n <> "." <> show i)
+
+  parts <- emitList ctx (st { counter = st.counter + 1 }) scrutinees
+
+  let
+    tmpLines =
+      mapWithIndex (\i t -> "        const " <> tmpFor i <> " = " <> t <> ";") parts.texts
+
+  body <- emitAlts ctx parts.st label tmpFor alts
+
+  let
+    fallthrough =
+      if body.canFail then [ "        @panic(\"pattern match failure\");" ] else []
+
+  pure
+    { text:
+        joinWith "\n"
+          ( [ label <> ": {" ]
+              <> tmpLines
+              <> body.lines
+              <> fallthrough
+              <> [ "    }" ]
+          )
+    , st: body.st
+    }
+
+-- | `canFail` is whether this chain of lines can fall through to whatever
+-- | comes after it. An alternative whose binders emit no test always matches,
+-- | which makes both the following alternatives and the trailing panic
+-- | unreachable -- and Zig rejects unreachable code outright.
+type Lines = { lines :: Array String, st :: St, canFail :: Boolean }
+
+emitAlts :: Ctx -> St -> String -> (Int -> String) -> Array CaseAlternative -> Either String Lines
+emitAlts ctx st label tmpFor alts = case uncons alts of
+  Nothing -> Right { lines: [], st, canFail: true }
+  Just { head, tail } -> do
+    one <- emitAlt ctx st label tmpFor head
+    if not one.canFail then
+      -- This alternative always matches; anything after it is dead code.
+      pure one
+    else do
+      rest <- emitAlts ctx one.st label tmpFor tail
+      pure { lines: one.lines <> rest.lines, st: rest.st, canFail: rest.canFail }
+
+emitAlt :: Ctx -> St -> String -> (Int -> String) -> CaseAlternative -> Either String Lines
+emitAlt ctx st label tmpFor alt =
+  emitBinders ctx st tmpFor 0 alt.binders \ctx' st' ->
+    case alt.result of
+      Unconditional e -> do
+        o <- emitExpr ctx' st' e
+        pure
+          { lines: [ "        break :" <> label <> " " <> o.text <> ";" ]
+          , st: o.st
+          , canFail: false
+          }
+      Guarded _ -> Left "guarded case alternatives are not implemented yet"
+
+-- | Fold the binders of one alternative, threading scope through the
+-- | continuation. Falling off the end of `binders` means the alternative
+-- | matched.
+emitBinders
+  :: Ctx
+  -> St
+  -> (Int -> String)
+  -> Int
+  -> Array Binder
+  -> (Ctx -> St -> Either String Lines)
+  -> Either String Lines
+emitBinders ctx st tmpFor i binders k = case uncons binders of
+  Nothing -> k ctx st
+  Just { head, tail } ->
+    emitBinder ctx st (tmpFor i) head \ctx' st' ->
+      emitBinders ctx' st' tmpFor (i + 1) tail k
+
+-- | Emit one binder against the Zig expression `subject`, wrapping the
+-- | continuation in whatever test and bindings it needs.
+emitBinder :: Ctx -> St -> String -> Binder -> (Ctx -> St -> Either String Lines) -> Either String Lines
+emitBinder ctx st subject binder k = case binder of
+  NullBinder -> k ctx st
+
+  VarBinder ident -> do
+    let
+      zig =
+        if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show st.counter)
+        else Ident.local ident
+      ctx' = ctx { scope = cons { ps: ident, zig } ctx.scope }
+    inner <- k ctx' (st { counter = st.counter + 1 })
+    pure
+      { lines: cons ("        const " <> zig <> " = " <> subject <> ";") inner.lines
+      , st: inner.st
+      , canFail: inner.canFail
+      }
+
+  LiteralBinder literal -> case literal of
+    LitBoolean b ->
+      wrapTest (subject <> ".asBool() == " <> (if b then "true" else "false")) ctx st k
+    _ -> Left "only Boolean literal binders are implemented so far"
+
+  NamedBinder _ _ -> Left "NamedBinder is not implemented yet"
+  ConstructorBinder _ -> Left "ConstructorBinder is not implemented yet"
+
+-- | A test that must hold for the alternative to match. Failure falls through
+-- | to whatever the enclosing block emits next, which is the next alternative.
+wrapTest :: String -> Ctx -> St -> (Ctx -> St -> Either String Lines) -> Either String Lines
+wrapTest test ctx st k = do
+  inner <- k ctx st
+  pure
+    { lines: [ "        if (" <> test <> ") {" ] <> inner.lines <> [ "        }" ]
+    , st: inner.st
+    , canFail: true
+    }
+
+-- | A recursive `let` group. Local mutual recursion cannot be expressed with
+-- | `const`, so the whole group is lifted to top-level functions sharing one
+-- | environment -- the union of the members' free variables, minus the members
+-- | themselves.
+-- |
+-- | The trick that makes self-reference terminate: within the group, a member
+-- | is `rt.Value.mkClosure(fn, env)`, a VALUE, not a call. Emitting a call
+-- | would re-enter the function being defined while building its own capture
+-- | list and loop forever.
+-- |
+-- | Only `Abs` members are supported. A non-function recursive binding
+-- | diverges under strict evaluation regardless; upstream backends handle that
+-- | with the compiler's laziness transform, which turns the divergence into a
+-- | runtime error. That transform is a backend responsibility -- CoreFn hands
+-- | over the raw `Rec` group -- and is not implemented here.
+emitRecLet :: Ctx -> St -> Array { identifier :: String, expression :: Expr } -> Either String LetAcc
+emitRecLet ctx st group = do
+  let
+    names = map _.identifier group
+    base = ctx.prefix <> ".rec" <> show st.counter
+    fnNameFor i = Ident.lifted (base <> "." <> show i)
+
+    -- Free variables of the whole group, so every member shares one env layout.
+    captured =
+      filter (\n -> not (elem n names) && isJust (lookupScope ctx n))
+        (sort (nub (concat (map (\b -> freeVars b.expression) group))))
+
+    -- Inside a lifted member, siblings resolve through that member's own `env`.
+    memberScope = mapWithIndex (\i n -> { ps: n, zig: mkClosureOf (fnNameFor i) "env" }) names
+    innerBase = memberScope <> map (\n -> { ps: n, zig: Ident.local n }) captured
+    envBindings = mapWithIndex (\i n -> "    const " <> Ident.local n <> " = env[" <> show i <> "];") captured
+
+    envName = Ident.local ("env." <> show st.counter)
+    envText = if null captured then "rt.no_env" else envName
+
+  defs <- emitRecMembers ctx (st { counter = st.counter + 1 }) fnNameFor innerBase envBindings
+    (mapWithIndex (\i b -> { i, b }) group)
+
+  let
+    envLine =
+      if null captured then []
+      else
+        [ "        const " <> envName <> " = rt.copyValues(&.{ "
+            <> joinWith ", " (map (scopeText ctx) captured)
+            <> " });"
+        ]
+    memberLines =
+      mapWithIndex
+        (\i n -> "        const " <> Ident.local n <> " = " <> mkClosureOf (fnNameFor i) envText <> ";")
+        names
+
+  pure
+    { ctx: ctx { scope = map (\n -> { ps: n, zig: Ident.local n }) names <> ctx.scope }
+    , st: defs
+    , lines: envLine <> memberLines
+    }
+
+mkClosureOf :: String -> String -> String
+mkClosureOf fnName env = "rt.Value.mkClosure(" <> fnName <> ", " <> env <> ")"
+
+emitRecMembers
+  :: Ctx
+  -> St
+  -> (Int -> String)
+  -> Array Scoped
+  -> Array String
+  -> Array { i :: Int, b :: { identifier :: String, expression :: Expr } }
+  -> Either String St
+emitRecMembers ctx st fnNameFor innerBase envBindings members =
+  case uncons members of
+    Nothing -> Right st
+    Just { head, tail } -> case head.b.expression of
+      Abs a -> do
+        let
+          argZig = Ident.local a.argument
+          innerScope = cons { ps: a.argument, zig: argZig } innerBase
+        bodyOut <- emitExpr (ctx { scope = innerScope }) st a.body
+        let
+          def =
+            joinWith "\n"
+              ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Value {" ]
+                  <> (if null envBindings then [ "    _ = env;" ] else envBindings)
+                  <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
+              )
+        emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings tail
+      _ ->
+        Left
+          ( "recursive let binding `" <> head.b.identifier
+              <> "` is not a function; only function bindings are supported"
+          )
+
 lookupScope :: Ctx -> String -> Maybe String
 lookupScope ctx name = findMap (\e -> if e.ps == name then Just e.zig else Nothing) ctx.scope
+
+-- | How a locally-bound name is written *at a use site in the current scope*.
+-- |
+-- | Not always `Ident.local name`: a shadowed let binder carries a suffix, and
+-- | a recursive-let member is a whole `mkClosure` expression. Anything building
+-- | a capture list must go through here rather than reconstructing the name,
+-- | or it will reference an identifier that was never declared.
+scopeText :: Ctx -> String -> String
+scopeText ctx name = case lookupScope ctx name of
+  Just zig -> zig
+  Nothing -> Ident.local name
 
 -- | Locally-bound names referenced in an expression. Module-qualified Vars are
 -- | never free -- they compile to calls, not captures.
