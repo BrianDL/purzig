@@ -8,9 +8,7 @@
 -- |    plus a captured `[]const rt.Value`. Computing which locals to capture
 -- |    (`freeVars` below) is the only real algorithm here.
 -- |
--- | Case is partially implemented: Boolean literal binders, VarBinder and
--- | NullBinder only, which is enough for `if`. Other binders and guards return
--- | a Left naming themselves rather than emitting something subtly wrong.
+-- | All CoreFn expression nodes are implemented as of Stage 2.
 -- |
 -- | NAMING HAZARD: nothing in this module may be called `bind` or `discard`.
 -- | Do-notation desugars to functions of exactly those names, so a parameter
@@ -436,7 +434,30 @@ emitAlt ctx st label tmpFor alt =
           , st: o.st
           , canFail: false
           }
-      Guarded _ -> Left "guarded case alternatives are not implemented yet"
+      Guarded guards -> emitGuards ctx' st' label guards
+
+-- | Guards are conditions on an alternative, not new alternatives: if every
+-- | guard fails, matching continues at the NEXT alternative rather than
+-- | panicking. So a guarded alternative can always fall through, whatever its
+-- | binders did.
+emitGuards
+  :: Ctx -> St -> String -> Array { guard :: Expr, expression :: Expr } -> Either String Lines
+emitGuards ctx st label guards = case uncons guards of
+  Nothing -> Right { lines: [], st, canFail: true }
+  Just { head, tail } -> do
+    g <- emitExpr ctx st head.guard
+    e <- emitExpr ctx g.st head.expression
+    rest <- emitGuards ctx e.st label tail
+    pure
+      { lines:
+          [ "        if (" <> g.text <> ".asBool()) {"
+          , "        break :" <> label <> " " <> e.text <> ";"
+          , "        }"
+          ]
+            <> rest.lines
+      , st: rest.st
+      , canFail: true
+      }
 
 -- | Fold the binders of one alternative, threading scope through the
 -- | continuation. Falling off the end of `binders` means the alternative
@@ -477,10 +498,47 @@ emitBinder ctx st subject binder k = case binder of
   LiteralBinder literal -> case literal of
     LitBoolean b ->
       wrapTest (subject <> ".asBool() == " <> (if b then "true" else "false")) ctx st k
-    _ -> Left "only Boolean literal binders are implemented so far"
+    LitInt n ->
+      wrapTest (subject <> ".asInt() == " <> show n) ctx st k
+    LitNumber n ->
+      wrapTest (subject <> ".asNumber() == " <> show n) ctx st k
+    LitChar c ->
+      wrapTest (subject <> ".asChar() == " <> Ident.stringLit c <> "[0]") ctx st k
+    LitString s ->
+      wrapTest (subject <> ".stringEq(" <> Ident.stringLit s <> ")") ctx st k
 
-  NamedBinder _ _ -> Left "NamedBinder is not implemented yet"
-  ConstructorBinder _ -> Left "ConstructorBinder is not implemented yet"
+    -- An array binder is refutable on length, then positional.
+    LitArray items ->
+      wrapTest (subject <> ".asArray().len == " <> show (length items)) ctx st
+        \ctx' st' ->
+          emitBinders ctx' st' (\i -> subject <> ".asArray()[" <> show i <> "]") 0 items k
+
+    -- A record binder needs no test: the type checker guarantees the fields.
+    LitObject fields ->
+      emitBinders ctx st
+        (\i -> subject <> ".field(" <> Ident.stringLit (indexOr "" (map _.key fields) i) <> ")")
+        0
+        (map _.value fields)
+        k
+
+  -- Bind the whole subject, then keep matching it against the inner binder.
+  NamedBinder ident inner -> do
+    let
+      zig =
+        if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show st.counter)
+        else Ident.local ident
+      ctx' = ctx { scope = cons { ps: ident, zig } ctx.scope }
+    rest <- emitBinder ctx' (st { counter = st.counter + 1 }) subject inner k
+    pure
+      { lines: cons ("        const " <> zig <> " = " <> subject <> ";") rest.lines
+      , st: rest.st
+      , canFail: rest.canFail
+      }
+
+  ConstructorBinder c ->
+    wrapTest (subject <> ".hasTag(" <> Ident.stringLit c.constructorName.identifier <> ")") ctx st
+      \ctx' st' ->
+        emitBinders ctx' st' (\i -> subject <> ".arg(" <> show i <> ")") 0 c.binders k
 
 -- | A test that must hold for the alternative to match. Failure falls through
 -- | to whatever the enclosing block emits next, which is the next alternative.

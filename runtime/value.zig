@@ -125,6 +125,27 @@ pub const Value = union(enum) {
         };
     }
 
+    pub fn asChar(self: Value) u21 {
+        return switch (self) {
+            .char => |c| c,
+            else => @panic("runtime: expected Char"),
+        };
+    }
+
+    pub fn asArray(self: Value) []const Value {
+        return switch (self) {
+            .array => |items| items,
+            else => @panic("runtime: expected Array"),
+        };
+    }
+
+    /// String equality, for `LiteralBinder` on String. On `Value` rather than
+    /// emitted as `std.mem.eql` inline, because only the entry module imports
+    /// std -- and generated code is meant to touch nothing but `rt`.
+    pub fn stringEq(self: Value, other: []const u8) bool {
+        return std.mem.eql(u8, self.asString(), other);
+    }
+
     pub fn asRecord(self: Value) []const Field {
         return switch (self) {
             .record => |fields| fields,
@@ -171,6 +192,15 @@ test "record field lookup" {
     const rec = Value.mkRecord(&fields);
     try std.testing.expectEqual(@as(i32, 2), rec.field("y").asInt());
     try std.testing.expectEqual(@as(usize, 2), rec.asRecord().len);
+
+    try std.testing.expect(Value.mkString("skip").stringEq("skip"));
+    try std.testing.expect(!Value.mkString("skip").stringEq("skop"));
+
+    const items = [_]Value{ Value.mkInt(7), Value.mkChar('q') };
+    const arr = Value.mkArray(&items);
+    try std.testing.expectEqual(@as(usize, 2), arr.asArray().len);
+    try std.testing.expectEqual(@as(i32, 7), arr.asArray()[0].asInt());
+    try std.testing.expectEqual(@as(u21, 'q'), arr.asArray()[1].asChar());
 }
 
 test "data constructor tag and fields" {
