@@ -9,6 +9,7 @@ const std = @import("std");
 
 const value = @import("value.zig");
 const apply_mod = @import("apply.zig");
+const curry_mod = @import("curry.zig");
 
 pub const Value = value.Value;
 pub const Field = value.Field;
@@ -27,10 +28,13 @@ pub const runEffect = apply_mod.runEffect;
 pub const copyValues = apply_mod.copyValues;
 pub const copyFields = apply_mod.copyFields;
 pub const updateRecord = apply_mod.updateRecord;
+pub const curry = curry_mod.curry;
+pub const effect = curry_mod.effect;
 pub const concatString = apply_mod.concatString;
 pub const writeLine = apply_mod.writeLine;
 
 test {
     _ = value;
     _ = apply_mod;
+    _ = curry_mod;
 }
