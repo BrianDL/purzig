@@ -1,0 +1,9 @@
+{
+  "name": "purs-backend-zig",
+  "version": "0.0.0",
+  "private": true,
+  "description": "PureScript backend targeting Zig",
+  "bin": {
+    "purs-backend-zig": "./bundle.js"
+  }
+}

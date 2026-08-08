@@ -1,0 +1,22 @@
+# Workspace B: user code, compiled through the Zig backend.
+#
+# `workspace.backend.cmd` is the whole integration point. Spago runs
+# `purs compile --codegen corefn` and then execs this command from THIS
+# directory. Pointing it at node + the compiler bundle avoids needing a
+# `purs-backend-zig` executable on PATH, so there is no npm link step.
+#
+# Note the dependency list: zig-prelude only. Nothing from the registry, so
+# nothing here needs JavaScript FFI translated into Zig.
+package:
+  name: example
+  dependencies:
+    - zig-prelude: "*"
+
+workspace:
+  extraPackages:
+    zig-prelude:
+      path: ../lib/zig-prelude
+  backend:
+    cmd: node
+    args:
+      - ../compiler/bundle.js

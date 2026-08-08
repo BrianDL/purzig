@@ -1,0 +1,12 @@
+# A shared package with NO `workspace:` key, so it can be pulled into several
+# workspaces via `extraPackages: path:` (the polyrepo pattern from the Spago
+# docs).
+#
+# Deliberately ZERO dependencies -- not even `prelude`. Depending on the real
+# prelude would mean every one of its `foreign import`s needs a Zig
+# implementation before anything compiles at all. Instead this package declares
+# its own Unit and Effect, so the example needs no upstream package with
+# JavaScript FFI. Growing toward the real prelude is a later, incremental job.
+package:
+  name: zig-prelude
+  dependencies: []

@@ -1,0 +1,29 @@
+{
+  "workspace": {
+    "packages": {
+      "example": {
+        "path": "./",
+        "core": {
+          "dependencies": [
+            "zig-prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      }
+    },
+    "extra_packages": {
+      "zig-prelude": {
+        "path": "../lib/zig-prelude"
+      }
+    }
+  },
+  "packages": {
+    "zig-prelude": {
+      "type": "local",
+      "path": "../lib/zig-prelude",
+      "dependencies": []
+    }
+  }
+}

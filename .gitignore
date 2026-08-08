@@ -1,0 +1,18 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# PureScript / Spago
+output/
+output-zig/
+.spago/
+bundle.js
+node_modules/
+
+# devenv
+.devenv/
+.devenv.flake.nix
+.direnv/
+
+
+.envrc

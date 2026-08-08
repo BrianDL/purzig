@@ -1,0 +1,9 @@
+{
+  "name": "purs-backend-zig-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Toolchain pins. devenv installs these on shell entry; nothing is global.",
+  "devDependencies": {
+    "spago": "^1.0.0"
+  }
+}
