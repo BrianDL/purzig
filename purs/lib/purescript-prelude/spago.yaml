@@ -1,0 +1,17 @@
+# purescript-prelude 6.0.2, vendored so it can ship Zig FFI.
+#
+# The .purs sources are unmodified upstream. What this package adds is a .zig
+# file beside each module that has `foreign import`s -- the same pairing the
+# JavaScript backend uses for .js and purerl for .erl. Registry packages ship
+# JavaScript, and files cannot be added to a registry package, so a backend
+# that needs different FFI has to carry its own copy. purerl solves this with a
+# whole forked package set; this is the same idea at one-package scale.
+#
+# No `workspace:` key, so it can be pulled into any workspace via
+# `extraPackages: path:`, exactly like zig-prelude.
+#
+# Upstream: https://github.com/purescript/purescript-prelude (v6.0.2)
+# LICENSE is copied verbatim and must travel with these sources.
+package:
+  name: prelude
+  dependencies: []

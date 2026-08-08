@@ -31,7 +31,7 @@ import Data.Argonaut.Core (Json)
 import Data.Argonaut.Decode (JsonDecodeError(..), decodeJson, (.:), (.:?))
 import Data.Array (filter)
 import Data.Either (Either(..))
-import Data.Maybe (Maybe)
+import Data.Maybe (Maybe(..))
 import Data.String (joinWith)
 import Data.Traversable (traverse)
 
@@ -260,7 +260,30 @@ decodeBinder json = do
       constructorName <- decodeQualified constructorNameJson
       bindersJson <- o .: "binders"
       binders <- traverse decodeBinder bindersJson
-      pure (ConstructorBinder { typeName, constructorName, binders })
+      isNewtype <- decodeIsNewtype json
+      pure (ConstructorBinder { typeName, constructorName, binders, isNewtype })
 
     other ->
       Left (TypeMismatch ("unknown binderType: " <> other))
+
+-- | Does this node's annotation carry `meta: { metaType: "IsNewtype" }`?
+-- |
+-- | The shape is `{ "annotation": { "sourceSpan": ..., "meta": null } }`, where
+-- | `meta` is null for almost every node and an object with a `metaType` string
+-- | otherwise. Every level is read with `.:?` so that a null or absent field
+-- | reads as False instead of failing: a spurious False merely leaves the tag
+-- | test that was already being emitted, whereas a decode error would drop the
+-- | entire module.
+decodeIsNewtype :: Json -> Decoded Boolean
+decodeIsNewtype json = do
+  o <- decodeJson json
+  annotation <- o .:? "annotation"
+  case annotation of
+    Nothing -> pure false
+    Just a -> do
+      meta <- a .:? "meta"
+      case meta of
+        Nothing -> pure false
+        Just m -> do
+          metaType <- m .:? "metaType"
+          pure (metaType == Just "IsNewtype")

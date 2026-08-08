@@ -1,3 +1,4 @@
+-- FILE: purs/compiler/src/Zig/Emit.purs
 -- | CoreFn.Types -> Zig source text. See docs/codegen.md for the rules.
 -- |
 -- | Two structural facts drive the whole design:
@@ -23,6 +24,8 @@ import Data.Array (concat, cons, elem, filter, findMap, length, mapWithIndex, nu
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), isJust)
 import Data.String (joinWith)
+import Data.String as String
+import Data.String.Pattern (Pattern(..))
 import Zig.Ident as Ident
 
 -- | Emitter state threaded left-to-right: a counter for fresh names, and the
@@ -63,9 +66,9 @@ emitModule m = do
       ]
         <> (if isEntry then [ "const std = @import(\"std\");" ] else [])
         <> [ "const rt = @import(\"runtime\");" ]
-        <> (if null m.foreigns then [] else [ "const ffi = @import(\"ffi\");" ])
+        <> (if null m.foreigns then [] else [ "const ffi = @import(\"" <> Ident.ffiFile m.name <> "\");" ])
         <> [ "" ]
-        <> map importLine m.imports
+        <> map importLine (filter (not <<< isPrim) m.imports)
         <> [ "" ]
 
     entry =
@@ -81,7 +84,7 @@ emitModule m = do
   pure
     ( joinWith "\n"
         ( header
-            <> map (foreignLine m.name) m.foreigns
+            <> map foreignLine m.foreigns
             <> result.st.lifted
             <> result.defs
             <> entry
@@ -93,19 +96,26 @@ importLine :: String -> String
 importLine name =
   "const " <> Ident.moduleRef name <> " = @import(\"" <> Ident.moduleFile name <> "\");"
 
--- | The ffi module keys on the bare PureScript module name, with no "mod."
--- | prefix -- it is a field of `ffi`, not a file-level binding.
-ffiRef :: String -> String
-ffiRef moduleName = "ffi.@\"" <> moduleName <> "\""
+-- | `Prim` and everything under it -- Prim.Row, Prim.RowList, Prim.Symbol,
+-- | Prim.Ordering, Prim.TypeError and the rest -- are compiler fictions with
+-- | no CoreFn behind them. Every module imports at least one, and emitting an
+-- | import produces a reference to a file that will never exist.
+isPrim :: String -> Boolean
+isPrim name = name == "Prim" || isJust (String.stripPrefix (Pattern "Prim.") name)
 
 -- | A foreign import has no CoreFn body, so it becomes a re-export from the
--- | ffi module -- as a nullary function, so that it is referenced exactly like
--- | a generated binding.
-foreignLine :: String -> String -> String
-foreignLine moduleName name =
+-- | module's own FFI file -- as a nullary function, so that it is referenced
+-- | exactly like a generated binding.
+-- |
+-- | The FFI file is written beside the `.purs` source and copied into the
+-- | output directory by the driver, which is how every other backend works:
+-- | `Foo/Bar.purs` pairs with `Foo/Bar.js` for JS and `Foo/Bar.erl` for
+-- | purerl. A package therefore ships its own FFI and needs no registration.
+foreignLine :: String -> String
+foreignLine name =
   joinWith "\n"
     [ "pub fn " <> Ident.topLevel name <> "() rt.Value {"
-    , "    return " <> ffiRef moduleName <> "." <> Ident.topLevel name <> ";"
+    , "    return ffi." <> Ident.topLevel name <> ";"
     , "}"
     , ""
     ]
@@ -162,6 +172,12 @@ emitExpr ctx st expr = case expr of
       Just zig -> Right { text: zig, st }
       Nothing -> Left ("unbound local variable: " <> q.identifier)
     Just m
+      -- The Prim modules are not real -- they are filtered out of the import
+      -- list, so there is nothing to qualify against. The compiler emits
+      -- `Prim.undefined` as a placeholder for an erased type argument, which
+      -- is passed around but never forced. The JavaScript backend emits a
+      -- literal `undefined` here; any value will do, so use unit.
+      | isPrim m -> Right { text: "rt.Value.mkUnit()", st }
       | m == ctx.moduleName -> Right { text: Ident.topLevel q.identifier <> "()", st }
       | otherwise ->
           Right { text: Ident.moduleRef m <> "." <> Ident.topLevel q.identifier <> "()", st }
@@ -244,8 +260,13 @@ emitList ctx st items = case uncons items of
 emitAbs :: Ctx -> St -> String -> Expr -> Either String Out
 emitAbs ctx st argument body = do
   let
-    captured =
-      filter (\n -> n /= argument && isJust (lookupScope ctx n)) (sort (nub (freeVars body)))
+    bodyFree = sort (nub (freeVars body))
+    captured = filter (\n -> n /= argument && isJust (lookupScope ctx n)) bodyFree
+
+    -- Zig errors on an unused function parameter, and PureScript is full of
+    -- lambdas that ignore their argument -- every erased dictionary argument
+    -- and every `\_ -> ...` is one.
+    argUsed = elem argument bodyFree
 
     fnName = Ident.lifted (ctx.prefix <> ".lam" <> show st.counter)
     argZig = Ident.local argument
@@ -258,10 +279,12 @@ emitAbs ctx st argument body = do
   let
     bindings = mapWithIndex (\i n -> "    const " <> Ident.local n <> " = env[" <> show i <> "];") captured
     envDiscard = if null captured then [ "    _ = env;" ] else []
+    argDiscard = if argUsed then [] else [ "    _ = " <> argZig <> ";" ]
     def =
       joinWith "\n"
         ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Value {" ]
             <> envDiscard
+            <> argDiscard
             <> bindings
             <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
         )
@@ -535,10 +558,20 @@ emitBinder ctx st subject binder k = case binder of
       , canFail: rest.canFail
       }
 
-  ConstructorBinder c ->
-    wrapTest (subject <> ".hasTag(" <> Ident.stringLit c.constructorName.identifier <> ")") ctx st
-      \ctx' st' ->
-        emitBinders ctx' st' (\i -> subject <> ".arg(" <> show i <> ")") 0 c.binders k
+  -- A newtype constructor is erased by the COMPILER on the construction side:
+  -- CoreFn emits it as the identity function, so the value arriving here was
+  -- never wrapped and `hasTag` could only ever fail. Match the single inner
+  -- binder against the subject itself, with no test.
+  --
+  -- This is not an optimisation. Single-method type classes are newtypes, so
+  -- `Eq`, `Ord`, `Show` and most of the Prelude depend on it.
+  ConstructorBinder c
+    | c.isNewtype ->
+        emitBinders ctx st (\_ -> subject) 0 c.binders k
+    | otherwise ->
+        wrapTest (subject <> ".hasTag(" <> Ident.stringLit c.constructorName.identifier <> ")") ctx st
+          \ctx' st' ->
+            emitBinders ctx' st' (\i -> subject <> ".arg(" <> show i <> ")") 0 c.binders k
 
 -- | A test that must hold for the alternative to match. Failure falls through
 -- | to whatever the enclosing block emits next, which is the next alternative.
@@ -586,7 +619,7 @@ emitRecLet ctx st group = do
     envName = Ident.local ("env." <> show st.counter)
     envText = if null captured then "rt.no_env" else envName
 
-  defs <- emitRecMembers ctx (st { counter = st.counter + 1 }) fnNameFor innerBase envBindings
+  defs <- emitRecMembers ctx (st { counter = st.counter + 1 }) fnNameFor innerBase envBindings names
     (mapWithIndex (\i b -> { i, b }) group)
 
   let
@@ -617,9 +650,10 @@ emitRecMembers
   -> (Int -> String)
   -> Array Scoped
   -> Array String
+  -> Array String
   -> Array { i :: Int, b :: { identifier :: String, expression :: Expr } }
   -> Either String St
-emitRecMembers ctx st fnNameFor innerBase envBindings members =
+emitRecMembers ctx st fnNameFor innerBase envBindings names members =
   case uncons members of
     Nothing -> Right st
     Just { head, tail } -> case head.b.expression of
@@ -629,13 +663,32 @@ emitRecMembers ctx st fnNameFor innerBase envBindings members =
           innerScope = cons { ps: a.argument, zig: argZig } innerBase
         bodyOut <- emitExpr (ctx { scope = innerScope }) st a.body
         let
+          bodyFree = freeVars a.body
+
+          -- Same reason as emitAbs: Zig rejects an unused parameter.
+          argDiscard =
+            if elem a.argument bodyFree then []
+            else [ "    _ = " <> argZig <> ";" ]
+
+          -- `env` is used by more than the bindings pulled out of it: a
+          -- reference to any group member -- including a self-reference --
+          -- emits `mkClosure(fn, env)`. Discarding on `null envBindings` alone
+          -- produces a "pointless discard" for a recursive function that
+          -- captures nothing, which `Data.Void.absurd` is exactly.
+          memberUsed = not (null (filter (\n -> elem n bodyFree) names))
+          envLines =
+            if not (null envBindings) then envBindings
+            else if memberUsed then []
+            else [ "    _ = env;" ]
+
           def =
             joinWith "\n"
               ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Value {" ]
-                  <> (if null envBindings then [ "    _ = env;" ] else envBindings)
+                  <> envLines
+                  <> argDiscard
                   <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
               )
-        emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings tail
+        emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings names tail
       _ ->
         Left
           ( "recursive let binding `" <> head.b.identifier

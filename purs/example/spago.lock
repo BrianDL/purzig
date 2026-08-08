@@ -6,6 +6,9 @@
         "core": {
           "dependencies": [
             {
+              "prelude": "*"
+            },
+            {
               "zig-prelude": "*"
             }
           ]
@@ -16,12 +19,20 @@
       }
     },
     "extra_packages": {
+      "prelude": {
+        "path": "../lib/purescript-prelude"
+      },
       "zig-prelude": {
         "path": "../lib/zig-prelude"
       }
     }
   },
   "packages": {
+    "prelude": {
+      "type": "local",
+      "path": "../lib/purescript-prelude",
+      "dependencies": []
+    },
     "zig-prelude": {
       "type": "local",
       "path": "../lib/zig-prelude",

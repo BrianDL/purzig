@@ -4,9 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // What the example is expected to print. Both the hand-written target and
-    // the generated code are checked against this, so the two are kept honest
-    // by behaviour rather than by text -- a diff would break on comments,
+    // What the example is expected to print. Checked as behaviour rather than
+    // as a text diff of the generated Zig, which would break on comments,
     // whitespace, and any edit to Main.purs.
     const expected_output = "Hello, Zig\n";
 
@@ -21,42 +20,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const ffi = b.createModule(.{
-        .root_source_file = b.path("ffi/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ffi.addImport("runtime", runtime);
-
     // -----------------------------------------------------------------
-    // 2. The hand-written reference implementation. Buildable with no
-    //    spago, purs or node present -- it is what validated the runtime
-    //    API before codegen existed, and it stays as a fallback way to
-    //    exercise the runtime when the PureScript side is broken.
-    // -----------------------------------------------------------------
-
-    const expected_exe = b.addExecutable(.{
-        .name = "example-expected",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("purs/example/expected/Main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    expected_exe.root_module.addImport("runtime", runtime);
-    expected_exe.root_module.addImport("ffi", ffi);
-
-    const run_expected = b.addRunArtifact(expected_exe);
-    const run_expected_step = b.step("run-expected", "Build and run the hand-written reference Zig");
-    run_expected_step.dependOn(&run_expected.step);
-
-    const check_expected = b.addRunArtifact(expected_exe);
-    check_expected.expectStdOutEqual(expected_output);
-    const check_expected_step = b.step("test-expected", "Check the hand-written reference output");
-    check_expected_step.dependOn(&check_expected.step);
-
-    // -----------------------------------------------------------------
-    // 3. Build the backend compiler: PureScript -> JavaScript, run on Node.
+    // 2. Build the backend compiler: PureScript -> JavaScript, run on Node.
     //
     //    `spago bundle`, not `spago build`: the example's spago.yaml points
     //    backend.cmd at ../compiler/bundle.js, and only `bundle` produces it.
@@ -73,7 +38,7 @@ pub fn build(b: *std.Build) void {
     compiler_step.dependOn(&build_compiler.step);
 
     // -----------------------------------------------------------------
-    // 4. Compile the example through that backend.
+    // 3. Compile the example through that backend.
     // -----------------------------------------------------------------
 
     const codegen = b.addSystemCommand(&.{ "spago", "build" });
@@ -85,7 +50,7 @@ pub fn build(b: *std.Build) void {
     codegen_step.dependOn(&codegen.step);
 
     // -----------------------------------------------------------------
-    // 5. Compile the GENERATED Zig.
+    // 4. Compile the GENERATED Zig.
     //
     //    The root source file does not exist on a clean checkout. The explicit
     //    dependOn is what guarantees codegen has run before the compiler tries
@@ -101,7 +66,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("runtime", runtime);
-    exe.root_module.addImport("ffi", ffi);
     exe.step.dependOn(&codegen.step);
 
     b.installArtifact(exe);
@@ -114,8 +78,8 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run.step);
 
     // -----------------------------------------------------------------
-    // 6. End-to-end check: does PureScript source, run through the whole
-    //    pipeline, behave the same as the hand-written reference?
+    // 5. End-to-end check: does PureScript source, run through the whole
+    //    pipeline, print what it should?
     //
     //    Requires purs/example/src/Main.purs to be the unmodified example.
     // -----------------------------------------------------------------
@@ -126,7 +90,7 @@ pub fn build(b: *std.Build) void {
     e2e_step.dependOn(&check_generated.step);
 
     // -----------------------------------------------------------------
-    // 7. Runtime tests. Independent of the PureScript pipeline:
+    // 6. Runtime tests. Independent of the PureScript pipeline:
     //    works with no spago, purs or node present.
     // -----------------------------------------------------------------
 
@@ -143,16 +107,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_tests.step);
 
     // -----------------------------------------------------------------
-    // 8. Everything.
+    // 7. Everything.
     // -----------------------------------------------------------------
 
     const all_tests = b.step("test", "Run every check");
     all_tests.dependOn(&run_runtime_tests.step);
-    all_tests.dependOn(&check_expected.step);
     all_tests.dependOn(&check_generated.step);
 
     // -----------------------------------------------------------------
-    // 9. Housekeeping.
+    // 8. Housekeeping.
     // -----------------------------------------------------------------
 
     const clean = b.addSystemCommand(&.{

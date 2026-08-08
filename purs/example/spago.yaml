@@ -1,3 +1,4 @@
+# FILE: purs/example/spago.yaml
 # Workspace B: user code, compiled through the Zig backend.
 #
 # `workspace.backend.cmd` is the whole integration point. Spago runs
@@ -5,15 +6,21 @@
 # directory. Pointing it at node + the compiler bundle avoids needing a
 # `purs-backend-zig` executable on PATH, so there is no npm link step.
 #
-# Note the dependency list: zig-prelude only. Nothing from the registry, so
-# nothing here needs JavaScript FFI translated into Zig.
+# `prelude` is overridden to a local path rather than resolved from the
+# registry. The registry copy ships JavaScript FFI, which this backend cannot
+# use; the vendored copy is the same 6.0.2 sources with Zig beside them. This
+# is the override purerl achieves with a forked package set -- same mechanism,
+# one package instead of a whole set. Anything else pulled from the registry
+# will fail at link time with MISSING FFI until it gets the same treatment.
 package:
   name: example
   dependencies:
+    - prelude: "*"
     - zig-prelude: "*"
-
 workspace:
   extraPackages:
+    prelude:
+      path: ../lib/purescript-prelude
     zig-prelude:
       path: ../lib/zig-prelude
   backend:

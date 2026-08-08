@@ -10,6 +10,7 @@ module Zig.Ident
   , local
   , moduleRef
   , moduleFile
+  , ffiFile
   , stringLit
   ) where
 
@@ -39,6 +40,15 @@ moduleRef name = quoted ("mod." <> name)
 -- | keeps the mapping trivial and the output directory flat.
 moduleFile :: String -> String
 moduleFile name = name <> ".zig"
+
+-- | Where a module's hand-written Zig lands in the output directory, beside
+-- | the generated file: `Data.Semiring` -> "Data.Semiring.ffi.zig".
+-- |
+-- | The source is `Data/Semiring.zig`, sitting next to `Data/Semiring.purs` in
+-- | whichever package owns it -- the same pairing the JavaScript backend uses
+-- | for `.js` and purerl for `.erl`. The driver copies it here.
+ffiFile :: String -> String
+ffiFile name = name <> ".ffi.zig"
 
 quoted :: String -> String
 quoted s = "@\"" <> escape s <> "\""

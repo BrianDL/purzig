@@ -4,8 +4,11 @@
 -- | field names here deliberately match the JSON keys, so the decoder reads as
 -- | a transcription rather than a translation.
 -- |
--- | Annotations and metadata are dropped. v0 needs neither; `IsNewtype` and
--- | `IsConstructor`/`ProductType` become interesting once `Case` is optimised.
+-- | Annotations are dropped, and metadata all but one flag: `IsNewtype` on a
+-- | ConstructorBinder is required for correctness, not optimisation, because
+-- | the compiler erases newtype wrappers on the construction side.
+-- | `IsConstructor`/`ProductType` remain unused and become interesting only
+-- | once `Case` is optimised.
 module CoreFn.Types where
 
 -- import Prelude
@@ -92,6 +95,14 @@ data Binder
       { typeName :: Qualified
       , constructorName :: Qualified
       , binders :: Array Binder
+      -- | True when the annotation carries `meta: IsNewtype`.
+      -- |
+      -- | This is NOT an optimisation hint. The compiler emits a newtype
+      -- | constructor as the identity function, so the value reaching this
+      -- | binder was never wrapped and testing its tag can only fail. Single-
+      -- | method type classes are newtypes, which makes `Eq`, `Ord`, `Show`
+      -- | and most of the Prelude depend on getting this right.
+      , isNewtype :: Boolean
       }
 
 -- | Convenience for the emitter: a `Var` with no module qualifier is a
