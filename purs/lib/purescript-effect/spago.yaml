@@ -1,0 +1,14 @@
+# Vendored `purescript-effect` 4.0.0.
+#
+# Vendored rather than pulled from the registry for the same reason as the
+# prelude: a registry package ships JavaScript FFI and cannot have files added
+# to it, so a backend needing different FFI has to carry its own copy. The
+# `.purs` sources are byte-identical to tag v4.0.0; the `.zig` files beside
+# them are this backend's own. LICENSE travels with the sources.
+#
+# No `workspace:` key, so it can be pulled into any workspace via
+# `extraPackages: path:`.
+package:
+  name: effect
+  dependencies:
+    - prelude

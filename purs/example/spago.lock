@@ -6,10 +6,19 @@
         "core": {
           "dependencies": [
             {
+              "console": "*"
+            },
+            {
+              "effect": "*"
+            },
+            {
+              "exceptions": "*"
+            },
+            {
               "prelude": "*"
             },
             {
-              "zig-prelude": "*"
+              "refs": "*"
             }
           ]
         },
@@ -19,23 +28,127 @@
       }
     },
     "extra_packages": {
+      "console": {
+        "path": "../lib/purescript-console"
+      },
+      "control": {
+        "path": "../lib/purescript-control"
+      },
+      "effect": {
+        "path": "../lib/purescript-effect"
+      },
+      "exceptions": {
+        "path": "../lib/purescript-exceptions"
+      },
       "prelude": {
         "path": "../lib/purescript-prelude"
       },
-      "zig-prelude": {
-        "path": "../lib/zig-prelude"
+      "refs": {
+        "path": "../lib/purescript-refs"
+      },
+      "unsafe-coerce": {
+        "path": "../lib/purescript-unsafe-coerce"
       }
     }
   },
   "packages": {
+    "console": {
+      "type": "local",
+      "path": "../lib/purescript-console",
+      "dependencies": [
+        "effect",
+        "prelude"
+      ]
+    },
+    "control": {
+      "type": "local",
+      "path": "../lib/purescript-control",
+      "dependencies": [
+        "newtype",
+        "prelude"
+      ]
+    },
+    "effect": {
+      "type": "local",
+      "path": "../lib/purescript-effect",
+      "dependencies": [
+        "prelude"
+      ]
+    },
+    "either": {
+      "type": "registry",
+      "version": "6.1.0",
+      "integrity": "sha256-tBHx3PgtH4GZOApZCDkcM7szRTYJinrUrVGWazQCUUg=",
+      "dependencies": [
+        "control",
+        "invariant",
+        "maybe",
+        "prelude"
+      ]
+    },
+    "exceptions": {
+      "type": "local",
+      "path": "../lib/purescript-exceptions",
+      "dependencies": [
+        "effect",
+        "either",
+        "maybe",
+        "prelude"
+      ]
+    },
+    "invariant": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-HyoT1I5qIHRq8RSZji6zZDvqnpVjLw748utrKwZtqsw=",
+      "dependencies": [
+        "control",
+        "prelude"
+      ]
+    },
+    "maybe": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-8X6XEgtZ5lqfkEuc1hWOofnL6mwhk8gSJTxwvbR/SbY=",
+      "dependencies": [
+        "control",
+        "invariant",
+        "newtype",
+        "prelude"
+      ]
+    },
+    "newtype": {
+      "type": "registry",
+      "version": "5.0.0",
+      "integrity": "sha256-dt6w0cty4OS+Pjt9fsh3iU6ottqSU83mdAZkaEEvo6c=",
+      "dependencies": [
+        "prelude",
+        "safe-coerce"
+      ]
+    },
     "prelude": {
       "type": "local",
       "path": "../lib/purescript-prelude",
       "dependencies": []
     },
-    "zig-prelude": {
+    "refs": {
       "type": "local",
-      "path": "../lib/zig-prelude",
+      "path": "../lib/purescript-refs",
+      "dependencies": [
+        "effect",
+        "prelude"
+      ]
+    },
+    "safe-coerce": {
+      "type": "registry",
+      "version": "2.0.0",
+      "integrity": "sha256-EJrxtKt5xC7TYjBZrSBO/J7Aw3DmtilYjt4olpAXWVc=",
+      "dependencies": [
+        "unsafe-coerce"
+      ]
+    },
+    "unsafe-coerce": {
+      "type": "local",
+      "path": "../lib/purescript-unsafe-coerce",
       "dependencies": []
     }
   }

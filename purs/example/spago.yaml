@@ -6,23 +6,44 @@
 # directory. Pointing it at node + the compiler bundle avoids needing a
 # `purs-backend-zig` executable on PATH, so there is no npm link step.
 #
-# `prelude` is overridden to a local path rather than resolved from the
-# registry. The registry copy ships JavaScript FFI, which this backend cannot
-# use; the vendored copy is the same 6.0.2 sources with Zig beside them. This
-# is the override purerl achieves with a forked package set -- same mechanism,
-# one package instead of a whole set. Anything else pulled from the registry
-# will fail at link time with MISSING FFI until it gets the same treatment.
+# The `extraPackages` block overrides registry packages with local copies. A
+# registry package ships JavaScript FFI and cannot have files added to it, so
+# any package declaring a `foreign import` needs a vendored copy carrying Zig
+# beside its sources. This is the override purerl achieves with a forked
+# package set -- same mechanism, six packages instead of a whole set.
+#
+# A registry package with NO foreign imports needs no such treatment: nothing
+# references its `.js`, so it compiles through the backend untouched. That is
+# why `either`, `maybe`, `invariant`, `newtype` and `safe-coerce` are absent
+# from this list despite being dependencies of `exceptions` -- they come
+# straight from the registry.
+#
+# `control` and `unsafe-coerce` are here for one foreign import each, reached
+# transitively through `maybe`.
 package:
   name: example
   dependencies:
+    - console: "*"
+    - effect: "*"
+    - exceptions: "*"
     - prelude: "*"
-    - zig-prelude: "*"
+    - refs: "*"
 workspace:
   extraPackages:
     prelude:
       path: ../lib/purescript-prelude
-    zig-prelude:
-      path: ../lib/zig-prelude
+    effect:
+      path: ../lib/purescript-effect
+    console:
+      path: ../lib/purescript-console
+    refs:
+      path: ../lib/purescript-refs
+    exceptions:
+      path: ../lib/purescript-exceptions
+    control:
+      path: ../lib/purescript-control
+    unsafe-coerce:
+      path: ../lib/purescript-unsafe-coerce
   backend:
     cmd: node
     args:

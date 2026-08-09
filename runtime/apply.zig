@@ -12,6 +12,7 @@ const value = @import("value.zig");
 
 const Value = value.Value;
 const Field = value.Field;
+const Error = value.Error;
 
 var io_inst: ?std.Io = null;
 var alloc_inst: ?std.mem.Allocator = null;
@@ -37,25 +38,70 @@ pub fn io() std.Io {
 }
 
 /// Apply a one-argument closure. The hot path of the entire backend.
-pub fn apply(f: Value, argument: Value) Value {
+///
+/// Fallible: any application may reach `Effect.Exception.throw`. Applying a
+/// non-function stays a panic, because that is a backend bug rather than
+/// something a PureScript program can express.
+pub fn apply(f: Value, argument: Value) Error!Value {
     return switch (f) {
         .closure => |c| c.func(c.env, argument),
         else => @panic("runtime: applied a non-function"),
     };
 }
 
-pub fn apply2(f: Value, a: Value, b: Value) Value {
-    return apply(apply(f, a), b);
+pub fn apply2(f: Value, a: Value, b: Value) Error!Value {
+    return apply(try apply(f, a), b);
 }
 
-pub fn apply3(f: Value, a: Value, b: Value, c: Value) Value {
-    return apply(apply(apply(f, a), b), c);
+pub fn apply3(f: Value, a: Value, b: Value, c: Value) Error!Value {
+    return apply(try apply(try apply(f, a), b), c);
 }
 
 /// Run an `Effect a`. An Effect is a thunk, which in a one-argument-closure
 /// world means a closure that ignores a unit argument.
-pub fn runEffect(eff: Value) Value {
+pub fn runEffect(eff: Value) Error!Value {
     return apply(eff, Value.mkUnit());
+}
+
+// --- exceptions ------------------------------------------------------------
+
+/// The value belonging to the `error.PsException` currently in flight.
+///
+/// A side channel because Zig error values are bare tags and cannot carry a
+/// payload. Single-threaded and arena-backed, so there is no ownership question
+/// -- the slot holds a `Value` like any other.
+var pending_error: ?Value = null;
+
+/// Raise a PureScript exception. Backs `Effect.Exception.throwException`.
+///
+/// Returns the error rather than taking it, so a caller writes
+/// `return rt.throwValue(e)` and Zig's own checking guarantees the stash and
+/// the raise cannot get out of step.
+pub fn throwValue(err: Value) Error {
+    pending_error = err;
+    return error.PsException;
+}
+
+/// Retrieve the in-flight exception value and clear the slot. Backs
+/// `Effect.Exception.catchException`; call exactly once per caught error.
+pub fn takeError() Value {
+    const err = pending_error orelse
+        @panic("runtime: caught PsException with no value in flight");
+    pending_error = null;
+    return err;
+}
+
+// --- references ------------------------------------------------------------
+
+/// Allocate a mutable cell in the arena. Backs `Effect.Ref.new`.
+///
+/// `newWithSelf` does not go through here: it needs to publish the reference
+/// before computing the contents, so it allocates and calls `Value.mkRef`
+/// itself.
+pub fn newRef(initial: Value) Value {
+    const cell = alloc().create(Value) catch @panic("runtime: out of memory");
+    cell.* = initial;
+    return Value.mkRef(cell);
 }
 
 /// Copy values into the arena. This is how a lambda's captured environment is
@@ -122,11 +168,19 @@ pub fn writeLine(bytes: []const u8) void {
     out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
 }
 
+/// Write bytes plus a newline to stderr. Backs `Effect.Console.warn` and
+/// `Effect.Console.error`, which go to stderr in Node exactly as they do here.
+pub fn writeLineErr(bytes: []const u8) void {
+    const out = std.Io.File.stderr();
+    out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
+    out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
+}
+
 // --- tests -----------------------------------------------------------------
 // These exercise the pure parts only. Anything touching `io()` needs a real
 // `Io`, which tests get from `std.testing.io`.
 
-fn incBody(env: []const Value, argument: Value) Value {
+fn incBody(env: []const Value, argument: Value) Error!Value {
     _ = env;
     return Value.mkInt(argument.asInt() + 1);
 }
@@ -134,14 +188,14 @@ fn incBody(env: []const Value, argument: Value) Value {
 test "apply calls through a closure" {
     init(std.testing.io, std.testing.allocator);
     const inc = Value.mkClosure(incBody, value.no_env);
-    try std.testing.expectEqual(@as(i32, 6), apply(inc, Value.mkInt(5)).asInt());
+    try std.testing.expectEqual(@as(i32, 6), (try apply(inc, Value.mkInt(5))).asInt());
 }
 
-fn addFirst(env: []const Value, b: Value) Value {
+fn addFirst(env: []const Value, b: Value) Error!Value {
     return Value.mkInt(env[0].asInt() + b.asInt());
 }
 
-fn addTakeFirst(env: []const Value, a: Value) Value {
+fn addTakeFirst(env: []const Value, a: Value) Error!Value {
     _ = env;
     return Value.mkClosure(addFirst, copyValues(&.{a}));
 }
@@ -152,8 +206,49 @@ test "currying through a captured environment" {
     init(std.testing.io, arena.allocator());
 
     const add = Value.mkClosure(addTakeFirst, value.no_env);
-    const result = apply2(add, Value.mkInt(2), Value.mkInt(3));
+    const result = try apply2(add, Value.mkInt(2), Value.mkInt(3));
     try std.testing.expectEqual(@as(i32, 5), result.asInt());
+}
+
+fn throwBody(env: []const Value, argument: Value) Error!Value {
+    _ = env;
+    return throwValue(argument);
+}
+
+test "a thrown value propagates and is recoverable" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const thrower = Value.mkClosure(throwBody, value.no_env);
+    const result = apply(thrower, Value.mkString("boom"));
+    try std.testing.expectError(error.PsException, result);
+    try std.testing.expectEqualStrings("boom", takeError().asString());
+}
+
+test "a throw propagates through nested application" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    // apply2 must not swallow an error raised by the inner application.
+    const thrower = Value.mkClosure(throwBody, value.no_env);
+    try std.testing.expectError(
+        error.PsException,
+        apply2(thrower, Value.mkString("inner"), Value.mkUnit()),
+    );
+    try std.testing.expectEqualStrings("inner", takeError().asString());
+}
+
+test "a ref is mutable through every copy of the reference" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const r = newRef(Value.mkInt(1));
+    const alias = r;
+    r.asRef().* = Value.mkInt(2);
+    try std.testing.expectEqual(@as(i32, 2), alias.asRef().*.asInt());
 }
 
 test "string concatenation" {

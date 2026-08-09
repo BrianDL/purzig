@@ -76,7 +76,7 @@ emitModule m = do
         [ ""
         , "pub fn main(init: std.process.Init) !void {"
         , "    rt.init(init.io, init.arena.allocator());"
-        , "    _ = rt.runEffect(" <> Ident.topLevel "main" <> "());"
+        , "    _ = try rt.runEffect(try " <> Ident.topLevel "main" <> "());"
         , "}"
         ]
       else []
@@ -114,7 +114,7 @@ isPrim name = name == "Prim" || isJust (String.stripPrefix (Pattern "Prim.") nam
 foreignLine :: String -> String
 foreignLine name =
   joinWith "\n"
-    [ "pub fn " <> Ident.topLevel name <> "() rt.Value {"
+    [ "pub fn " <> Ident.topLevel name <> "() rt.Error!rt.Value {"
     , "    return ffi." <> Ident.topLevel name <> ";"
     , "}"
     , ""
@@ -142,7 +142,7 @@ emitTopValue ctx st ident expr = do
   o <- emitExpr (ctx { prefix = ident }) st expr
   pure
     { defs:
-        [ "pub fn " <> Ident.topLevel ident <> "() rt.Value {"
+        [ "pub fn " <> Ident.topLevel ident <> "() rt.Error!rt.Value {"
         , "    return " <> o.text <> ";"
         , "}"
         , ""
@@ -178,14 +178,17 @@ emitExpr ctx st expr = case expr of
       -- is passed around but never forced. The JavaScript backend emits a
       -- literal `undefined` here; any value will do, so use unit.
       | isPrim m -> Right { text: "rt.Value.mkUnit()", st }
-      | m == ctx.moduleName -> Right { text: Ident.topLevel q.identifier <> "()", st }
+      | m == ctx.moduleName -> Right { text: "(try " <> Ident.topLevel q.identifier <> "())", st }
       | otherwise ->
-          Right { text: Ident.moduleRef m <> "." <> Ident.topLevel q.identifier <> "()", st }
+          Right
+            { text: "(try " <> Ident.moduleRef m <> "." <> Ident.topLevel q.identifier <> "())"
+            , st
+            }
 
   App a -> do
     f <- emitExpr ctx st a.abstraction
     x <- emitExpr ctx f.st a.argument
-    pure { text: "rt.apply(" <> f.text <> ", " <> x.text <> ")", st: x.st }
+    pure { text: "(try rt.apply(" <> f.text <> ", " <> x.text <> "))", st: x.st }
 
   Abs a -> emitAbs ctx st a.argument a.body
 
@@ -282,7 +285,7 @@ emitAbs ctx st argument body = do
     argDiscard = if argUsed then [] else [ "    _ = " <> argZig <> ";" ]
     def =
       joinWith "\n"
-        ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Value {" ]
+        ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
             <> envDiscard
             <> argDiscard
             <> bindings
@@ -324,7 +327,7 @@ emitConstructor ctx st name arity =
                 <> " }))"
         in
           joinWith "\n"
-            ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Value {" ]
+            ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
                 <> envDiscard
                 <> [ "    return " <> body <> ";", "}", "" ]
             )
@@ -413,6 +416,23 @@ emitCase ctx st scrutinees alts = do
   body <- emitAlts ctx parts.st label tmpFor alts
 
   let
+    -- A scrutinee temporary that no alternative mentions is a Zig compile
+    -- error ("unused local constant"). It happens whenever every binder in
+    -- every REACHABLE alternative ignores that position -- most often a
+    -- multi-scrutinee `case` where one column is all `_`, and reachability
+    -- matters because an irrefutable alternative stops emission before later
+    -- ones get to use it. Discard rather than omit the binding: the scrutinee
+    -- is still an expression that may have to be evaluated for its effects on
+    -- the arena, and omitting it would also change evaluation order.
+    --
+    -- The test is textual containment. Safe because `v.c.<case>.<index>` is
+    -- unique within the function by construction.
+    used tmp = String.contains (Pattern tmp) (joinWith "\n" body.lines)
+
+    discards =
+      map (\i -> "        _ = " <> tmpFor i <> ";")
+        (filter (\i -> not (used (tmpFor i))) (range' 0 (length parts.texts)))
+
     fallthrough =
       if body.canFail then [ "        @panic(\"pattern match failure\");" ] else []
 
@@ -421,6 +441,7 @@ emitCase ctx st scrutinees alts = do
         joinWith "\n"
           ( [ label <> ": {" ]
               <> tmpLines
+              <> discards
               <> body.lines
               <> fallthrough
               <> [ "    }" ]
@@ -447,8 +468,8 @@ emitAlts ctx st label tmpFor alts = case uncons alts of
       pure { lines: one.lines <> rest.lines, st: rest.st, canFail: rest.canFail }
 
 emitAlt :: Ctx -> St -> String -> (Int -> String) -> CaseAlternative -> Either String Lines
-emitAlt ctx st label tmpFor alt =
-  emitBinders ctx st tmpFor 0 alt.binders \ctx' st' ->
+emitAlt ctx st label tmpFor alt = do
+  inner <- emitBinders ctx st tmpFor 0 alt.binders \ctx' st' ->
     case alt.result of
       Unconditional e -> do
         o <- emitExpr ctx' st' e
@@ -458,6 +479,34 @@ emitAlt ctx st label tmpFor alt =
           , canFail: false
           }
       Guarded guards -> emitGuards ctx' st' label guards
+
+  -- Each alternative that can fall through gets its own Zig block. PureScript
+  -- already scopes a binder to its own alternative, but Zig does not: an
+  -- irrefutable binder emits `const @"v.x" = ...;` directly into the case
+  -- block, and the next alternative binding the same name collides with it --
+  -- "shadows local constant from outer scope", which Zig rejects outright.
+  --
+  -- This needs no unusual source to trigger. A `VarBinder` alternative that is
+  -- guarded binds a name AND falls through, so the next alternative sees it;
+  -- `Data.Maybe` hits it twice.
+  --
+  -- Bracketing is the structural fix rather than suffixing the name, because it
+  -- makes the Zig scope match the PureScript one instead of relying on
+  -- generated names never colliding. `break :caseN` crosses the extra block
+  -- without trouble -- that is what a labelled break is for.
+  --
+  -- An alternative that CANNOT fall through is left unbracketed. It is
+  -- necessarily the last one emitted, so nothing can collide with it, and
+  -- leaving it bare keeps the case block's final statement an unconditional
+  -- `break` rather than a block that happens to be noreturn.
+  pure
+    ( if inner.canFail then
+        { lines: [ "        {" ] <> inner.lines <> [ "        }" ]
+        , st: inner.st
+        , canFail: inner.canFail
+        }
+      else inner
+    )
 
 -- | Guards are conditions on an alternative, not new alternatives: if every
 -- | guard fails, matching continues at the NEXT alternative rather than
@@ -683,7 +732,7 @@ emitRecMembers ctx st fnNameFor innerBase envBindings names members =
 
           def =
             joinWith "\n"
-              ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Value {" ]
+              ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
                   <> envLines
                   <> argDiscard
                   <> [ "    return " <> bodyOut.text <> ";", "}", "" ]

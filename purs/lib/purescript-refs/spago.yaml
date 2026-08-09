@@ -1,0 +1,7 @@
+# Vendored `purescript-refs` 6.0.0. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+package:
+  name: refs
+  dependencies:
+    - prelude
+    - effect

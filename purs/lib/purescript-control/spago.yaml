@@ -1,0 +1,7 @@
+# Vendored `purescript-control` 6.0.0, for its single foreign import
+# (`arrayExtend`). Pulled in transitively by `maybe`, which `exceptions` needs.
+package:
+  name: control
+  dependencies:
+    - prelude
+    - newtype

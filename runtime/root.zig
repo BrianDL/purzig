@@ -17,6 +17,7 @@ pub const Data = value.Data;
 pub const Closure = value.Closure;
 pub const Fn1 = value.Fn1;
 pub const no_env = value.no_env;
+pub const Error = value.Error;
 
 pub const init = apply_mod.init;
 pub const alloc = apply_mod.alloc;
@@ -32,6 +33,10 @@ pub const curry = curry_mod.curry;
 pub const effect = curry_mod.effect;
 pub const concatString = apply_mod.concatString;
 pub const writeLine = apply_mod.writeLine;
+pub const writeLineErr = apply_mod.writeLineErr;
+pub const throwValue = apply_mod.throwValue;
+pub const takeError = apply_mod.takeError;
+pub const newRef = apply_mod.newRef;
 
 test {
     _ = value;

@@ -6,6 +6,20 @@
 
 const std = @import("std");
 
+/// The one error a PureScript program can raise: `Effect.Exception.throw`.
+///
+/// Zig has no stack unwinding -- errors are values in the return type and every
+/// call site decides explicitly what to do with them -- so a PureScript
+/// exception has to be threaded through the return type of every function that
+/// could be on the path to a `throw`. Since the backend is untyped, that is all
+/// of them.
+///
+/// Zig error values carry no payload, so the thrown `Error` value itself
+/// travels in a side channel: `rt.throwValue` stashes it and returns
+/// `error.PsException`, and `rt.takeError` retrieves it in the handler. This is
+/// the standard Zig pattern for errors that need diagnostics attached.
+pub const Error = error{PsException};
+
 /// A closure body. Takes its captured environment and exactly one argument.
 ///
 /// CoreFn is fully curried -- every `Abs` binds one name, every `App` applies
@@ -16,7 +30,11 @@ const std = @import("std");
 /// type for every `Abs`, and every call site would need @ptrCast/@alignCast.
 /// One pointer indirection per capture is irrelevant at v0, and
 /// purescript-backend-optimizer would erase most captures later anyway.
-pub const Fn1 = *const fn (env: []const Value, arg: Value) Value;
+///
+/// Fallible because any application may reach a `throw`. This is the single
+/// declaration that forces generated code's signatures, so changing it and
+/// changing the emitter are necessarily the same commit.
+pub const Fn1 = *const fn (env: []const Value, arg: Value) Error!Value;
 
 pub const Closure = struct {
     func: Fn1,
@@ -48,6 +66,17 @@ pub const Value = union(enum) {
     record: []const Field,
     data: Data,
     closure: Closure,
+
+    /// A mutable cell, backing `Effect.Ref`. The only mutable thing in the
+    /// runtime: every other variant is immutable, and `updateRecord` is
+    /// explicitly copy-on-write.
+    ///
+    /// It has to be a pointer rather than an inline value. `Ref` semantics are
+    /// that a write is observable through every copy of the reference, and
+    /// `Value` is passed by value everywhere; only indirection gives that.
+    /// `newWithSelf` additionally needs the cell to exist before its contents
+    /// are computed, which a pointer allows and an inline value does not.
+    ref: *Value,
 
     // ---- constructors -------------------------------------------------
     // Named `mk*` because a union cannot carry a declaration and a field
@@ -91,6 +120,13 @@ pub const Value = union(enum) {
 
     pub fn mkClosure(func: Fn1, env: []const Value) Value {
         return .{ .closure = .{ .func = func, .env = env } };
+    }
+
+    /// Wrap an already-allocated cell. `rt.newRef` is the usual way in; this
+    /// exists for `newWithSelf`, which must publish the reference before it has
+    /// a value to put in it.
+    pub fn mkRef(cell: *Value) Value {
+        return .{ .ref = cell };
     }
 
     // ---- accessors ----------------------------------------------------
@@ -174,6 +210,15 @@ pub const Value = union(enum) {
         return switch (self) {
             .data => |d| d.fields[index],
             else => @panic("runtime: expected a data constructor"),
+        };
+    }
+
+    /// The cell behind an `Effect.Ref`. Read through `.*`, write through
+    /// `.* =`. Only `Effect/Ref.zig` should need this.
+    pub fn asRef(self: Value) *Value {
+        return switch (self) {
+            .ref => |cell| cell,
+            else => @panic("runtime: expected a Ref"),
         };
     }
 };

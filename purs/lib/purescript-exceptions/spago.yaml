@@ -1,0 +1,13 @@
+# Vendored `purescript-exceptions` 6.1.0.
+#
+# `either` and `maybe` are NOT vendored: neither declares a `foreign import`, so
+# nothing references their JavaScript and the registry copies compile through
+# this backend untouched. `control` and `unsafe-coerce` are vendored, because
+# they do (one function each), and they are reachable from `maybe`.
+package:
+  name: exceptions
+  dependencies:
+    - prelude
+    - effect
+    - either
+    - maybe

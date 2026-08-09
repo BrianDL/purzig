@@ -1,0 +1,5 @@
+# Vendored `purescript-unsafe-coerce` 6.0.0, for its single foreign import.
+# Pulled in transitively by `newtype` -> `safe-coerce`.
+package:
+  name: unsafe-coerce
+  dependencies: []

@@ -62,7 +62,7 @@ fn Step(
             return Value.mkClosure(run, env);
         }
 
-        fn run(env: []const Value, arg: Value) Value {
+        fn run(env: []const Value, arg: Value) value.Error!Value {
             // A nullary effect uses neither; the branch below is comptime-dead.
             // if (comptime arity == 0) {
             //     _ = env;
@@ -79,6 +79,12 @@ fn Step(
             // Final level. For an effect the incoming `arg` is the unit the
             // thunk was forced with, and is discarded: `j < i` is false only
             // for the genuine last argument of a pure function.
+            //
+            // No `try` and no comptime branch on `f`'s return type: Zig coerces
+            // `Value` to `Error!Value`, so this one call site accepts both a
+            // plain FFI function and one that can throw. Only the handful of
+            // foreign imports that actually raise need `Error!Value` in their
+            // own signature.
             var args: std.meta.ArgsTuple(@TypeOf(f)) = undefined;
             inline for (0..arity) |j| {
                 args[j] = if (comptime j < i) env[j] else arg;
@@ -108,7 +114,7 @@ test "curry over arity 1" {
     apply_mod.init(std.testing.io, arena.allocator());
 
     const f = curry(negate);
-    try std.testing.expectEqual(@as(i32, -5), apply_mod.apply(f, Value.mkInt(5)).asInt());
+    try std.testing.expectEqual(@as(i32, -5), (try apply_mod.apply(f, Value.mkInt(5))).asInt());
 }
 
 test "curry over arity 2, applied one argument at a time" {
@@ -117,11 +123,11 @@ test "curry over arity 2, applied one argument at a time" {
     apply_mod.init(std.testing.io, arena.allocator());
 
     const f = curry(add);
-    const partial = apply_mod.apply(f, Value.mkInt(2));
+    const partial = try apply_mod.apply(f, Value.mkInt(2));
 
     // A partial application is reusable: currying must not mutate shared state.
-    try std.testing.expectEqual(@as(i32, 5), apply_mod.apply(partial, Value.mkInt(3)).asInt());
-    try std.testing.expectEqual(@as(i32, 12), apply_mod.apply(partial, Value.mkInt(10)).asInt());
+    try std.testing.expectEqual(@as(i32, 5), (try apply_mod.apply(partial, Value.mkInt(3))).asInt());
+    try std.testing.expectEqual(@as(i32, 12), (try apply_mod.apply(partial, Value.mkInt(10))).asInt());
 }
 
 test "curry over arity 3 keeps argument order" {
@@ -130,7 +136,7 @@ test "curry over arity 3 keeps argument order" {
     apply_mod.init(std.testing.io, arena.allocator());
 
     const f = curry(three);
-    const r = apply_mod.apply3(f, Value.mkInt(100), Value.mkInt(20), Value.mkInt(3));
+    const r = try apply_mod.apply3(f, Value.mkInt(100), Value.mkInt(20), Value.mkInt(3));
     try std.testing.expectEqual(@as(i32, 123), r.asInt());
 }
 
@@ -150,11 +156,11 @@ test "a nullary effect does not run until forced" {
     const eff = effect(bumpCounter);
     try std.testing.expectEqual(@as(u32, 0), effect_runs);
 
-    _ = apply_mod.runEffect(eff);
+    _ = try apply_mod.runEffect(eff);
     try std.testing.expectEqual(@as(u32, 1), effect_runs);
 
     // Effects are values: running twice runs the body twice.
-    _ = apply_mod.runEffect(eff);
+    _ = try apply_mod.runEffect(eff);
     try std.testing.expectEqual(@as(u32, 2), effect_runs);
 }
 
@@ -174,9 +180,9 @@ test "an effect of arity 2 waits for the unit argument" {
     const eff = effect(recordSum);
 
     // Both arguments supplied, but this is still an unforced Effect.
-    const saturated = apply_mod.apply2(eff, Value.mkInt(40), Value.mkInt(2));
+    const saturated = try apply_mod.apply2(eff, Value.mkInt(40), Value.mkInt(2));
     try std.testing.expectEqual(@as(i32, 0), last_sum);
 
-    _ = apply_mod.runEffect(saturated);
+    _ = try apply_mod.runEffect(saturated);
     try std.testing.expectEqual(@as(i32, 42), last_sum);
 }
