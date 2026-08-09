@@ -10,6 +10,7 @@ const std = @import("std");
 const value = @import("value.zig");
 const apply_mod = @import("apply.zig");
 const curry_mod = @import("curry.zig");
+const lazy_mod = @import("lazy.zig");
 
 pub const Value = value.Value;
 pub const Field = value.Field;
@@ -37,9 +38,13 @@ pub const writeLineErr = apply_mod.writeLineErr;
 pub const throwValue = apply_mod.throwValue;
 pub const takeError = apply_mod.takeError;
 pub const newRef = apply_mod.newRef;
+pub const newLazy = lazy_mod.newLazy;
+pub const setLazyInit = lazy_mod.setLazyInit;
+pub const forceLazy = lazy_mod.forceLazy;
 
 test {
     _ = value;
     _ = apply_mod;
     _ = curry_mod;
+    _ = lazy_mod;
 }

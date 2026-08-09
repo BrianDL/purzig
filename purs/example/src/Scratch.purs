@@ -15,6 +15,7 @@ module Scratch (target) where
 
 import Prelude
 
+import Control.Lazy (fix)
 import Effect (Effect, forE, foreachE, whileE)
 import Effect.Exception (catchException, error, message, name, throwException)
 import Effect.Ref as Ref
@@ -80,6 +81,15 @@ countDown n =
     go acc k = if k == 0 then acc + n else go (acc + 1) (k - 1)
   in
     go 0 3
+
+-- | `Control.Lazy.fix` -- the reason the laziness fallback exists. The `Lazy`
+-- | instance for functions is `defer f = \\x -> f unit x`, and `fix f = go
+-- | where go = defer \\_ -> f go` is a recursive `let` whose member is NOT a
+-- | function, so it goes through `rt.newLazy`/`setLazyInit`/`forceLazy` rather
+-- | than the lifted-closure path. Without a reference here, `Control.Lazy.zig`
+-- | is emitted but never compiled by Zig.
+viaFix :: Int -> Int
+viaFix = fix \recur n -> if n == 0 then 0 else recur (n - 1) + 1
 
 -- | `Ref` plus `forE`: sum 1..4 by mutation. Exercises `_new`, `read`,
 -- | `modify_` (which goes through `modifyImpl` and its `{ state, value }`
@@ -162,6 +172,7 @@ target n = do
         $ check "totalMany" (total [ 1, 2, 3 ] == (-1))
         $ check "countDown" (countDown 4 == 7)
         $ check "describe" (describe 5 == "shape5")
+        $ check "viaFix" (viaFix 5 == 5)
         $ check "sumTo" (s == 10)
         $ check "foreachE" (joined == "abc")
         $ check "whileE" (loops == 3)

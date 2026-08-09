@@ -20,9 +20,9 @@ module Zig.Emit (emitModule) where
 import Prelude
 
 import CoreFn.Types (Bind(..), Binder(..), CaseAlternative, Expr(..), Literal(..), Module, Result(..))
-import Data.Array (concat, cons, elem, filter, findMap, length, mapWithIndex, nub, null, snoc, sort, uncons)
+import Data.Array (concat, cons, elem, elemIndex, filter, findMap, index, length, mapWithIndex, nub, null, snoc, sort, uncons)
 import Data.Either (Either(..))
-import Data.Maybe (Maybe(..), isJust)
+import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String (joinWith)
 import Data.String as String
 import Data.String.Pattern (Pattern(..))
@@ -45,7 +45,15 @@ type Defs =
   , st :: St
   }
 
-type Scoped = { ps :: String, zig :: String }
+-- | How a PureScript local is written in Zig, and whether reading it has to
+-- | go through a lazy cell.
+-- |
+-- | `lazy` lives on the scope ENTRY rather than in a set on `Ctx`, so that
+-- | shadowing is handled for free: a new binder conses a fresh entry onto the
+-- | front, and `lookupEntry` finds that one. A set would have to be pruned at
+-- | every binding site instead, and missing one would force a value that is
+-- | not a cell.
+type Scoped = { ps :: String, zig :: String, lazy :: Boolean }
 
 type Ctx =
   { moduleName :: String
@@ -168,8 +176,14 @@ emitExpr ctx st expr = case expr of
   Lit literal -> emitLit ctx st literal
 
   Var q -> case q.moduleName of
-    Nothing -> case lookupScope ctx q.identifier of
-      Just zig -> Right { text: zig, st }
+    Nothing -> case lookupEntry ctx q.identifier of
+      -- A lazy binding is stored as a cell, and READING it forces. Capturing
+      -- it must not: `scopeText`, which builds capture lists, deliberately
+      -- yields the cell itself. Forcing at capture time would run the
+      -- initialiser while the group is still being defined, which is the exact
+      -- cycle the cell exists to detect.
+      Just e | e.lazy -> Right { text: "(try rt.forceLazy(" <> e.zig <> "))", st }
+      Just e -> Right { text: e.zig, st }
       Nothing -> Left ("unbound local variable: " <> q.identifier)
     Just m
       -- The Prim modules are not real -- they are filtered out of the import
@@ -274,8 +288,8 @@ emitAbs ctx st argument body = do
     fnName = Ident.lifted (ctx.prefix <> ".lam" <> show st.counter)
     argZig = Ident.local argument
     innerScope =
-      cons { ps: argument, zig: argZig }
-        (map (\n -> { ps: n, zig: Ident.local n }) captured)
+      cons { ps: argument, zig: argZig, lazy: false }
+        (map (\n -> { ps: n, zig: Ident.local n, lazy: isLazy ctx n }) captured)
 
   bodyOut <- emitExpr (ctx { scope = innerScope }) (st { counter = st.counter + 1 }) body
 
@@ -380,7 +394,7 @@ emitLetBinds ctx st binds = case uncons binds of
         zig =
           if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show o.st.counter)
           else Ident.local ident
-        ctx' = ctx { scope = cons { ps: ident, zig } ctx.scope }
+        ctx' = ctx { scope = cons { ps: ident, zig, lazy: false } ctx.scope }
       rest <- emitLetBinds ctx' (o.st { counter = o.st.counter + 1 }) tail
       pure
         { ctx: rest.ctx
@@ -559,7 +573,7 @@ emitBinder ctx st subject binder k = case binder of
       zig =
         if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show st.counter)
         else Ident.local ident
-      ctx' = ctx { scope = cons { ps: ident, zig } ctx.scope }
+      ctx' = ctx { scope = cons { ps: ident, zig, lazy: false } ctx.scope }
     inner <- k ctx' (st { counter = st.counter + 1 })
     pure
       { lines: cons ("        const " <> zig <> " = " <> subject <> ";") inner.lines
@@ -599,7 +613,7 @@ emitBinder ctx st subject binder k = case binder of
       zig =
         if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show st.counter)
         else Ident.local ident
-      ctx' = ctx { scope = cons { ps: ident, zig } ctx.scope }
+      ctx' = ctx { scope = cons { ps: ident, zig, lazy: false } ctx.scope }
     rest <- emitBinder ctx' (st { counter = st.counter + 1 }) subject inner k
     pure
       { lines: cons ("        const " <> zig <> " = " <> subject <> ";") rest.lines
@@ -638,56 +652,119 @@ wrapTest test ctx st k = do
 -- | environment -- the union of the members' free variables, minus the members
 -- | themselves.
 -- |
--- | The trick that makes self-reference terminate: within the group, a member
--- | is `rt.Value.mkClosure(fn, env)`, a VALUE, not a call. Emitting a call
--- | would re-enter the function being defined while building its own capture
--- | list and loop forever.
+-- | The trick that makes self-reference terminate for a FUNCTION member: within
+-- | the group, a member is `rt.Value.mkClosure(fn, env)`, a VALUE, not a call.
+-- | Emitting a call would re-enter the function being defined while building
+-- | its own capture list and loop forever.
 -- |
--- | Only `Abs` members are supported. A non-function recursive binding
--- | diverges under strict evaluation regardless; upstream backends handle that
--- | with the compiler's laziness transform, which turns the divergence into a
--- | runtime error. That transform is a backend responsibility -- CoreFn hands
--- | over the raw `Rec` group -- and is not implemented here.
+-- | A member that is NOT a function gets a lazy cell instead. The compiler
+-- | offers `applyLazinessTransform` for this, but only to backends embedding it
+-- | as a Haskell library; reading `corefn.json` means implementing the fallback
+-- | the 0.15.0 release notes describe -- make recursive bindings lazy, skipping
+-- | the machinery when every initialiser in the group is an `Abs`. That skip is
+-- | why function members still take the cheaper path above.
+-- |
+-- | Ordering at the let site is forced by a mutual dependency: an initialiser
+-- | closes over an environment that has to contain the cells, so the cells are
+-- | created empty first, then the environment, then the initialisers attached.
 emitRecLet :: Ctx -> St -> Array { identifier :: String, expression :: Expr } -> Either String LetAcc
 emitRecLet ctx st group = do
   let
     names = map _.identifier group
-    base = ctx.prefix <> ".rec" <> show st.counter
+    n = st.counter
+    base = ctx.prefix <> ".rec" <> show n
     fnNameFor i = Ident.lifted (base <> "." <> show i)
+
+    isLazyMember b = case b.expression of
+      Abs _ -> false
+      _ -> true
+
+    -- Group indices of the members needing a cell, in order.
+    lazyIndices =
+      map _.i (filter (\m -> isLazyMember m.b) (mapWithIndex (\i b -> { i, b }) group))
+
+    cellName i = Ident.local ("lazy." <> show n <> "." <> show i)
 
     -- Free variables of the whole group, so every member shares one env layout.
     captured =
-      filter (\n -> not (elem n names) && isJust (lookupScope ctx n))
+      filter (\ident -> not (elem ident names) && isJust (lookupScope ctx ident))
         (sort (nub (concat (map (\b -> freeVars b.expression) group))))
 
-    -- Inside a lifted member, siblings resolve through that member's own `env`.
-    memberScope = mapWithIndex (\i n -> { ps: n, zig: mkClosureOf (fnNameFor i) "env" }) names
-    innerBase = memberScope <> map (\n -> { ps: n, zig: Ident.local n }) captured
-    envBindings = mapWithIndex (\i n -> "    const " <> Ident.local n <> " = env[" <> show i <> "];") captured
+    -- Env layout: captured variables first, then one slot per lazy member.
+    -- Both halves are fixed at emission time, so a slot index is a constant.
+    slotOf i = length captured + fromMaybe 0 (elemIndex i lazyIndices)
 
-    envName = Ident.local ("env." <> show st.counter)
-    envText = if null captured then "rt.no_env" else envName
+    -- Inside a lifted member, a function sibling resolves through `env` as a
+    -- closure value; a lazy sibling resolves to its cell, which reading forces.
+    memberScope =
+      mapWithIndex
+        ( \i ident ->
+            if elem i lazyIndices then
+              { ps: ident, zig: "env[" <> show (slotOf i) <> "]", lazy: true }
+            else { ps: ident, zig: mkClosureOf (fnNameFor i) "env", lazy: false }
+        )
+        names
+    innerBase =
+      memberScope
+        <> map (\ident -> { ps: ident, zig: Ident.local ident, lazy: isLazy ctx ident }) captured
+    envBindings =
+      mapWithIndex (\i ident -> "    const " <> Ident.local ident <> " = env[" <> show i <> "];") captured
+
+    envName = Ident.local ("env." <> show n)
+    hasEnv = not (null captured) || not (null lazyIndices)
+    envText = if hasEnv then envName else "rt.no_env"
 
   defs <- emitRecMembers ctx (st { counter = st.counter + 1 }) fnNameFor innerBase envBindings names
     (mapWithIndex (\i b -> { i, b }) group)
 
   let
+    cellLines =
+      map
+        ( \i ->
+            "        const " <> cellName i <> " = rt.newLazy("
+              <> Ident.stringLit (fromMaybe "" (index names i))
+              <> ", "
+              <> Ident.stringLit ctx.moduleName
+              <> ");"
+        )
+        lazyIndices
+
+    envSlots = map (scopeText ctx) captured <> map cellName lazyIndices
     envLine =
-      if null captured then []
-      else
-        [ "        const " <> envName <> " = rt.copyValues(&.{ "
-            <> joinWith ", " (map (scopeText ctx) captured)
-            <> " });"
-        ]
+      if not hasEnv then []
+      else [ "        const " <> envName <> " = rt.copyValues(&.{ " <> joinWith ", " envSlots <> " });" ]
+
+    initLines =
+      map
+        ( \i ->
+            "        rt.setLazyInit(" <> cellName i <> ", "
+              <> mkClosureOf (fnNameFor i) envText
+              <> ");"
+        )
+        lazyIndices
+
+    -- Only function members get a `const`; a lazy member IS its cell.
     memberLines =
+      map
+        ( \i ->
+            "        const " <> Ident.local (fromMaybe "" (index names i)) <> " = "
+              <> mkClosureOf (fnNameFor i) envText
+              <> ";"
+        )
+        (filter (\i -> not (elem i lazyIndices)) (range' 0 (length names)))
+
+    outerScope =
       mapWithIndex
-        (\i n -> "        const " <> Ident.local n <> " = " <> mkClosureOf (fnNameFor i) envText <> ";")
+        ( \i ident ->
+            if elem i lazyIndices then { ps: ident, zig: cellName i, lazy: true }
+            else { ps: ident, zig: Ident.local ident, lazy: false }
+        )
         names
 
   pure
-    { ctx: ctx { scope = map (\n -> { ps: n, zig: Ident.local n }) names <> ctx.scope }
+    { ctx: ctx { scope = outerScope <> ctx.scope }
     , st: defs
-    , lines: envLine <> memberLines
+    , lines: cellLines <> envLine <> initLines <> memberLines
     }
 
 mkClosureOf :: String -> String -> String
@@ -709,7 +786,7 @@ emitRecMembers ctx st fnNameFor innerBase envBindings names members =
       Abs a -> do
         let
           argZig = Ident.local a.argument
-          innerScope = cons { ps: a.argument, zig: argZig } innerBase
+          innerScope = cons { ps: a.argument, zig: argZig, lazy: false } innerBase
         bodyOut <- emitExpr (ctx { scope = innerScope }) st a.body
         let
           bodyFree = freeVars a.body
@@ -738,14 +815,46 @@ emitRecMembers ctx st fnNameFor innerBase envBindings names members =
                   <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
               )
         emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings names tail
-      _ ->
-        Left
-          ( "recursive let binding `" <> head.b.identifier
-              <> "` is not a function; only function bindings are supported"
-          )
+      -- Not a function, so it becomes a lazy cell's initialiser: a closure of
+      -- one ignored argument, exactly the `Unit -> a` the compiler's own
+      -- laziness contract specifies. It is lifted like an `Abs` member and
+      -- shares the same environment; only the reference side differs, where
+      -- reading forces the cell rather than rebuilding a closure.
+      _ -> do
+        let
+          argZig = Ident.local ("lazyarg." <> show st.counter)
+        bodyOut <- emitExpr (ctx { scope = innerBase }) (st { counter = st.counter + 1 })
+          head.b.expression
+        let
+          bodyFree = freeVars head.b.expression
+          memberUsed = not (null (filter (\n -> elem n bodyFree) names))
+          envLines =
+            if not (null envBindings) then envBindings
+            else if memberUsed then []
+            else [ "    _ = env;" ]
+
+          def =
+            joinWith "\n"
+              ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
+                  <> envLines
+                  <> [ "    _ = " <> argZig <> ";" ]
+                  <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
+              )
+        emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings names tail
+
+lookupEntry :: Ctx -> String -> Maybe Scoped
+lookupEntry ctx name = findMap (\e -> if e.ps == name then Just e else Nothing) ctx.scope
 
 lookupScope :: Ctx -> String -> Maybe String
-lookupScope ctx name = findMap (\e -> if e.ps == name then Just e.zig else Nothing) ctx.scope
+lookupScope ctx name = map _.zig (lookupEntry ctx name)
+
+-- | Whether a name in scope is a lazy cell. Absent names are not lazy: a
+-- | top-level reference is a nullary call, which recomputes rather than
+-- | caching and so needs no cell.
+isLazy :: Ctx -> String -> Boolean
+isLazy ctx name = case lookupEntry ctx name of
+  Just e -> e.lazy
+  Nothing -> false
 
 -- | How a locally-bound name is written *at a use site in the current scope*.
 -- |
