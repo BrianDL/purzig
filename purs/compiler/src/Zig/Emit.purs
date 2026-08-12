@@ -1,31 +1,51 @@
 -- FILE: purs/compiler/src/Zig/Emit.purs
--- | CoreFn.Types -> Zig source text. See docs/codegen.md for the rules.
+-- | `BackendModule` -> Zig source text. See docs/codegen.md for the rules.
 -- |
--- | Two structural facts drive the whole design:
+-- | This consumes `purescript-backend-optimizer`'s IR, not CoreFn. Three
+-- | structural facts drive the design:
 -- |
--- |  * CoreFn is fully curried, so every Abs binds one name and every App
--- |    applies one argument. Emission is a tree walk with no arity analysis.
--- |  * Zig has no closures, so every Abs is LIFTED to a top-level function
--- |    plus a captured `[]const rt.Value`. Computing which locals to capture
--- |    (`freeVars` below) is the only real algorithm here.
+-- |  * A local is identified by `(Maybe Ident, Level)`, not by name. Levels are
+-- |    assigned by the optimizer as it descends, and a `LetRec` gives every
+-- |    member of a group the SAME level, distinguished by identifier -- so the
+-- |    pair is the key, and `@"v.<name>.<level>"` is collision-free by
+-- |    construction. That is why nothing here suffixes names on shadowing.
+-- |  * Pattern matching has already been compiled away. There are no binders:
+-- |    a `case` arrives as `Branch` (a list of condition/result pairs) plus
+-- |    `Accessor` and `OpIsTag`. The continuation-passing binder fold, the
+-- |    `canFail` reachability tracking and the per-alternative bracketing that
+-- |    the CoreFn emitter needed are all gone.
+-- |  * Zig still has no closures, so every `Abs` is LIFTED to a top-level
+-- |    function plus a captured `[]const rt.Value`. `freeKeys` is the only real
+-- |    algorithm left here.
 -- |
--- | All CoreFn expression nodes are implemented as of Stage 2.
+-- | NOT IMPLEMENTED in this batch: `EffectBind`, `EffectPure`, `EffectDefer`,
+-- | `PrimEffect`. Each returns a `Left` naming itself. They are unreachable so
+-- | long as `Main.purs` filters the corresponding entries out of
+-- | `coreForeignSemantics` -- `Effect.bindE` and friends then stay ordinary
+-- | foreign applications through the existing `rt.effect` FFI, exactly as they
+-- | work today.
 -- |
 -- | NAMING HAZARD: nothing in this module may be called `bind` or `discard`.
 -- | Do-notation desugars to functions of exactly those names, so a parameter
 -- | shadowing one breaks every `do` block in scope -- and the error points at
--- | the do block, not at the shadowing name. Both were hit writing this file.
+-- | the do block, not at the shadowing name.
 module Zig.Emit (emitModule) where
 
 import Prelude
 
-import CoreFn.Types (Bind(..), Binder(..), CaseAlternative, Expr(..), Literal(..), Module, Result(..))
-import Data.Array (concat, cons, elem, elemIndex, filter, findMap, index, length, mapWithIndex, nub, null, snoc, sort, uncons)
+import Data.Array (concat, cons, elem, filter, findMap, length, mapWithIndex, nub, null, snoc, sortWith, uncons)
+import Data.Array.NonEmpty as NEA
 import Data.Either (Either(..))
+import Data.Enum (fromEnum)
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
+import Data.Newtype (unwrap)
+import Data.Set as Set
 import Data.String (joinWith)
-import Data.String as String
-import Data.String.Pattern (Pattern(..))
+import Data.Tuple (Tuple(..), snd)
+import PureScript.Backend.Optimizer.Convert (BackendModule)
+import PureScript.Backend.Optimizer.CoreFn (Ident(..), Literal(..), ModuleName, Prop, Qualified(..), propKey, propValue)
+import PureScript.Backend.Optimizer.Semantics (NeutralExpr(..))
+import PureScript.Backend.Optimizer.Syntax (BackendAccessor(..), BackendEffect(..), BackendOperator(..), BackendOperator1(..), BackendOperator2(..), BackendOperatorNum(..), BackendOperatorOrd(..), BackendSyntax(..), Level(..), Pair(..))
 import Zig.Ident as Ident
 
 -- | Emitter state threaded left-to-right: a counter for fresh names, and the
@@ -45,15 +65,15 @@ type Defs =
   , st :: St
   }
 
--- | How a PureScript local is written in Zig, and whether reading it has to
--- | go through a lazy cell.
--- |
--- | `lazy` lives on the scope ENTRY rather than in a set on `Ctx`, so that
--- | shadowing is handled for free: a new binder conses a fresh entry onto the
--- | front, and `lookupEntry` finds that one. A set would have to be pruned at
--- | every binding site instead, and missing one would force a value that is
--- | not a cell.
-type Scoped = { ps :: String, zig :: String, lazy :: Boolean }
+-- | A local's identity. `name` is "" for an anonymous binder (the optimizer
+-- | introduces plenty while inlining). The pair is unique: two distinct
+-- | binders never share both, and a `LetRec` group shares only the level.
+type Key = { name :: String, level :: Int }
+
+-- | How a local is written in Zig, and whether reading it goes through a lazy
+-- | cell. `lazy` lives on the scope ENTRY rather than in a set on `Ctx`, so a
+-- | new binder simply conses a fresh entry and lookup resolves shadowing.
+type Scoped = { key :: Key, zig :: String, lazy :: Boolean }
 
 type Ctx =
   { moduleName :: String
@@ -61,22 +81,28 @@ type Ctx =
   , scope :: Array Scoped
   }
 
-emitModule :: Module -> Either String String
+emitModule :: BackendModule -> Either String String
 emitModule m = do
-  let ctx0 = { moduleName: m.name, prefix: "", scope: [] }
-  result <- emitDecls ctx0 { counter: 0, lifted: [] } m.decls
   let
-    isEntry = m.name == "Main"
+    name = unwrap m.name
+    ctx0 = { moduleName: name, prefix: "", scope: [] }
+    foreigns = map unwrap (Set.toUnfoldable m.foreign :: Array Ident)
+    imports = map unwrap (Set.toUnfoldable m.imports :: Array ModuleName)
+
+  result <- emitGroups ctx0 { counter: 0, lifted: [] } m.bindings
+
+  let
+    isEntry = name == "Main"
 
     header =
-      [ "// GENERATED by purs-backend-zig from " <> m.path <> ". Do not edit."
+      [ "// GENERATED by purs-backend-zig from " <> name <> ". Do not edit."
       , ""
       ]
         <> (if isEntry then [ "const std = @import(\"std\");" ] else [])
         <> [ "const rt = @import(\"runtime\");" ]
-        <> (if null m.foreigns then [] else [ "const ffi = @import(\"" <> Ident.ffiFile m.name <> "\");" ])
+        <> (if null foreigns then [] else [ "const ffi = @import(\"" <> Ident.ffiFile name <> "\");" ])
         <> [ "" ]
-        <> map importLine (filter (not <<< isPrim) m.imports)
+        <> map importLine imports
         <> [ "" ]
 
     entry =
@@ -92,7 +118,7 @@ emitModule m = do
   pure
     ( joinWith "\n"
         ( header
-            <> map foreignLine m.foreigns
+            <> map foreignLine foreigns
             <> result.st.lifted
             <> result.defs
             <> entry
@@ -100,25 +126,16 @@ emitModule m = do
         <> "\n"
     )
 
+-- | The optimizer has already filtered `Prim` and the module's own name out of
+-- | the import set, and dropped every import that survived dead-code
+-- | elimination unused. Nothing to do here but write the lines.
 importLine :: String -> String
 importLine name =
   "const " <> Ident.moduleRef name <> " = @import(\"" <> Ident.moduleFile name <> "\");"
 
--- | `Prim` and everything under it -- Prim.Row, Prim.RowList, Prim.Symbol,
--- | Prim.Ordering, Prim.TypeError and the rest -- are compiler fictions with
--- | no CoreFn behind them. Every module imports at least one, and emitting an
--- | import produces a reference to a file that will never exist.
-isPrim :: String -> Boolean
-isPrim name = name == "Prim" || isJust (String.stripPrefix (Pattern "Prim.") name)
-
--- | A foreign import has no CoreFn body, so it becomes a re-export from the
--- | module's own FFI file -- as a nullary function, so that it is referenced
--- | exactly like a generated binding.
--- |
--- | The FFI file is written beside the `.purs` source and copied into the
--- | output directory by the driver, which is how every other backend works:
--- | `Foo/Bar.purs` pairs with `Foo/Bar.js` for JS and `Foo/Bar.erl` for
--- | purerl. A package therefore ships its own FFI and needs no registration.
+-- | A foreign import has no body, so it becomes a re-export from the module's
+-- | own FFI file -- as a nullary function, so that it is referenced exactly
+-- | like a generated binding.
 foreignLine :: String -> String
 foreignLine name =
   joinWith "\n"
@@ -128,108 +145,178 @@ foreignLine name =
     , ""
     ]
 
-emitDecls :: Ctx -> St -> Array Bind -> Either String Defs
-emitDecls ctx st binds = case uncons binds of
+-- | Binding groups. `recursive` needs no handling at all: mutual recursion
+-- | between nullary Zig functions is fine, and the optimizer has already
+-- | ordered the groups.
+emitGroups
+  :: Ctx
+  -> St
+  -> Array { recursive :: Boolean, bindings :: Array (Tuple Ident NeutralExpr) }
+  -> Either String Defs
+emitGroups ctx st groups = case uncons groups of
   Nothing -> Right { defs: [], st }
   Just { head, tail } -> do
-    one <- emitTopBind ctx st head
-    rest <- emitDecls ctx one.st tail
+    one <- emitBindings ctx st head.bindings
+    rest <- emitGroups ctx one.st tail
     pure { defs: one.defs <> rest.defs, st: rest.st }
 
-emitTopBind :: Ctx -> St -> Bind -> Either String Defs
-emitTopBind ctx st decl = case decl of
-  NonRec ident expr -> emitTopValue ctx st ident expr
-  Rec group -> emitRecGroup ctx st group
+emitBindings :: Ctx -> St -> Array (Tuple Ident NeutralExpr) -> Either String Defs
+emitBindings ctx st binds = case uncons binds of
+  Nothing -> Right { defs: [], st }
+  Just { head: Tuple ident expr, tail } -> do
+    one <- emitTopValue ctx st (unwrap ident) expr
+    rest <- emitBindings ctx one.st tail
+    pure { defs: one.defs <> rest.defs, st: rest.st }
 
 -- | Top-level bindings become NULLARY FUNCTIONS, not constants: rt.apply
 -- | allocates, so a const would have to be comptime-known, and a lazy global
 -- | would need initialisation ordering. Recomputing is semantically free
 -- | because PureScript is pure. purerl uses the same convention.
-emitTopValue :: Ctx -> St -> String -> Expr -> Either String Defs
+emitTopValue :: Ctx -> St -> String -> NeutralExpr -> Either String Defs
 emitTopValue ctx st ident expr = do
   o <- emitExpr (ctx { prefix = ident }) st expr
   pure
     { defs:
         [ "pub fn " <> Ident.topLevel ident <> "() rt.Error!rt.Value {"
-        , "    return " <> o.text <> ";"
+        , returnStmt expr o.text
         , "}"
         , ""
         ]
     , st: o.st
     }
 
--- | Mutual recursion between nullary Zig functions needs no special handling.
-emitRecGroup
-  :: Ctx
-  -> St
-  -> Array { identifier :: String, expression :: Expr }
-  -> Either String Defs
-emitRecGroup ctx st group = case uncons group of
-  Nothing -> Right { defs: [], st }
-  Just { head, tail } -> do
-    one <- emitTopValue ctx st head.identifier head.expression
-    rest <- emitRecGroup ctx one.st tail
-    pure { defs: one.defs <> rest.defs, st: rest.st }
-
-emitExpr :: Ctx -> St -> Expr -> Either String Out
-emitExpr ctx st expr = case expr of
+emitExpr :: Ctx -> St -> NeutralExpr -> Either String Out
+emitExpr ctx st (NeutralExpr syntax) = case syntax of
   Lit literal -> emitLit ctx st literal
 
-  Var q -> case q.moduleName of
-    Nothing -> case lookupEntry ctx q.identifier of
-      -- A lazy binding is stored as a cell, and READING it forces. Capturing
-      -- it must not: `scopeText`, which builds capture lists, deliberately
-      -- yields the cell itself. Forcing at capture time would run the
-      -- initialiser while the group is still being defined, which is the exact
-      -- cycle the cell exists to detect.
-      Just e | e.lazy -> Right { text: "(try rt.forceLazy(" <> e.zig <> "))", st }
-      Just e -> Right { text: e.zig, st }
-      Nothing -> Left ("unbound local variable: " <> q.identifier)
-    Just m
-      -- The Prim modules are not real -- they are filtered out of the import
-      -- list, so there is nothing to qualify against. The compiler emits
-      -- `Prim.undefined` as a placeholder for an erased type argument, which
-      -- is passed around but never forced. The JavaScript backend emits a
-      -- literal `undefined` here; any value will do, so use unit.
-      | isPrim m -> Right { text: "rt.Value.mkUnit()", st }
-      | m == ctx.moduleName -> Right { text: "(try " <> Ident.topLevel q.identifier <> "())", st }
-      | otherwise ->
-          Right
-            { text: "(try " <> Ident.moduleRef m <> "." <> Ident.topLevel q.identifier <> "())"
-            , st
-            }
+  -- A `Var` is always a top-level reference; locals are `Local`. `Qualified
+  -- Nothing` means the current module.
+  Var (Qualified mn ident) ->
+    let
+      target = unwrap ident
+    in
+      case mn of
+        Nothing -> Right { text: "(try " <> Ident.topLevel target <> "())", st }
+        Just m
+          | unwrap m == ctx.moduleName ->
+              Right { text: "(try " <> Ident.topLevel target <> "())", st }
+          | otherwise ->
+              Right
+                { text: "(try " <> Ident.moduleRef (unwrap m) <> "." <> Ident.topLevel target <> "())"
+                , st
+                }
 
-  App a -> do
-    f <- emitExpr ctx st a.abstraction
-    x <- emitExpr ctx f.st a.argument
-    pure { text: "(try rt.apply(" <> f.text <> ", " <> x.text <> "))", st: x.st }
+  Local mIdent lvl -> case lookupEntry ctx (keyOf mIdent lvl) of
+    -- Reading a lazy binding forces it. Capturing it must not: `scopeText`,
+    -- which builds every capture list, deliberately yields the bare cell.
+    -- Backwards, and a recursive non-function binding forces during its own
+    -- initialisation and hits the cycle panic.
+    Just e | e.lazy -> Right { text: "(try rt.forceLazy(" <> e.zig <> "))", st }
+    Just e -> Right { text: e.zig, st }
+    Nothing -> Left ("unbound local: " <> keyText (keyOf mIdent lvl))
 
-  Abs a -> emitAbs ctx st a.argument a.body
+  -- Applications arrive as a collected spine. Nesting them back into
+  -- one-argument applies is what keeps the FFI convention intact: every
+  -- foreign export is still a chain of one-argument closures.
+  App f args -> do
+    fo <- emitExpr ctx st f
+    applyAll ctx fo (NEA.toArray args)
 
-  Accessor a -> do
-    e <- emitExpr ctx st a.expression
-    pure { text: e.text <> ".field(" <> Ident.stringLit a.fieldName <> ")", st: e.st }
+  Abs args body -> emitAbsChain ctx st (NEA.toArray args) body
 
-  Constructor c -> emitConstructor ctx st c.constructorName (length c.fieldNames)
+  -- The uncurried forms come from Data.Function.Uncurried and
+  -- Effect.Uncurried. There is no N-ary function value in this runtime, so
+  -- they collapse to the curried chain -- the same decision as the EffectFnN
+  -- shim. Effectful and pure differ only in when the body runs, and since
+  -- Values are strict here, applying the last argument runs it either way.
+  UncurriedAbs args body -> emitUncurriedAbs ctx st args body
+  UncurriedEffectAbs args body -> emitUncurriedAbs ctx st args body
 
-  Let l -> emitLet ctx st l.binds l.expression
+  UncurriedApp f args -> emitUncurriedApp ctx st f args
+  UncurriedEffectApp f args -> emitUncurriedApp ctx st f args
 
-  Case c -> emitCase ctx st c.caseExpressions c.caseAlternatives
+  Accessor e acc -> do
+    o <- emitExpr ctx st e
+    pure { text: o.text <> accessorText acc, st: o.st }
 
-  -- rt.updateRecord copies into the arena itself, so the literal slice of
-  -- updates does not need copyFields the way a bare record literal does.
-  ObjectUpdate o -> do
-    e <- emitExpr ctx st o.expression
-    fs <- emitFields ctx e.st o.updates
-    pure { text: "rt.updateRecord(" <> e.text <> ", " <> fs.text <> ")", st: fs.st }
+  -- rt.updateRecord copies into the arena itself, so the update slice may stay
+  -- a stack temporary -- unlike a bare record literal, which needs copyFields.
+  Update e props -> do
+    o <- emitExpr ctx st e
+    fs <- emitProps ctx o.st props
+    pure { text: "rt.updateRecord(" <> o.text <> ", " <> fs.text <> ")", st: fs.st }
 
-emitLit :: Ctx -> St -> Literal Expr -> Either String Out
+  -- A saturated constructor application needs no closure chain at all: the
+  -- optimizer has already collected the arguments.
+  CtorSaturated _ _ _ ctor fields -> do
+    parts <- emitList ctx st (map snd fields)
+    pure
+      { text:
+          "rt.Value.mkData(" <> Ident.stringLit (unwrap ctor)
+            <> ", rt.copyValues(&.{ "
+            <> joinWith ", " parts.texts
+            <> " }))"
+      , st: parts.st
+      }
+
+  CtorDef _ _ ctor fields -> emitCtorDef ctx st (unwrap ctor) (length fields)
+
+  Let mIdent lvl e body -> emitLet ctx st mIdent lvl e body
+
+  LetRec lvl bindings body -> emitLetRec ctx st lvl (NEA.toArray bindings) body
+
+  Branch pairs fallback -> emitBranch ctx st (NEA.toArray pairs) fallback
+
+  PrimOp op -> emitPrimOp ctx st op
+
+  -- The compiler's placeholder for an erased type argument: passed around,
+  -- never forced. Any value does.
+  PrimUndefined -> Right { text: "rt.Value.mkUnit()", st }
+
+  -- `Fail` is how the optimizer represents an incomplete match. @panic is
+  -- noreturn, so it coerces to whatever type the surrounding expression needs.
+  Fail msg -> Right { text: "@panic(" <> Ident.stringLit msg <> ")", st }
+
+  EffectBind _ _ _ _ -> Left "EffectBind"
+  EffectPure _ -> Left "EffectPure"
+  EffectDefer _ -> Left "EffectDefer"
+  PrimEffect _ -> Left "PrimEffect"
+
+applyAll :: Ctx -> Out -> Array NeutralExpr -> Either String Out
+applyAll ctx acc args = case uncons args of
+  Nothing -> Right acc
+  Just { head, tail } -> do
+    x <- emitExpr ctx acc.st head
+    applyAll ctx { text: "(try rt.apply(" <> acc.text <> ", " <> x.text <> "))", st: x.st } tail
+
+-- | An uncurried application of no arguments still has to apply something --
+-- | `runFn0` and `runEffectFn0` are thunks in this runtime, forced by unit.
+emitUncurriedApp :: Ctx -> St -> NeutralExpr -> Array NeutralExpr -> Either String Out
+emitUncurriedApp ctx st f args = do
+  fo <- emitExpr ctx st f
+  if null args then
+    pure { text: "(try rt.apply(" <> fo.text <> ", rt.Value.mkUnit()))", st: fo.st }
+  else
+    applyAll ctx fo args
+
+-- | Likewise, a nullary uncurried abstraction becomes a closure over one
+-- | ignored argument, so that applying unit runs it.
+emitUncurriedAbs :: Ctx -> St -> Array (Tuple (Maybe Ident) Level) -> NeutralExpr -> Either String Out
+emitUncurriedAbs ctx st args body =
+  if null args then emitAbsChain ctx st [ Tuple Nothing (Level (-1)) ] body
+  else emitAbsChain ctx st args body
+
+emitLit :: Ctx -> St -> Literal NeutralExpr -> Either String Out
 emitLit ctx st literal = case literal of
   LitInt n -> Right { text: "rt.Value.mkInt(" <> show n <> ")", st }
   LitNumber n -> Right { text: "rt.Value.mkNumber(" <> show n <> ")", st }
   LitString s -> Right { text: "rt.Value.mkString(" <> Ident.stringLit s <> ")", st }
   LitBoolean b -> Right { text: "rt.Value.mkBool(" <> (if b then "true" else "false") <> ")", st }
-  LitChar c -> Right { text: "rt.Value.mkChar(" <> Ident.stringLit c <> "[0])", st }
+
+  -- The IR carries a real Char, and ours is a u21. Emitting the code point
+  -- avoids having to escape it into a Zig character literal, and is exact for
+  -- everything outside the BMP too.
+  LitChar c -> Right { text: "rt.Value.mkChar(" <> show (fromEnum c) <> ")", st }
 
   LitArray items -> do
     parts <- emitList ctx st items
@@ -238,33 +325,34 @@ emitLit ctx st literal = case literal of
       , st: parts.st
       }
 
-  LitObject fields -> do
-    fs <- emitFields ctx st fields
-    pure
-      { text: "rt.Value.mkRecord(rt.copyFields(" <> fs.text <> "))"
-      , st: fs.st
-      }
+  LitRecord props -> do
+    fs <- emitProps ctx st props
+    pure { text: "rt.Value.mkRecord(rt.copyFields(" <> fs.text <> "))", st: fs.st }
 
--- | The Zig syntax for a field slice, shared by record literals and record
--- | update. Field NAMES are comptime-known, so this can be a struct literal --
--- | but the VALUES are not, so `&.{ ... }` points at a stack temporary in the
--- | enclosing function. Whatever consumes it must copy into the arena first,
--- | exactly as LitArray already does via copyValues.
-emitFields :: Ctx -> St -> Array { key :: String, value :: Expr } -> Either String Out
-emitFields ctx st fields = do
-  parts <- emitList ctx st (map _.value fields)
+-- | The Zig syntax for a field slice. Field NAMES are comptime-known, so this
+-- | can be a struct literal -- but the VALUES are not, so `&.{ ... }` points at
+-- | a stack temporary in the enclosing frame. Whatever consumes it must copy
+-- | into the arena first.
+emitProps :: Ctx -> St -> Array (Prop NeutralExpr) -> Either String Out
+emitProps ctx st props = do
+  parts <- emitList ctx st (map propValue props)
   let
-    renderField k v = ".{ .name = " <> Ident.stringLit k <> ", .value = " <> v <> " }"
-    pairs = mapWithIndex (\i k -> renderField k (indexOr "" parts.texts i)) (map _.key fields)
+    keys = map propKey props
+    pairs =
+      mapWithIndex
+        ( \i k ->
+            ".{ .name = " <> Ident.stringLit k
+              <> ", .value = "
+              <> fromMaybe "" (parts.texts `indexAt` i)
+              <> " }"
+        )
+        keys
   pure { text: "&.{ " <> joinWith ", " pairs <> " }", st: parts.st }
 
-indexOr :: String -> Array String -> Int -> String
-indexOr fallback xs i =
-  case findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithIndex (\j x -> { i: j, x }) xs) of
-    Just x -> x
-    Nothing -> fallback
+indexAt :: Array String -> Int -> Maybe String
+indexAt xs i = findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithIndex (\j x -> { i: j, x }) xs)
 
-emitList :: Ctx -> St -> Array Expr -> Either String { texts :: Array String, st :: St }
+emitList :: Ctx -> St -> Array NeutralExpr -> Either String { texts :: Array String, st :: St }
 emitList ctx st items = case uncons items of
   Nothing -> Right { texts: [], st }
   Just { head, tail } -> do
@@ -272,29 +360,51 @@ emitList ctx st items = case uncons items of
     rest <- emitList ctx o.st tail
     pure { texts: cons o.text rest.texts, st: rest.st }
 
--- | The one genuinely non-trivial case. Lift the body to a top-level function,
--- | pass captured locals as a flat positional slice.
-emitAbs :: Ctx -> St -> String -> Expr -> Either String Out
-emitAbs ctx st argument body = do
-  let
-    bodyFree = sort (nub (freeVars body))
-    captured = filter (\n -> n /= argument && isJust (lookupScope ctx n)) bodyFree
+accessorText :: BackendAccessor -> String
+accessorText = case _ of
+  GetProp k -> ".field(" <> Ident.stringLit k <> ")"
+  GetIndex i -> ".asArray()[" <> show i <> "]"
+  -- Newtype erasure is not a special case here: the optimizer resolves it
+  -- before codegen, so a GetCtorField always addresses a real constructor.
+  GetCtorField _ _ _ _ _ i -> ".arg(" <> show i <> ")"
 
-    -- Zig errors on an unused function parameter, and PureScript is full of
-    -- lambdas that ignore their argument -- every erased dictionary argument
-    -- and every `\_ -> ...` is one.
-    argUsed = elem argument bodyFree
+-- | Lift a chain of binders to nested one-argument Zig functions. The
+-- | optimizer collects `\a b c -> ...` into one `Abs`; the runtime still wants
+-- | one argument per closure, so this peels the head and rebuilds the tail as
+-- | a fresh `Abs` node.
+emitAbsChain :: Ctx -> St -> Array (Tuple (Maybe Ident) Level) -> NeutralExpr -> Either String Out
+emitAbsChain ctx st args body = case uncons args of
+  Nothing -> emitExpr ctx st body
+  Just { head: Tuple mIdent lvl, tail } ->
+    let
+      inner = case NEA.fromArray tail of
+        Nothing -> body
+        Just rest -> NeutralExpr (Abs rest body)
+    in
+      emitAbs ctx st (keyOf mIdent lvl) inner
+
+-- | The one genuinely non-trivial case. Lift the body to a top-level function
+-- | and pass captured locals as a flat positional slice.
+emitAbs :: Ctx -> St -> Key -> NeutralExpr -> Either String Out
+emitAbs ctx st key body = do
+  let
+    bodyFree = freeKeys body
+    captured = orderKeys (filter (\k -> k /= key && isJust (lookupEntry ctx k)) bodyFree)
+
+    -- Zig errors on an unused function parameter, and PureScript produces them
+    -- constantly: every `\_ -> ...` and every erased dictionary argument.
+    argUsed = elem key bodyFree
 
     fnName = Ident.lifted (ctx.prefix <> ".lam" <> show st.counter)
-    argZig = Ident.local argument
+    argZig = zigOf key
     innerScope =
-      cons { ps: argument, zig: argZig, lazy: false }
-        (map (\n -> { ps: n, zig: Ident.local n, lazy: isLazy ctx n }) captured)
+      cons { key, zig: argZig, lazy: false }
+        (map (\k -> { key: k, zig: zigOf k, lazy: isLazy ctx k }) captured)
 
   bodyOut <- emitExpr (ctx { scope = innerScope }) (st { counter = st.counter + 1 }) body
 
   let
-    bindings = mapWithIndex (\i n -> "    const " <> Ident.local n <> " = env[" <> show i <> "];") captured
+    bindings = mapWithIndex (\i k -> "    const " <> zigOf k <> " = env[" <> show i <> "];") captured
     envDiscard = if null captured then [ "    _ = env;" ] else []
     argDiscard = if argUsed then [] else [ "    _ = " <> argZig <> ";" ]
     def =
@@ -303,7 +413,7 @@ emitAbs ctx st argument body = do
             <> envDiscard
             <> argDiscard
             <> bindings
-            <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
+            <> [ returnStmt body bodyOut.text, "}", "" ]
         )
     envExpr =
       if null captured then "rt.no_env"
@@ -314,10 +424,10 @@ emitAbs ctx st argument body = do
     , st: bodyOut.st { lifted = snoc bodyOut.st.lifted def }
     }
 
--- | A constructor of arity n is n nested one-argument closures ending in a
--- | mkData. Arity 0 is just the mkData.
-emitConstructor :: Ctx -> St -> String -> Int -> Either String Out
-emitConstructor ctx st name arity =
+-- | An unsaturated constructor: n nested one-argument closures ending in a
+-- | mkData. Saturated uses are handled by `CtorSaturated` and never reach here.
+emitCtorDef :: Ctx -> St -> String -> Int -> Either String Out
+emitCtorDef ctx st name arity =
   if arity == 0 then
     Right { text: "rt.Value.mkData(" <> Ident.stringLit name <> ", &.{})", st }
   else
@@ -354,375 +464,116 @@ emitConstructor ctx st name arity =
 range' :: Int -> Int -> Array Int
 range' lo hi = if lo >= hi then [] else cons lo (range' (lo + 1) hi)
 
-type LetAcc =
-  { ctx :: Ctx
-  , st :: St
-  , lines :: Array String
-  }
-
-emitLet :: Ctx -> St -> Array Bind -> Expr -> Either String Out
-emitLet ctx st binds body = do
+-- | Zig has statement-level `const`, so a Let is a labelled block. Labels share
+-- | one namespace within a function, hence the counter -- a fixed `blk`
+-- | collides the moment one Let nests inside another.
+emitLet :: Ctx -> St -> Maybe Ident -> Level -> NeutralExpr -> NeutralExpr -> Either String Out
+emitLet ctx st mIdent lvl e body = do
   let
-    -- Zig block labels share one namespace within a function, so a fixed "blk"
-    -- collides as soon as one Let nests inside another. Take a fresh one from
-    -- the same counter the lifted lambdas use.
     label = "blk" <> show st.counter
-  acc <- emitLetBinds ctx (st { counter = st.counter + 1 }) binds
-  bodyOut <- emitExpr acc.ctx acc.st body
+    key = keyOf mIdent lvl
+    zig = zigOf key
+  o <- emitExpr ctx (st { counter = st.counter + 1 }) e
+  let ctx' = ctx { scope = cons { key, zig, lazy: false } ctx.scope }
+  bodyOut <- emitExpr ctx' o.st body
   pure
     { text:
         joinWith "\n"
-          ( [ label <> ": {" ]
-              <> acc.lines
-              <> [ "        break :" <> label <> " " <> bodyOut.text <> ";", "    }" ]
-          )
+          [ label <> ": {"
+          , "        const " <> zig <> " = " <> o.text <> ";"
+          , breakStmt label body bodyOut.text
+          , "    }"
+          ]
     , st: bodyOut.st
     }
 
-emitLetBinds :: Ctx -> St -> Array Bind -> Either String LetAcc
-emitLetBinds ctx st binds = case uncons binds of
-  Nothing -> Right { ctx, st, lines: [] }
-  Just { head, tail } -> case head of
-    Rec group -> do
-      one <- emitRecLet ctx st group
-      rest <- emitLetBinds one.ctx one.st tail
-      pure { ctx: rest.ctx, st: rest.st, lines: one.lines <> rest.lines }
-    NonRec ident expr -> do
-      o <- emitExpr ctx st expr
-      let
-        -- Zig forbids shadowing, so a rebound name gets a fresh suffix.
-        zig =
-          if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show o.st.counter)
-          else Ident.local ident
-        ctx' = ctx { scope = cons { ps: ident, zig, lazy: false } ctx.scope }
-      rest <- emitLetBinds ctx' (o.st { counter = o.st.counter + 1 }) tail
-      pure
-        { ctx: rest.ctx
-        , st: rest.st
-        , lines: cons ("        const " <> zig <> " = " <> o.text <> ";") rest.lines
-        }
-
--- | Pattern matching, structured after the compiler's own JS backend: bind the
--- | scrutinees to temporaries, then emit each alternative as a nested chain of
--- | tests that falls through to the next alternative on failure, with a panic
--- | at the end.
+-- | A recursive group. Function members are lifted to top-level functions
+-- | sharing one environment; a member reference within the group is
+-- | `mkClosure(fn, env)` -- a VALUE, not a call, or building the capture list
+-- | would re-enter the function being defined.
 -- |
--- | The key borrowed idea is that a binder does not produce a (test,
--- | destructure) pair. It WRAPS a continuation -- the code to run once this
--- | binder has matched. Nested binders then compose for free, because a
--- | sub-binder is emitted inside the bindings its parent introduced.
--- |
--- | A Zig labelled block gives us the equivalent of the JS backend's
--- | immediately-invoked function: `break :label` plays the part of `return`.
-emitCase :: Ctx -> St -> Array Expr -> Array CaseAlternative -> Either String Out
-emitCase ctx st scrutinees alts = do
+-- | Non-function members get a lazy cell, which is the fallback the compiler's
+-- | 0.15.0 release notes specify for backends that cannot call
+-- | `applyLazinessTransform`. Restricting the cheap path to function members is
+-- | the "light analysis" those notes sanction.
+emitLetRec :: Ctx -> St -> Level -> Array (Tuple Ident NeutralExpr) -> NeutralExpr -> Either String Out
+emitLetRec ctx st lvl bindings body = do
   let
     n = st.counter
-    label = "case" <> show n
-    tmpFor i = Ident.local ("c." <> show n <> "." <> show i)
+    label = "blk" <> show n
+    level = unwrap lvl
+    keys = map (\(Tuple ident _) -> { name: unwrap ident, level }) bindings
+    exprs = map snd bindings
 
-  parts <- emitList ctx (st { counter = st.counter + 1 }) scrutinees
-
-  let
-    tmpLines =
-      mapWithIndex (\i t -> "        const " <> tmpFor i <> " = " <> t <> ";") parts.texts
-
-  body <- emitAlts ctx parts.st label tmpFor alts
-
-  let
-    -- A scrutinee temporary that no alternative mentions is a Zig compile
-    -- error ("unused local constant"). It happens whenever every binder in
-    -- every REACHABLE alternative ignores that position -- most often a
-    -- multi-scrutinee `case` where one column is all `_`, and reachability
-    -- matters because an irrefutable alternative stops emission before later
-    -- ones get to use it. Discard rather than omit the binding: the scrutinee
-    -- is still an expression that may have to be evaluated for its effects on
-    -- the arena, and omitting it would also change evaluation order.
-    --
-    -- The test is textual containment. Safe because `v.c.<case>.<index>` is
-    -- unique within the function by construction.
-    used tmp = String.contains (Pattern tmp) (joinWith "\n" body.lines)
-
-    discards =
-      map (\i -> "        _ = " <> tmpFor i <> ";")
-        (filter (\i -> not (used (tmpFor i))) (range' 0 (length parts.texts)))
-
-    fallthrough =
-      if body.canFail then [ "        @panic(\"pattern match failure\");" ] else []
-
-  pure
-    { text:
-        joinWith "\n"
-          ( [ label <> ": {" ]
-              <> tmpLines
-              <> discards
-              <> body.lines
-              <> fallthrough
-              <> [ "    }" ]
-          )
-    , st: body.st
-    }
-
--- | `canFail` is whether this chain of lines can fall through to whatever
--- | comes after it. An alternative whose binders emit no test always matches,
--- | which makes both the following alternatives and the trailing panic
--- | unreachable -- and Zig rejects unreachable code outright.
-type Lines = { lines :: Array String, st :: St, canFail :: Boolean }
-
-emitAlts :: Ctx -> St -> String -> (Int -> String) -> Array CaseAlternative -> Either String Lines
-emitAlts ctx st label tmpFor alts = case uncons alts of
-  Nothing -> Right { lines: [], st, canFail: true }
-  Just { head, tail } -> do
-    one <- emitAlt ctx st label tmpFor head
-    if not one.canFail then
-      -- This alternative always matches; anything after it is dead code.
-      pure one
-    else do
-      rest <- emitAlts ctx one.st label tmpFor tail
-      pure { lines: one.lines <> rest.lines, st: rest.st, canFail: rest.canFail }
-
-emitAlt :: Ctx -> St -> String -> (Int -> String) -> CaseAlternative -> Either String Lines
-emitAlt ctx st label tmpFor alt = do
-  inner <- emitBinders ctx st tmpFor 0 alt.binders \ctx' st' ->
-    case alt.result of
-      Unconditional e -> do
-        o <- emitExpr ctx' st' e
-        pure
-          { lines: [ "        break :" <> label <> " " <> o.text <> ";" ]
-          , st: o.st
-          , canFail: false
-          }
-      Guarded guards -> emitGuards ctx' st' label guards
-
-  -- Each alternative that can fall through gets its own Zig block. PureScript
-  -- already scopes a binder to its own alternative, but Zig does not: an
-  -- irrefutable binder emits `const @"v.x" = ...;` directly into the case
-  -- block, and the next alternative binding the same name collides with it --
-  -- "shadows local constant from outer scope", which Zig rejects outright.
-  --
-  -- This needs no unusual source to trigger. A `VarBinder` alternative that is
-  -- guarded binds a name AND falls through, so the next alternative sees it;
-  -- `Data.Maybe` hits it twice.
-  --
-  -- Bracketing is the structural fix rather than suffixing the name, because it
-  -- makes the Zig scope match the PureScript one instead of relying on
-  -- generated names never colliding. `break :caseN` crosses the extra block
-  -- without trouble -- that is what a labelled break is for.
-  --
-  -- An alternative that CANNOT fall through is left unbracketed. It is
-  -- necessarily the last one emitted, so nothing can collide with it, and
-  -- leaving it bare keeps the case block's final statement an unconditional
-  -- `break` rather than a block that happens to be noreturn.
-  pure
-    ( if inner.canFail then
-        { lines: [ "        {" ] <> inner.lines <> [ "        }" ]
-        , st: inner.st
-        , canFail: inner.canFail
-        }
-      else inner
-    )
-
--- | Guards are conditions on an alternative, not new alternatives: if every
--- | guard fails, matching continues at the NEXT alternative rather than
--- | panicking. So a guarded alternative can always fall through, whatever its
--- | binders did.
-emitGuards
-  :: Ctx -> St -> String -> Array { guard :: Expr, expression :: Expr } -> Either String Lines
-emitGuards ctx st label guards = case uncons guards of
-  Nothing -> Right { lines: [], st, canFail: true }
-  Just { head, tail } -> do
-    g <- emitExpr ctx st head.guard
-    e <- emitExpr ctx g.st head.expression
-    rest <- emitGuards ctx e.st label tail
-    pure
-      { lines:
-          [ "        if (" <> g.text <> ".asBool()) {"
-          , "        break :" <> label <> " " <> e.text <> ";"
-          , "        }"
-          ]
-            <> rest.lines
-      , st: rest.st
-      , canFail: true
-      }
-
--- | Fold the binders of one alternative, threading scope through the
--- | continuation. Falling off the end of `binders` means the alternative
--- | matched.
-emitBinders
-  :: Ctx
-  -> St
-  -> (Int -> String)
-  -> Int
-  -> Array Binder
-  -> (Ctx -> St -> Either String Lines)
-  -> Either String Lines
-emitBinders ctx st tmpFor i binders k = case uncons binders of
-  Nothing -> k ctx st
-  Just { head, tail } ->
-    emitBinder ctx st (tmpFor i) head \ctx' st' ->
-      emitBinders ctx' st' tmpFor (i + 1) tail k
-
--- | Emit one binder against the Zig expression `subject`, wrapping the
--- | continuation in whatever test and bindings it needs.
-emitBinder :: Ctx -> St -> String -> Binder -> (Ctx -> St -> Either String Lines) -> Either String Lines
-emitBinder ctx st subject binder k = case binder of
-  NullBinder -> k ctx st
-
-  VarBinder ident -> do
-    let
-      zig =
-        if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show st.counter)
-        else Ident.local ident
-      ctx' = ctx { scope = cons { ps: ident, zig, lazy: false } ctx.scope }
-    inner <- k ctx' (st { counter = st.counter + 1 })
-    pure
-      { lines: cons ("        const " <> zig <> " = " <> subject <> ";") inner.lines
-      , st: inner.st
-      , canFail: inner.canFail
-      }
-
-  LiteralBinder literal -> case literal of
-    LitBoolean b ->
-      wrapTest (subject <> ".asBool() == " <> (if b then "true" else "false")) ctx st k
-    LitInt n ->
-      wrapTest (subject <> ".asInt() == " <> show n) ctx st k
-    LitNumber n ->
-      wrapTest (subject <> ".asNumber() == " <> show n) ctx st k
-    LitChar c ->
-      wrapTest (subject <> ".asChar() == " <> Ident.stringLit c <> "[0]") ctx st k
-    LitString s ->
-      wrapTest (subject <> ".stringEq(" <> Ident.stringLit s <> ")") ctx st k
-
-    -- An array binder is refutable on length, then positional.
-    LitArray items ->
-      wrapTest (subject <> ".asArray().len == " <> show (length items)) ctx st
-        \ctx' st' ->
-          emitBinders ctx' st' (\i -> subject <> ".asArray()[" <> show i <> "]") 0 items k
-
-    -- A record binder needs no test: the type checker guarantees the fields.
-    LitObject fields ->
-      emitBinders ctx st
-        (\i -> subject <> ".field(" <> Ident.stringLit (indexOr "" (map _.key fields) i) <> ")")
-        0
-        (map _.value fields)
-        k
-
-  -- Bind the whole subject, then keep matching it against the inner binder.
-  NamedBinder ident inner -> do
-    let
-      zig =
-        if isJust (lookupScope ctx ident) then Ident.local (ident <> "." <> show st.counter)
-        else Ident.local ident
-      ctx' = ctx { scope = cons { ps: ident, zig, lazy: false } ctx.scope }
-    rest <- emitBinder ctx' (st { counter = st.counter + 1 }) subject inner k
-    pure
-      { lines: cons ("        const " <> zig <> " = " <> subject <> ";") rest.lines
-      , st: rest.st
-      , canFail: rest.canFail
-      }
-
-  -- A newtype constructor is erased by the COMPILER on the construction side:
-  -- CoreFn emits it as the identity function, so the value arriving here was
-  -- never wrapped and `hasTag` could only ever fail. Match the single inner
-  -- binder against the subject itself, with no test.
-  --
-  -- This is not an optimisation. Single-method type classes are newtypes, so
-  -- `Eq`, `Ord`, `Show` and most of the Prelude depend on it.
-  ConstructorBinder c
-    | c.isNewtype ->
-        emitBinders ctx st (\_ -> subject) 0 c.binders k
-    | otherwise ->
-        wrapTest (subject <> ".hasTag(" <> Ident.stringLit c.constructorName.identifier <> ")") ctx st
-          \ctx' st' ->
-            emitBinders ctx' st' (\i -> subject <> ".arg(" <> show i <> ")") 0 c.binders k
-
--- | A test that must hold for the alternative to match. Failure falls through
--- | to whatever the enclosing block emits next, which is the next alternative.
-wrapTest :: String -> Ctx -> St -> (Ctx -> St -> Either String Lines) -> Either String Lines
-wrapTest test ctx st k = do
-  inner <- k ctx st
-  pure
-    { lines: [ "        if (" <> test <> ") {" ] <> inner.lines <> [ "        }" ]
-    , st: inner.st
-    , canFail: true
-    }
-
--- | A recursive `let` group. Local mutual recursion cannot be expressed with
--- | `const`, so the whole group is lifted to top-level functions sharing one
--- | environment -- the union of the members' free variables, minus the members
--- | themselves.
--- |
--- | The trick that makes self-reference terminate for a FUNCTION member: within
--- | the group, a member is `rt.Value.mkClosure(fn, env)`, a VALUE, not a call.
--- | Emitting a call would re-enter the function being defined while building
--- | its own capture list and loop forever.
--- |
--- | A member that is NOT a function gets a lazy cell instead. The compiler
--- | offers `applyLazinessTransform` for this, but only to backends embedding it
--- | as a Haskell library; reading `corefn.json` means implementing the fallback
--- | the 0.15.0 release notes describe -- make recursive bindings lazy, skipping
--- | the machinery when every initialiser in the group is an `Abs`. That skip is
--- | why function members still take the cheaper path above.
--- |
--- | Ordering at the let site is forced by a mutual dependency: an initialiser
--- | closes over an environment that has to contain the cells, so the cells are
--- | created empty first, then the environment, then the initialisers attached.
-emitRecLet :: Ctx -> St -> Array { identifier :: String, expression :: Expr } -> Either String LetAcc
-emitRecLet ctx st group = do
-  let
-    names = map _.identifier group
-    n = st.counter
-    base = ctx.prefix <> ".rec" <> show n
-    fnNameFor i = Ident.lifted (base <> "." <> show i)
-
-    isLazyMember b = case b.expression of
-      Abs _ -> false
-      _ -> true
-
-    -- Group indices of the members needing a cell, in order.
-    lazyIndices =
-      map _.i (filter (\m -> isLazyMember m.b) (mapWithIndex (\i b -> { i, b }) group))
-
+    fnNameFor i = Ident.lifted (ctx.prefix <> ".rec" <> show n <> "." <> show i)
     cellName i = Ident.local ("lazy." <> show n <> "." <> show i)
-
-    -- Free variables of the whole group, so every member shares one env layout.
-    captured =
-      filter (\ident -> not (elem ident names) && isJust (lookupScope ctx ident))
-        (sort (nub (concat (map (\b -> freeVars b.expression) group))))
-
-    -- Env layout: captured variables first, then one slot per lazy member.
-    -- Both halves are fixed at emission time, so a slot index is a constant.
-    slotOf i = length captured + fromMaybe 0 (elemIndex i lazyIndices)
-
-    -- Inside a lifted member, a function sibling resolves through `env` as a
-    -- closure value; a lazy sibling resolves to its cell, which reading forces.
-    memberScope =
-      mapWithIndex
-        ( \i ident ->
-            if elem i lazyIndices then
-              { ps: ident, zig: "env[" <> show (slotOf i) <> "]", lazy: true }
-            else { ps: ident, zig: mkClosureOf (fnNameFor i) "env", lazy: false }
-        )
-        names
-    innerBase =
-      memberScope
-        <> map (\ident -> { ps: ident, zig: Ident.local ident, lazy: isLazy ctx ident }) captured
-    envBindings =
-      mapWithIndex (\i ident -> "    const " <> Ident.local ident <> " = env[" <> show i <> "];") captured
-
     envName = Ident.local ("env." <> show n)
+
+    lazyIndices = filter (\i -> not (isAbs (fromMaybe unitExpr (exprs `indexExpr` i)))) (range' 0 (length keys))
+
+    -- The union of the members' free variables, minus the members themselves,
+    -- so that every member shares one env layout and every slot index is a
+    -- compile-time constant.
+    allFree = nub (concat (map freeKeys exprs))
+    captured = orderKeys (filter (\k -> not (elem k keys) && isJust (lookupEntry ctx k)) allFree)
+
     hasEnv = not (null captured) || not (null lazyIndices)
     envText = if hasEnv then envName else "rt.no_env"
 
-  defs <- emitRecMembers ctx (st { counter = st.counter + 1 }) fnNameFor innerBase envBindings names
-    (mapWithIndex (\i b -> { i, b }) group)
+    -- Env layout: captured variables first, then one slot per lazy member.
+    innerBase =
+      map (\k -> { key: k, zig: zigOf k, lazy: isLazy ctx k }) captured
+    envBindings =
+      mapWithIndex (\i k -> "    const " <> zigOf k <> " = env[" <> show i <> "];") captured
+    lazySlots =
+      mapWithIndex (\j i -> { i, slot: length captured + j }) lazyIndices
+
+    innerScope =
+      innerBase
+        <> map
+          ( \s ->
+              { key: fromMaybe emptyKey (keys `indexKey` s.i)
+              , zig: "env[" <> show s.slot <> "]"
+              , lazy: true
+              }
+          )
+          lazySlots
+        <> map
+          ( \i ->
+              { key: fromMaybe emptyKey (keys `indexKey` i)
+              , zig: mkClosureOf (fnNameFor i) "env"
+              , lazy: false
+              }
+          )
+          (filter (\i -> not (elem i lazyIndices)) (range' 0 (length keys)))
+
+  defs <- emitRecMembers ctx (st { counter = st.counter + 1 }) fnNameFor innerScope envBindings keys
+    (mapWithIndex (\i e -> { i, e }) exprs)
+
+  bodyCtx <- Right
+    ( ctx
+        { scope =
+            mapWithIndex
+              ( \i k ->
+                  if elem i lazyIndices then { key: k, zig: cellName i, lazy: true }
+                  else { key: k, zig: mkClosureOf (fnNameFor i) envText, lazy: false }
+              )
+              keys
+              <> ctx.scope
+        }
+    )
+
+  bodyOut <- emitExpr bodyCtx defs body
 
   let
+    -- Order is forced by a mutual dependency: the initialisers close over an
+    -- environment that has to contain the cells, so cells first, then the
+    -- environment, then the initialisers attached.
     cellLines =
       map
         ( \i ->
             "        const " <> cellName i <> " = rt.newLazy("
-              <> Ident.stringLit (fromMaybe "" (index names i))
+              <> Ident.stringLit (keyName (fromMaybe emptyKey (keys `indexKey` i)))
               <> ", "
               <> Ident.stringLit ctx.moduleName
               <> ");"
@@ -736,35 +587,19 @@ emitRecLet ctx st group = do
 
     initLines =
       map
-        ( \i ->
-            "        rt.setLazyInit(" <> cellName i <> ", "
-              <> mkClosureOf (fnNameFor i) envText
-              <> ");"
-        )
+        ( \i -> "        rt.setLazyInit(" <> cellName i <> ", " <> mkClosureOf (fnNameFor i) envText <> ");" )
         lazyIndices
 
-    -- Only function members get a `const`; a lazy member IS its cell.
-    memberLines =
-      map
-        ( \i ->
-            "        const " <> Ident.local (fromMaybe "" (index names i)) <> " = "
-              <> mkClosureOf (fnNameFor i) envText
-              <> ";"
-        )
-        (filter (\i -> not (elem i lazyIndices)) (range' 0 (length names)))
-
-    outerScope =
-      mapWithIndex
-        ( \i ident ->
-            if elem i lazyIndices then { ps: ident, zig: cellName i, lazy: true }
-            else { ps: ident, zig: Ident.local ident, lazy: false }
-        )
-        names
-
   pure
-    { ctx: ctx { scope = outerScope <> ctx.scope }
-    , st: defs
-    , lines: cellLines <> envLine <> initLines <> memberLines
+    { text:
+        joinWith "\n"
+          ( [ label <> ": {" ]
+              <> cellLines
+              <> envLine
+              <> initLines
+              <> [ breakStmt label body bodyOut.text, "    }" ]
+          )
+    , st: bodyOut.st
     }
 
 mkClosureOf :: String -> String -> String
@@ -776,149 +611,352 @@ emitRecMembers
   -> (Int -> String)
   -> Array Scoped
   -> Array String
-  -> Array String
-  -> Array { i :: Int, b :: { identifier :: String, expression :: Expr } }
+  -> Array Key
+  -> Array { i :: Int, e :: NeutralExpr }
   -> Either String St
-emitRecMembers ctx st fnNameFor innerBase envBindings names members =
+emitRecMembers ctx st fnNameFor innerScope envBindings keys members =
   case uncons members of
     Nothing -> Right st
-    Just { head, tail } -> case head.b.expression of
-      Abs a -> do
-        let
-          argZig = Ident.local a.argument
-          innerScope = cons { ps: a.argument, zig: argZig, lazy: false } innerBase
-        bodyOut <- emitExpr (ctx { scope = innerScope }) st a.body
-        let
-          bodyFree = freeVars a.body
+    Just { head, tail } -> do
+      one <- emitRecMember ctx st fnNameFor innerScope envBindings keys head.i head.e
+      emitRecMembers ctx one fnNameFor innerScope envBindings keys tail
 
-          -- Same reason as emitAbs: Zig rejects an unused parameter.
-          argDiscard =
-            if elem a.argument bodyFree then []
-            else [ "    _ = " <> argZig <> ";" ]
+emitRecMember
+  :: Ctx
+  -> St
+  -> (Int -> String)
+  -> Array Scoped
+  -> Array String
+  -> Array Key
+  -> Int
+  -> NeutralExpr
+  -> Either String St
+emitRecMember ctx st fnNameFor innerScope envBindings keys i expr = case expr of
+  NeutralExpr (Abs args body) -> do
+    let
+      { head: Tuple mIdent lvl, tail } = NEA.uncons args
+      key = keyOf mIdent lvl
+      argZig = zigOf key
+      inner = case NEA.fromArray tail of
+        Nothing -> body
+        Just rest -> NeutralExpr (Abs rest body)
+      scope = cons { key, zig: argZig, lazy: false } innerScope
+    bodyOut <- emitExpr (ctx { scope = scope }) st inner
+    let
+      bodyFree = freeKeys inner
+      argDiscard = if elem key bodyFree then [] else [ "    _ = " <> argZig <> ";" ]
+      def = recDef (fnNameFor i) argZig (envLinesFor envBindings keys bodyFree) argDiscard inner bodyOut.text
+    pure (bodyOut.st { lifted = snoc bodyOut.st.lifted def })
 
-          -- `env` is used by more than the bindings pulled out of it: a
-          -- reference to any group member -- including a self-reference --
-          -- emits `mkClosure(fn, env)`. Discarding on `null envBindings` alone
-          -- produces a "pointless discard" for a recursive function that
-          -- captures nothing, which `Data.Void.absurd` is exactly.
-          memberUsed = not (null (filter (\n -> elem n bodyFree) names))
-          envLines =
-            if not (null envBindings) then envBindings
-            else if memberUsed then []
-            else [ "    _ = env;" ]
+  -- Not a function, so it becomes a lazy cell's initialiser: a closure of one
+  -- ignored argument, exactly the `Unit -> a` the laziness contract specifies.
+  _ -> do
+    let argZig = Ident.local ("lazyarg." <> show st.counter)
+    bodyOut <- emitExpr (ctx { scope = innerScope }) (st { counter = st.counter + 1 }) expr
+    let
+      bodyFree = freeKeys expr
+      def =
+        recDef (fnNameFor i) argZig (envLinesFor envBindings keys bodyFree)
+          [ "    _ = " <> argZig <> ";" ]
+          expr
+          bodyOut.text
+    pure (bodyOut.st { lifted = snoc bodyOut.st.lifted def })
 
-          def =
-            joinWith "\n"
-              ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
-                  <> envLines
-                  <> argDiscard
-                  <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
-              )
-        emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings names tail
-      -- Not a function, so it becomes a lazy cell's initialiser: a closure of
-      -- one ignored argument, exactly the `Unit -> a` the compiler's own
-      -- laziness contract specifies. It is lifted like an `Abs` member and
-      -- shares the same environment; only the reference side differs, where
-      -- reading forces the cell rather than rebuilding a closure.
-      _ -> do
-        let
-          argZig = Ident.local ("lazyarg." <> show st.counter)
-        bodyOut <- emitExpr (ctx { scope = innerBase }) (st { counter = st.counter + 1 })
-          head.b.expression
-        let
-          bodyFree = freeVars head.b.expression
-          memberUsed = not (null (filter (\n -> elem n bodyFree) names))
-          envLines =
-            if not (null envBindings) then envBindings
-            else if memberUsed then []
-            else [ "    _ = env;" ]
+recDef :: String -> String -> Array String -> Array String -> NeutralExpr -> String -> String
+recDef fnName argZig envLines argDiscard body bodyText =
+  joinWith "\n"
+    ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
+        <> envLines
+        <> argDiscard
+        <> [ returnStmt body bodyText, "}", "" ]
+    )
 
-          def =
-            joinWith "\n"
-              ( [ "fn " <> fnNameFor head.i <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
-                  <> envLines
-                  <> [ "    _ = " <> argZig <> ";" ]
-                  <> [ "    return " <> bodyOut.text <> ";", "}", "" ]
-              )
-        emitRecMembers ctx (bodyOut.st { lifted = snoc bodyOut.st.lifted def }) fnNameFor innerBase envBindings names tail
+-- | `env` is used by more than the bindings pulled out of it: every reference
+-- | to a group member -- including a self-reference -- emits
+-- | `mkClosure(fn, env)`. Discarding on "no captures" alone produces a
+-- | pointless discard for a recursive function that captures nothing, which
+-- | `Data.Void.absurd` is exactly.
+envLinesFor :: Array String -> Array Key -> Array Key -> Array String
+envLinesFor envBindings keys bodyFree =
+  if not (null envBindings) then envBindings
+  else if not (null (filter (\k -> elem k bodyFree) keys)) then []
+  else [ "    _ = env;" ]
 
-lookupEntry :: Ctx -> String -> Maybe Scoped
-lookupEntry ctx name = findMap (\e -> if e.ps == name then Just e else Nothing) ctx.scope
+-- | Pattern matching arrives already compiled: a list of condition/result
+-- | pairs with a fallback. Conditions are ordinary Values, so each is a
+-- | `.asBool()` test, and a labelled block gives the equivalent of the JS
+-- | backend's early return.
+-- |
+-- | No reachability tracking is needed. The optimizer has already pruned
+-- | unreachable alternatives, and the fallback is always emitted -- it is an
+-- | expression (often `Fail`), not an optional trailing panic.
+emitBranch :: Ctx -> St -> Array (Pair NeutralExpr) -> NeutralExpr -> Either String Out
+emitBranch ctx st pairs fallback = do
+  let
+    n = st.counter
+    label = "case" <> show n
+  arms <- emitArms ctx (st { counter = st.counter + 1 }) label pairs
+  fb <- emitExpr ctx arms.st fallback
+  pure
+    { text:
+        joinWith "\n"
+          ( [ label <> ": {" ]
+              <> arms.lines
+              <> [ breakStmt label fallback fb.text, "    }" ]
+          )
+    , st: fb.st
+    }
 
-lookupScope :: Ctx -> String -> Maybe String
-lookupScope ctx name = map _.zig (lookupEntry ctx name)
+emitArms :: Ctx -> St -> String -> Array (Pair NeutralExpr) -> Either String { lines :: Array String, st :: St }
+emitArms ctx st label pairs = case uncons pairs of
+  Nothing -> Right { lines: [], st }
+  Just { head: Pair cond result, tail } -> do
+    c <- emitExpr ctx st cond
+    r <- emitExpr ctx c.st result
+    rest <- emitArms ctx r.st label tail
+    pure
+      { lines:
+          cons ("        if (" <> c.text <> ".asBool()) " <> tailText label result r.text <> ";")
+            rest.lines
+      , st: rest.st
+      }
 
--- | Whether a name in scope is a lazy cell. Absent names are not lazy: a
--- | top-level reference is a nullary call, which recomputes rather than
--- | caching and so needs no cell.
-isLazy :: Ctx -> String -> Boolean
-isLazy ctx name = case lookupEntry ctx name of
+-- | Primitive operations. These are new: the optimizer rewrites the prelude's
+-- | foreign arithmetic, comparison and append into `PrimOp`, so most of what
+-- | used to be an FFI call arrives here instead.
+-- |
+-- | Four operators are deliberately NOT implemented, because this backend's
+-- | semantics differ from the JavaScript ones the optimizer assumes:
+-- | integer division (ours is Euclidean and returns 0 on divide-by-zero), the
+-- | three bit-shifts (JavaScript masks the count to 5 bits), and string
+-- | ordering (the runtime has `stringEq` but no comparison). `Main.purs`
+-- | filters the corresponding entries out of `coreForeignSemantics`, so those
+-- | calls stay in the FFI where the semantics already match. If one of these
+-- | ever fires, the filter has drifted.
+emitPrimOp :: Ctx -> St -> BackendOperator NeutralExpr -> Either String Out
+emitPrimOp ctx st op = case op of
+  Op1 o a -> do
+    x <- emitExpr ctx st a
+    text <- op1Text o x.text
+    pure { text, st: x.st }
+  Op2 o a b -> do
+    x <- emitExpr ctx st a
+    y <- emitExpr ctx x.st b
+    text <- op2Text o x.text y.text
+    pure { text, st: y.st }
+
+op1Text :: BackendOperator1 -> String -> Either String String
+op1Text o x = case o of
+  OpBooleanNot -> Right ("rt.Value.mkBool(!" <> x <> ".asBool())")
+  OpIntBitNot -> Right ("rt.Value.mkInt(~" <> x <> ".asInt())")
+  OpIntNegate -> Right ("rt.Value.mkInt(-%" <> x <> ".asInt())")
+  OpNumberNegate -> Right ("rt.Value.mkNumber(-" <> x <> ".asNumber())")
+  OpArrayLength -> Right ("rt.Value.mkInt(@intCast(" <> x <> ".asArray().len))")
+  OpIsTag (Qualified _ ctor) ->
+    Right ("rt.Value.mkBool(" <> x <> ".hasTag(" <> Ident.stringLit (unwrap ctor) <> "))")
+
+op2Text :: BackendOperator2 -> String -> String -> Either String String
+op2Text o x y = case o of
+  OpArrayIndex -> Right (x <> ".asArray()[@intCast(" <> y <> ".asInt())]")
+
+  -- Zig's `and`/`or` short-circuit, and the right operand is part of the
+  -- right-hand expression, so this stays lazy in the second argument as
+  -- PureScript expects.
+  OpBooleanAnd -> Right ("rt.Value.mkBool(" <> x <> ".asBool() and " <> y <> ".asBool())")
+  OpBooleanOr -> Right ("rt.Value.mkBool(" <> x <> ".asBool() or " <> y <> ".asBool())")
+
+  OpBooleanOrd ord -> Right (cmp ord ("@intFromBool(" <> x <> ".asBool())") ("@intFromBool(" <> y <> ".asBool())"))
+  OpCharOrd ord -> Right (cmp ord (x <> ".asChar()") (y <> ".asChar()"))
+  OpIntOrd ord -> Right (cmp ord (x <> ".asInt()") (y <> ".asInt()"))
+  OpNumberOrd ord -> Right (cmp ord (x <> ".asNumber()") (y <> ".asNumber()"))
+
+  OpStringOrd OpEq -> Right ("rt.Value.mkBool(" <> x <> ".stringEq(" <> y <> ".asString()))")
+  OpStringOrd OpNotEq -> Right ("rt.Value.mkBool(!" <> x <> ".stringEq(" <> y <> ".asString()))")
+  OpStringOrd _ -> Left "PrimOp: string ordering (Data.Ord.ordString should be filtered)"
+
+  OpIntNum OpAdd -> Right (intOp "+%" x y)
+  OpIntNum OpSubtract -> Right (intOp "-%" x y)
+  OpIntNum OpMultiply -> Right (intOp "*%" x y)
+  OpIntNum OpDivide -> Left "PrimOp: Int division (Data.EuclideanRing.intDiv should be filtered)"
+
+  OpNumberNum OpAdd -> Right (numOp "+" x y)
+  OpNumberNum OpSubtract -> Right (numOp "-" x y)
+  OpNumberNum OpMultiply -> Right (numOp "*" x y)
+  OpNumberNum OpDivide -> Right (numOp "/" x y)
+
+  OpIntBitAnd -> Right (intOp "&" x y)
+  OpIntBitOr -> Right (intOp "|" x y)
+  OpIntBitXor -> Right (intOp "^" x y)
+  OpIntBitShiftLeft -> Left "PrimOp: Int shl (Data.Int.Bits should be filtered)"
+  OpIntBitShiftRight -> Left "PrimOp: Int shr (Data.Int.Bits should be filtered)"
+  OpIntBitZeroFillShiftRight -> Left "PrimOp: Int zshr (Data.Int.Bits should be filtered)"
+
+  OpStringAppend ->
+    Right
+      ( "rt.Value.mkString(rt.concatString(" <> x <> ".asString(), " <> y <> ".asString()))" )
+
+-- | `Fail` becomes `@panic`, which is `noreturn`. Zig then rejects the
+-- | enclosing `return` or `break` as unreachable code -- control flow has
+-- | already diverted by the time it would run. So a diverging expression is
+-- | emitted as a bare statement instead.
+-- |
+-- | This only became reachable with the optimizer: the CoreFn emitter tracked
+-- | reachability itself and simply omitted the trailing panic, whereas here
+-- | `Fail` arrives as an ordinary expression in the IR, in tail position of a
+-- | branch, a let, or a whole binding.
+diverges :: NeutralExpr -> Boolean
+diverges (NeutralExpr syntax) = case syntax of
+  Fail _ -> true
+  _ -> false
+
+returnStmt :: NeutralExpr -> String -> String
+returnStmt e text = if diverges e then "    " <> text <> ";" else "    return " <> text <> ";"
+
+breakStmt :: String -> NeutralExpr -> String -> String
+breakStmt label e text = "        " <> tailText label e text <> ";"
+
+tailText :: String -> NeutralExpr -> String -> String
+tailText label e text = if diverges e then text else "break :" <> label <> " " <> text
+
+cmp :: BackendOperatorOrd -> String -> String -> String
+cmp ord x y = "rt.Value.mkBool(" <> x <> " " <> ordText ord <> " " <> y <> ")"
+
+ordText :: BackendOperatorOrd -> String
+ordText = case _ of
+  OpEq -> "=="
+  OpNotEq -> "!="
+  OpGt -> ">"
+  OpGte -> ">="
+  OpLt -> "<"
+  OpLte -> "<="
+
+-- | Every Int operation wraps, matching JavaScript's `| 0`. Zig's plain `+`
+-- | panics on overflow in Debug, where JavaScript silently wraps.
+intOp :: String -> String -> String -> String
+intOp o x y = "rt.Value.mkInt(" <> x <> ".asInt() " <> o <> " " <> y <> ".asInt())"
+
+numOp :: String -> String -> String -> String
+numOp o x y = "rt.Value.mkNumber(" <> x <> ".asNumber() " <> o <> " " <> y <> ".asNumber())"
+
+-- ---------------------------------------------------------------------------
+-- Scope and keys
+
+keyOf :: Maybe Ident -> Level -> Key
+keyOf mIdent lvl = { name: maybe' mIdent, level: unwrap lvl }
+  where
+  maybe' = case _ of
+    Just (Ident s) -> s
+    Nothing -> ""
+
+emptyKey :: Key
+emptyKey = { name: "", level: -1 }
+
+keyName :: Key -> String
+keyName k = if k.name == "" then "anonymous" else k.name
+
+keyText :: Key -> String
+keyText k = keyName k <> "@" <> show k.level
+
+-- | `@"v.<name>.<level>"`. The pair is unique by construction, so there is no
+-- | shadowing to defend against and no counter suffix.
+zigOf :: Key -> String
+zigOf k = Ident.local ((if k.name == "" then "l" else k.name) <> "." <> show k.level)
+
+-- | A stable capture order, so that env slot indices are deterministic.
+orderKeys :: Array Key -> Array Key
+orderKeys = sortWith (\k -> Tuple k.level k.name) <<< nub
+
+lookupEntry :: Ctx -> Key -> Maybe Scoped
+lookupEntry ctx key = findMap (\e -> if e.key == key then Just e else Nothing) ctx.scope
+
+isLazy :: Ctx -> Key -> Boolean
+isLazy ctx key = case lookupEntry ctx key of
   Just e -> e.lazy
   Nothing -> false
 
--- | How a locally-bound name is written *at a use site in the current scope*.
--- |
--- | Not always `Ident.local name`: a shadowed let binder carries a suffix, and
--- | a recursive-let member is a whole `mkClosure` expression. Anything building
--- | a capture list must go through here rather than reconstructing the name,
--- | or it will reference an identifier that was never declared.
-scopeText :: Ctx -> String -> String
-scopeText ctx name = case lookupScope ctx name of
-  Just zig -> zig
-  Nothing -> Ident.local name
+-- | How a local is written AT A USE SITE in the current scope. Not always
+-- | `zigOf`: a recursive-let member is a whole `mkClosure` expression, and a
+-- | captured local inside a lifted body is an `env[i]`. Anything building a
+-- | capture list must go through here.
+scopeText :: Ctx -> Key -> String
+scopeText ctx key = case lookupEntry ctx key of
+  Just e -> e.zig
+  Nothing -> zigOf key
 
--- | Locally-bound names referenced in an expression. Module-qualified Vars are
--- | never free -- they compile to calls, not captures.
-freeVars :: Expr -> Array String
-freeVars = go []
+isAbs :: NeutralExpr -> Boolean
+isAbs (NeutralExpr syntax) = case syntax of
+  Abs _ _ -> true
+  _ -> false
+
+unitExpr :: NeutralExpr
+unitExpr = NeutralExpr PrimUndefined
+
+indexExpr :: Array NeutralExpr -> Int -> Maybe NeutralExpr
+indexExpr xs i = findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithIndex (\j x -> { i: j, x }) xs)
+
+indexKey :: Array Key -> Int -> Maybe Key
+indexKey xs i = findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithIndex (\j x -> { i: j, x }) xs)
+
+-- ---------------------------------------------------------------------------
+-- Free variables
+
+-- | Locals referenced in an expression but bound outside it. `Var` is never
+-- | free -- it compiles to a call, not a capture.
+freeKeys :: NeutralExpr -> Array Key
+freeKeys = nub <<< go []
   where
-  go bound expr = case expr of
-    Var q -> case q.moduleName of
-      Nothing -> if elem q.identifier bound then [] else [ q.identifier ]
-      Just _ -> []
+  go bound (NeutralExpr syntax) = case syntax of
+    Local mIdent lvl ->
+      let k = keyOf mIdent lvl
+      in if elem k bound then [] else [ k ]
+
+    Var _ -> []
     Lit literal -> goLit bound literal
-    Abs a -> go (cons a.argument bound) a.body
-    App a -> go bound a.abstraction <> go bound a.argument
-    Accessor a -> go bound a.expression
-    ObjectUpdate a -> go bound a.expression <> concat (map (\u -> go bound u.value) a.updates)
-    Constructor _ -> []
-    Let l ->
+    App f args -> go bound f <> concat (map (go bound) (NEA.toArray args))
+    Abs args body -> go (bound <> map absKey (NEA.toArray args)) body
+    UncurriedApp f args -> go bound f <> concat (map (go bound) args)
+    UncurriedAbs args body -> go (bound <> map absKey args) body
+    UncurriedEffectApp f args -> go bound f <> concat (map (go bound) args)
+    UncurriedEffectAbs args body -> go (bound <> map absKey args) body
+    Accessor e _ -> go bound e
+    Update e props -> go bound e <> concat (map (go bound <<< propValue) props)
+    CtorSaturated _ _ _ _ fields -> concat (map (go bound <<< snd) fields)
+    CtorDef _ _ _ _ -> []
+
+    LetRec lvl bindings body ->
       let
-        names = concat (map bindNames l.binds)
-        inner = bound <> names
+        inner = bound <> map (\(Tuple ident _) -> { name: unwrap ident, level: unwrap lvl })
+          (NEA.toArray bindings)
       in
-        concat (map (goBind inner) l.binds) <> go inner l.expression
-    Case c ->
-      concat (map (go bound) c.caseExpressions)
-        <> concat (map (goAlt bound) c.caseAlternatives)
+        concat (map (go inner <<< snd) (NEA.toArray bindings)) <> go inner body
+
+    Let mIdent lvl e body -> go bound e <> go (cons (keyOf mIdent lvl) bound) body
+    EffectBind mIdent lvl e body -> go bound e <> go (cons (keyOf mIdent lvl) bound) body
+    EffectPure e -> go bound e
+    EffectDefer e -> go bound e
+
+    Branch pairs fallback ->
+      concat (map (goPair bound) (NEA.toArray pairs)) <> go bound fallback
+
+    PrimOp o -> goOp bound o
+    PrimEffect e -> goEffect bound e
+    PrimUndefined -> []
+    Fail _ -> []
+
+  absKey (Tuple mIdent lvl) = keyOf mIdent lvl
+
+  goPair bound (Pair a b) = go bound a <> go bound b
 
   goLit bound literal = case literal of
     LitArray items -> concat (map (go bound) items)
-    LitObject fields -> concat (map (\f -> go bound f.value) fields)
+    LitRecord props -> concat (map (go bound <<< propValue) props)
     _ -> []
 
-  goBind bound decl = case decl of
-    NonRec _ e -> go bound e
-    Rec group -> concat (map (\b -> go bound b.expression) group)
+  goOp bound o = case o of
+    Op1 _ a -> go bound a
+    Op2 _ a b -> go bound a <> go bound b
 
-  bindNames decl = case decl of
-    NonRec ident _ -> [ ident ]
-    Rec group -> map _.identifier group
-
-  goAlt bound alt =
-    let
-      inner = bound <> concat (map binderNames alt.binders)
-    in
-      case alt.result of
-        Unconditional e -> go inner e
-        Guarded gs -> concat (map (\g -> go inner g.guard <> go inner g.expression) gs)
-
-  binderNames binder = case binder of
-    NullBinder -> []
-    VarBinder ident -> [ ident ]
-    NamedBinder ident b -> cons ident (binderNames b)
-    LiteralBinder literal -> case literal of
-      LitArray items -> concat (map binderNames items)
-      LitObject fields -> concat (map (\f -> binderNames f.value) fields)
-      _ -> []
-    ConstructorBinder c -> concat (map binderNames c.binders)
+  goEffect bound e = case e of
+    EffectRefNew a -> go bound a
+    EffectRefRead a -> go bound a
+    EffectRefWrite a b -> go bound a <> go bound b
