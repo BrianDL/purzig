@@ -18,12 +18,9 @@
 -- |    function plus a captured `[]const rt.Value`. `freeKeys` is the only real
 -- |    algorithm left here.
 -- |
--- | NOT IMPLEMENTED in this batch: `EffectBind`, `EffectPure`, `EffectDefer`,
--- | `PrimEffect`. Each returns a `Left` naming itself. They are unreachable so
--- | long as `Main.purs` filters the corresponding entries out of
--- | `coreForeignSemantics` -- `Effect.bindE` and friends then stay ordinary
--- | foreign applications through the existing `rt.effect` FFI, exactly as they
--- | work today.
+-- | Every IR node is implemented, including the four effect nodes. A chain of
+-- | `EffectBind`s flattens into a single Zig block of statements rather than a
+-- | closure per bind -- that is what MagicDo buys.
 -- |
 -- | NAMING HAZARD: nothing in this module may be called `bind` or `discard`.
 -- | Do-notation desugars to functions of exactly those names, so a parameter
@@ -178,7 +175,7 @@ emitTopValue ctx st ident expr = do
   pure
     { defs:
         [ "pub fn " <> Ident.topLevel ident <> "() rt.Error!rt.Value {"
-        , returnStmt expr o.text
+        , returnStmt (diverges expr) o.text
         , "}"
         , ""
         ]
@@ -277,10 +274,26 @@ emitExpr ctx st (NeutralExpr syntax) = case syntax of
   -- noreturn, so it coerces to whatever type the surrounding expression needs.
   Fail msg -> Right { text: "@panic(" <> Ident.stringLit msg <> ")", st }
 
-  EffectBind _ _ _ _ -> Left "EffectBind"
-  EffectPure _ -> Left "EffectPure"
-  EffectDefer _ -> Left "EffectDefer"
-  PrimEffect _ -> Left "PrimEffect"
+  -- An `Effect a` is a thunk: a closure ignoring a unit argument, run by
+  -- `rt.runEffect`. All four nodes below produce a lifted closure, and differ
+  -- only in what its body does. `emitPerform` is what runs one.
+  EffectPure a ->
+    emitThunk ctx st (freeKeys a) \c s -> emitExpr c s a
+
+  EffectDefer a ->
+    emitThunk ctx st (freeKeys a) \c s -> emitPerform c s a
+
+  EffectBind mIdent lvl a b ->
+    let
+      node = NeutralExpr (EffectBind mIdent lvl a b)
+    in
+      emitThunk ctx st (freeKeys node) \c s -> emitEffectBlock c s node
+
+  PrimEffect eff ->
+    let
+      node = NeutralExpr (PrimEffect eff)
+    in
+      emitThunk ctx st (freeKeys node) \c s -> emitPerform c s node
 
 applyAll :: Ctx -> Out -> Array NeutralExpr -> Either String Out
 applyAll ctx acc args = case uncons args of
@@ -386,9 +399,27 @@ emitAbsChain ctx st args body = case uncons args of
 -- | The one genuinely non-trivial case. Lift the body to a top-level function
 -- | and pass captured locals as a flat positional slice.
 emitAbs :: Ctx -> St -> Key -> NeutralExpr -> Either String Out
-emitAbs ctx st key body = do
+emitAbs ctx st key body =
+  emitLifted ctx st key (freeKeys body) (diverges body) \c s -> emitExpr c s body
+
+-- | Lift a function to the top level, given the free variables its body
+-- | mentions and a way to emit that body in the inner scope.
+-- |
+-- | `emitAbs` is the ordinary case, where the body is one `NeutralExpr`. The
+-- | effect nodes need the same lifting but their bodies are composites -- a
+-- | block of statements, or an expression wrapped in `rt.runEffect` -- so the
+-- | body is a callback rather than a node, and the free-variable set is passed
+-- | in rather than computed here.
+emitLifted
+  :: Ctx
+  -> St
+  -> Key
+  -> Array Key
+  -> Boolean
+  -> (Ctx -> St -> Either String Out)
+  -> Either String Out
+emitLifted ctx st key bodyFree divergent emitBody = do
   let
-    bodyFree = freeKeys body
     captured = orderKeys (filter (\k -> k /= key && isJust (lookupEntry ctx k)) bodyFree)
 
     -- Zig errors on an unused function parameter, and PureScript produces them
@@ -401,7 +432,7 @@ emitAbs ctx st key body = do
       cons { key, zig: argZig, lazy: false }
         (map (\k -> { key: k, zig: zigOf k, lazy: isLazy ctx k }) captured)
 
-  bodyOut <- emitExpr (ctx { scope = innerScope }) (st { counter = st.counter + 1 }) body
+  bodyOut <- emitBody (ctx { scope = innerScope }) (st { counter = st.counter + 1 })
 
   let
     bindings = mapWithIndex (\i k -> "    const " <> zigOf k <> " = env[" <> show i <> "];") captured
@@ -413,7 +444,7 @@ emitAbs ctx st key body = do
             <> envDiscard
             <> argDiscard
             <> bindings
-            <> [ returnStmt body bodyOut.text, "}", "" ]
+            <> [ returnStmt divergent bodyOut.text, "}", "" ]
         )
     envExpr =
       if null captured then "rt.no_env"
@@ -668,7 +699,7 @@ recDef fnName argZig envLines argDiscard body bodyText =
     ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
         <> envLines
         <> argDiscard
-        <> [ returnStmt body bodyText, "}", "" ]
+        <> [ returnStmt (diverges body) bodyText, "}", "" ]
     )
 
 -- | `env` is used by more than the bindings pulled out of it: every reference
@@ -809,8 +840,9 @@ diverges (NeutralExpr syntax) = case syntax of
   Fail _ -> true
   _ -> false
 
-returnStmt :: NeutralExpr -> String -> String
-returnStmt e text = if diverges e then "    " <> text <> ";" else "    return " <> text <> ";"
+returnStmt :: Boolean -> String -> String
+returnStmt divergent text =
+  if divergent then "    " <> text <> ";" else "    return " <> text <> ";"
 
 breakStmt :: String -> NeutralExpr -> String -> String
 breakStmt label e text = "        " <> tailText label e text <> ";"
@@ -837,6 +869,107 @@ intOp o x y = "rt.Value.mkInt(" <> x <> ".asInt() " <> o <> " " <> y <> ".asInt(
 
 numOp :: String -> String -> String -> String
 numOp o x y = "rt.Value.mkNumber(" <> x <> ".asNumber() " <> o <> " " <> y <> ".asNumber())"
+
+-- | Wrap a body in an `Effect` thunk: a lifted closure whose argument is
+-- | ignored, so that nothing runs until `rt.runEffect` applies unit.
+-- |
+-- | The synthetic parameter key uses a negative level derived from the fresh
+-- | counter. Negative levels cannot collide with a real binder's (the optimizer
+-- | numbers from zero), and using the counter keeps nested thunks from
+-- | declaring the same parameter name, which Zig rejects as shadowing.
+emitThunk :: Ctx -> St -> Array Key -> (Ctx -> St -> Either String Out) -> Either String Out
+emitThunk ctx st bodyFree emitBody =
+  emitLifted ctx st thunkKey bodyFree false emitBody
+  where
+  thunkKey = { name: "eff", level: -1 - st.counter }
+
+-- | Perform an effect *now* and yield its result.
+-- |
+-- | This is what makes MagicDo pay. The generic case has to build a thunk and
+-- | immediately force it with `rt.runEffect`, but every node the optimizer
+-- | produced structurally is known to be an effect already, so its work can be
+-- | emitted inline with no closure at all. `pure x` becomes `x`; a `Ref` read
+-- | becomes a pointer dereference; a nested do-block becomes a nested Zig
+-- | block.
+emitPerform :: Ctx -> St -> NeutralExpr -> Either String Out
+emitPerform ctx st expr = case expr of
+  NeutralExpr (EffectPure a) -> emitExpr ctx st a
+  NeutralExpr (EffectDefer a) -> emitPerform ctx st a
+  NeutralExpr (EffectBind _ _ _ _) -> emitEffectBlock ctx st expr
+
+  NeutralExpr (PrimEffect (EffectRefNew a)) -> do
+    o <- emitExpr ctx st a
+    pure { text: "rt.newRef(" <> o.text <> ")", st: o.st }
+
+  NeutralExpr (PrimEffect (EffectRefRead r)) -> do
+    o <- emitExpr ctx st r
+    pure { text: o.text <> ".asRef().*", st: o.st }
+
+  -- A write is a statement in Zig, not an expression, so it needs a block to
+  -- sit in expression position -- and `Effect Unit` still has to yield a value.
+  NeutralExpr (PrimEffect (EffectRefWrite r v)) -> do
+    ro <- emitExpr ctx st r
+    vo <- emitExpr ctx ro.st v
+    let label = "eff" <> show vo.st.counter
+    pure
+      { text:
+          joinWith "\n"
+            [ label <> ": {"
+            , "        " <> ro.text <> ".asRef().* = " <> vo.text <> ";"
+            , "        break :" <> label <> " rt.Value.mkUnit();"
+            , "    }"
+            ]
+      , st: vo.st { counter = vo.st.counter + 1 }
+      }
+
+  -- Any other expression is an ordinary `Effect` value -- an application, a
+  -- variable, an FFI import -- so it has to be forced.
+  _ -> do
+    o <- emitExpr ctx st expr
+    pure { text: "(try rt.runEffect(" <> o.text <> "))", st: o.st }
+
+-- | Flatten a chain of `EffectBind`s into ONE Zig block of statements.
+-- |
+-- | Emitting each bind as its own thunk would allocate a closure per `>>=`,
+-- | which is exactly what MagicDo exists to avoid: the optimizer has already
+-- | proven the chain is a straight line, so it becomes a straight line.
+-- |
+-- | A bind whose result the continuation ignores is discarded rather than
+-- | bound -- Zig rejects an unused local constant, and PureScript produces
+-- | these constantly, since every `discard` in a do-block binds `$__unused`
+-- | and the loop combinators bind a result nobody reads.
+emitEffectBlock :: Ctx -> St -> NeutralExpr -> Either String Out
+emitEffectBlock ctx st expr = do
+  let label = "eff" <> show st.counter
+  r <- spine ctx (st { counter = st.counter + 1 }) [] expr
+  pure
+    { text:
+        joinWith "\n"
+          ( [ label <> ": {" ]
+              <> r.stmts
+              <> [ "        break :" <> label <> " " <> r.tail <> ";", "    }" ]
+          )
+    , st: r.st
+    }
+  where
+  spine
+    :: Ctx
+    -> St
+    -> Array String
+    -> NeutralExpr
+    -> Either String { stmts :: Array String, tail :: String, st :: St }
+  spine c s acc e = case e of
+    NeutralExpr (EffectBind mIdent lvl a b) -> do
+      let
+        key = keyOf mIdent lvl
+        zig = zigOf key
+        binder = if elem key (freeKeys b) then "const " <> zig else "_"
+      ao <- emitPerform c s a
+      let c' = c { scope = cons { key, zig, lazy: false } c.scope }
+      spine c' ao.st (snoc acc ("        " <> binder <> " = " <> ao.text <> ";")) b
+    _ -> do
+      o <- emitPerform c s e
+      pure { stmts: acc, tail: o.text, st: o.st }
 
 -- ---------------------------------------------------------------------------
 -- Scope and keys

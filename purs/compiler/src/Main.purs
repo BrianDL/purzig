@@ -123,25 +123,22 @@ build mods =
     mods
 
 -- | Foreign functions the optimizer knows how to evaluate, but whose result
--- | this backend cannot currently express. Removing an entry here does not
--- | break the call -- it just leaves it an ordinary application of the foreign
--- | import, exactly as before the optimizer existed, and the hand-written Zig
--- | FFI already has the right semantics.
+-- | this backend cannot express. Removing an entry here does not break the
+-- | call -- it just leaves it an ordinary application of the foreign import,
+-- | exactly as before the optimizer existed, and the hand-written Zig FFI
+-- | already has the right semantics.
 -- |
--- | Two reasons appear in this list.
+-- | All five are here for the same reason: the `PrimOp` the optimizer produces
+-- | assumes JavaScript semantics this backend deliberately does not share.
+-- | `intDiv` becomes `OpIntNum OpDivide`, which assumes truncating division;
+-- | ours is Euclidean and returns 0 rather than trapping on divide-by-zero,
+-- | transcribed from the original `.js`. The `Data.Int.Bits` shifts assume
+-- | JavaScript masks the shift count to five bits. `ordString` becomes
+-- | `OpStringOrd`, and the runtime has `stringEq` but no comparison.
 -- |
--- | SEMANTICS. `intDiv` becomes `OpIntNum OpDivide`, which assumes
--- | JavaScript's truncating division; ours is Euclidean and returns 0 rather
--- | than trapping on divide-by-zero, transcribed from the original `.js`. The
--- | `Data.Int.Bits` shifts assume JavaScript masks the shift count to five
--- | bits. `ordString` becomes `OpStringOrd`, and the runtime has `stringEq`
--- | but no comparison.
--- |
--- | NOT YET IMPLEMENTED. `Effect.bindE`/`pureE`, the `Effect.Ref` primitives
--- | and their `Control.Monad.ST` equivalents rewrite into `EffectBind`,
--- | `EffectPure`, `EffectDefer` and `PrimEffect` -- four IR nodes the emitter
--- | does not handle yet. Dropping these from the list is the whole of batch 2,
--- | and is where MagicDo starts paying off.
+-- | These are permanent, not a to-do list. `ordString` is the only one worth
+-- | revisiting, and only if a string comparison is added to the runtime's
+-- | public surface.
 unsupported :: Set (Qualified Ident)
 unsupported = Set.fromFoldable
   [ qualified "Data.EuclideanRing" "intDiv"
@@ -149,18 +146,6 @@ unsupported = Set.fromFoldable
   , qualified "Data.Int.Bits" "shl"
   , qualified "Data.Int.Bits" "shr"
   , qualified "Data.Int.Bits" "zshr"
-  , qualified "Effect" "bindE"
-  , qualified "Effect" "pureE"
-  , qualified "Effect.Ref" "_new"
-  , qualified "Effect.Ref" "read"
-  , qualified "Effect.Ref" "write"
-  , qualified "Effect.Ref" "modify"
-  , qualified "Effect.Unsafe" "unsafePerformEffect"
-  , qualified "Control.Monad.ST.Internal" "new"
-  , qualified "Control.Monad.ST.Internal" "read"
-  , qualified "Control.Monad.ST.Internal" "write"
-  , qualified "Control.Monad.ST.Internal" "modify"
-  , qualified "Control.Monad.ST.Internal" "run"
   ]
 
 codegen :: Module Ann -> BackendModule -> Effect Unit
