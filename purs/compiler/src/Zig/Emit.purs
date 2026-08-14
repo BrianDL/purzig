@@ -18,6 +18,13 @@
 -- |    function plus a captured `[]const rt.Value`. `freeKeys` is the only real
 -- |    algorithm left here.
 -- |
+-- | The tree walked here is `TcoExpr`, not `NeutralExpr`: `Tco.analyze`
+-- | decorates each node with tail-call information, which the loop emission
+-- | reads. Matching therefore goes through `unTcoExpr`. A node this module
+-- | synthesises (the tail of a curried `Abs` chain) carries `mempty` analysis,
+-- | which is sound because a synthesised node is only ever walked, never
+-- | consulted for a TCO decision.
+-- |
 -- | Every IR node is implemented, including the four effect nodes. A chain of
 -- | `EffectBind`s flattens into a single Zig block of statements rather than a
 -- | closure per bind -- that is what MagicDo buys.
@@ -30,18 +37,20 @@ module Zig.Emit (emitModule) where
 
 import Prelude
 
-import Data.Array (concat, cons, elem, filter, findMap, length, mapWithIndex, nub, null, snoc, sortWith, uncons)
+import Data.Array (concat, cons, elem, filter, findIndex, findMap, foldl, length, mapWithIndex, nub, null, snoc, sortWith, uncons)
 import Data.Array.NonEmpty as NEA
 import Data.Either (Either(..))
 import Data.Enum (fromEnum)
-import Data.Maybe (Maybe(..), fromMaybe, isJust)
+import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
 import Data.Newtype (unwrap)
 import Data.Set as Set
 import Data.String (joinWith)
+import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..), snd)
 import PureScript.Backend.Optimizer.Convert (BackendModule)
 import PureScript.Backend.Optimizer.CoreFn (Ident(..), Literal(..), ModuleName, Prop, Qualified(..), propKey, propValue)
-import PureScript.Backend.Optimizer.Semantics (NeutralExpr(..))
+import PureScript.Backend.Optimizer.Codegen.Tco (TcoExpr(..), analyze, localTcoRefBindings, tcoRoleIsLoop, topLevelTcoEnvGroup, topLevelTcoRefBindings, unTcoExpr)
+import PureScript.Backend.Optimizer.Semantics (NeutralExpr)
 import PureScript.Backend.Optimizer.Syntax (BackendAccessor(..), BackendEffect(..), BackendOperator(..), BackendOperator1(..), BackendOperator2(..), BackendOperatorNum(..), BackendOperatorOrd(..), BackendSyntax(..), Level(..), Pair(..))
 import Zig.Ident as Ident
 
@@ -50,6 +59,11 @@ import Zig.Ident as Ident
 type St =
   { counter :: Int
   , lifted :: Array String
+  -- | Slot indices a jump has assigned during the loop currently being
+  -- | emitted. Zig rejects a `var` that is never mutated, and with members of
+  -- | differing arity a high slot may belong to a member nothing ever jumps to,
+  -- | so mutability cannot be decided until the bodies are emitted.
+  , touched :: Array Int
   }
 
 type Out =
@@ -76,17 +90,44 @@ type Ctx =
   { moduleName :: String
   , prefix :: String
   , scope :: Array Scoped
+  , loop :: Maybe Loop
+  }
+
+-- | The tail-recursive binding currently being emitted as a loop, if any.
+-- | `params` are the mutable copies a jump assigns, in order.
+type Loop =
+  { members :: Array { target :: LoopTarget, arity :: Int }
+  , slots :: Array String
+  , branch :: Maybe String
+  }
+
+-- | A loop is reached either as a top-level binding (`Var`) or as a `LetRec`
+-- | member (`Local`). The two are otherwise identical.
+data LoopTarget
+  = LoopTop String
+  | LoopLocal Key
+
+-- | One member of a tail-recursive group. `key` is what a non-tail reference
+-- | to the member resolves to in scope; for a top-level member it is a
+-- | synthetic key that no real binder can produce.
+type LoopMember =
+  { target :: LoopTarget
+  , key :: Key
+  , ident :: String
+  , arity :: Int
+  , params :: Array Key
+  , body :: TcoExpr
   }
 
 emitModule :: BackendModule -> Either String String
 emitModule m = do
   let
     name = unwrap m.name
-    ctx0 = { moduleName: name, prefix: "", scope: [] }
+    ctx0 = { moduleName: name, prefix: "", scope: [], loop: Nothing }
     foreigns = map unwrap (Set.toUnfoldable m.foreign :: Array Ident)
     imports = map unwrap (Set.toUnfoldable m.imports :: Array ModuleName)
 
-  result <- emitGroups ctx0 { counter: 0, lifted: [] } m.bindings
+  result <- emitGroups ctx0 m.name { counter: 0, lifted: [], touched: [] } m.bindings
 
   let
     isEntry = name == "Main"
@@ -147,17 +188,41 @@ foreignLine name =
 -- | ordered the groups.
 emitGroups
   :: Ctx
+  -> ModuleName
   -> St
   -> Array { recursive :: Boolean, bindings :: Array (Tuple Ident NeutralExpr) }
   -> Either String Defs
-emitGroups ctx st groups = case uncons groups of
+emitGroups ctx mod st groups = case uncons groups of
   Nothing -> Right { defs: [], st }
   Just { head, tail } -> do
-    one <- emitBindings ctx st head.bindings
-    rest <- emitGroups ctx one.st tail
+    one <- emitGroup ctx mod st head.bindings
+    rest <- emitGroups ctx mod one.st tail
     pure { defs: one.defs <> rest.defs, st: rest.st }
 
-emitBindings :: Ctx -> St -> Array (Tuple Ident NeutralExpr) -> Either String Defs
+-- | `analyze` decorates every node with tail-call information, relative to an
+-- | environment naming the group's own bindings and their arities. That is what
+-- | lets it see a self-call in tail position as a jump rather than a call.
+-- |
+-- | `tcoRoleIsLoop` is true when EVERY self-reference in the group is a
+-- | saturated tail call at a uniform arity -- if the function is ever passed
+-- | around as a value, or called with the wrong number of arguments, it is not
+-- | a loop and the ordinary curried emission is the only correct one.
+-- |
+-- | Only single-binding groups take the loop path for now. A mutual group needs
+-- | a branch variable dispatching between members, which is a later batch.
+emitGroup :: Ctx -> ModuleName -> St -> Array (Tuple Ident NeutralExpr) -> Either String Defs
+emitGroup ctx mod st binds = case NEA.fromArray binds of
+  Nothing -> Right { defs: [], st }
+  Just nea -> do
+    let
+      env = topLevelTcoEnvGroup mod nea
+      analyzed = map (map (analyze env)) nea
+      isLoop = maybe false tcoRoleIsLoop (topLevelTcoRefBindings mod analyzed)
+    case topLoopMembers (NEA.toArray analyzed) of
+      Just members | isLoop -> emitLoopBinding ctx st members
+      _ -> emitBindings ctx st (NEA.toArray analyzed)
+
+emitBindings :: Ctx -> St -> Array (Tuple Ident TcoExpr) -> Either String Defs
 emitBindings ctx st binds = case uncons binds of
   Nothing -> Right { defs: [], st }
   Just { head: Tuple ident expr, tail } -> do
@@ -169,7 +234,7 @@ emitBindings ctx st binds = case uncons binds of
 -- | allocates, so a const would have to be comptime-known, and a lazy global
 -- | would need initialisation ordering. Recomputing is semantically free
 -- | because PureScript is pure. purerl uses the same convention.
-emitTopValue :: Ctx -> St -> String -> NeutralExpr -> Either String Defs
+emitTopValue :: Ctx -> St -> String -> TcoExpr -> Either String Defs
 emitTopValue ctx st ident expr = do
   o <- emitExpr (ctx { prefix = ident }) st expr
   pure
@@ -182,8 +247,342 @@ emitTopValue ctx st ident expr = do
     , st: o.st
     }
 
-emitExpr :: Ctx -> St -> NeutralExpr -> Either String Out
-emitExpr ctx st (NeutralExpr syntax) = case syntax of
+-- | A tail-recursive binding group, emitted as a real Zig loop.
+-- |
+-- | The ES backend can put the loop inside the curried arrow chain, because a
+-- | JavaScript closure may reassign a captured `let`. Ours cannot: arguments of
+-- | a curried chain live in a `[]const rt.Value` env, so a jump has nothing it
+-- | is allowed to write to. The loop therefore becomes a separate UNCURRIED Zig
+-- | function taking every argument at once, with a mutable copy of each:
+-- |
+-- | ```zig
+-- | fn @"ps.f.loop0"(env: []const rt.Value, @"v.in.0.0": rt.Value) rt.Error!rt.Value {
+-- |     _ = env;
+-- |     var @"v.a.0.0" = @"v.in.0.0";
+-- |     while (true) { ... }
+-- | }
+-- | ```
+-- |
+-- | The curried chain still exists and is unchanged -- its innermost lambda
+-- | just calls the loop. Every call site, `rt.apply`, and the whole FFI
+-- | convention stay exactly as they were, and partial application still works.
+-- |
+-- | A group of several mutually tail-recursive members shares ONE loop
+-- | function. Slots are numbered up to the widest member's arity, a member of
+-- | lesser arity leaves the high slots alone, and a `branch` variable says
+-- | which member's body to run. That is the ES backend's design; only the
+-- | dispatch differs, being an `if` chain rather than a switch.
+-- |
+-- | No trailing `return`: Zig knows a `while (true)` with no `break` is
+-- | noreturn, and every tail position emits either a `return` or a `continue`.
+emitLoopGroup
+  :: Ctx
+  -> St
+  -> String
+  -> Array Key
+  -> Array LoopMember
+  -> Either String { lifted :: Array String, entry :: Array String, st :: St }
+emitLoopGroup ctx st base captured members = do
+  let
+    n = st.counter
+    loopName = Ident.lifted (base <> ".loop" <> show n)
+    argName i j = Ident.lifted (base <> ".arg" <> show n <> "." <> show i <> "." <> show j)
+    slotName j = Ident.local ("a." <> show n <> "." <> show j)
+    inName j = Ident.local ("in." <> show n <> "." <> show j)
+    branchName = Ident.local ("br." <> show n)
+    branchIn = Ident.local ("brin." <> show n)
+
+    capCount = length captured
+    multi = length members > 1
+    maxArity = foldl max 0 (map _.arity members)
+    slots = map slotName (range' 0 maxArity)
+    envRef = if capCount == 0 then "rt.no_env" else "env"
+
+    loopInfo =
+      { members: map (\m -> { target: m.target, arity: m.arity }) members
+      , slots
+      , branch: if multi then Just branchName else Nothing
+      }
+
+    -- A member referenced anywhere but a tail call is still an ordinary value:
+    -- the closure chain, closed over the same env.
+    selfEntries env = mapWithIndex
+      (\i m -> { key: m.key, zig: "rt.Value.mkClosure(" <> argName i 0 <> ", " <> env <> ")", lazy: false })
+      members
+    capEntries = map (\k -> { key: k, zig: zigOf k, lazy: false }) captured
+
+    memberCtx m =
+      ctx
+        { scope =
+            mapWithIndex (\j k -> { key: k, zig: slotName j, lazy: false }) m.params
+              <> capEntries
+              <> selfEntries envRef
+        , loop = Just loopInfo
+        }
+
+  bodies <- emitLoopBodies memberCtx (st { counter = st.counter + 1, touched = [] }) members
+
+  let
+    touched = bodies.st.touched
+    -- Restore the enclosing loop's slot record: a nested loop must not report
+    -- its own assignments as the outer one's.
+    st' = bodies.st { touched = st.touched }
+
+    envBindings = mapWithIndex
+      (\i k -> "    const " <> zigOf k <> " = env[" <> show i <> "];")
+      captured
+    envDiscard = if capCount == 0 then [ "    _ = env;" ] else []
+
+    branchDecl = if multi then [ "    var " <> branchName <> " = " <> branchIn <> ";" ] else []
+
+    copies = map
+      ( \j ->
+          (if elem j touched then "    var " else "    const ")
+            <> fromMaybe "" (indexAt slots j)
+            <> " = "
+            <> inName j
+            <> ";"
+      )
+      (range' 0 maxArity)
+
+    dispatch =
+      if not multi then bodies.lines
+      else
+        concat
+          ( mapWithIndex
+              ( \i ls ->
+                  [ "        if (" <> branchName <> " == " <> show i <> ") {" ]
+                    <> map (\l -> "    " <> l) ls
+                    <> [ "        }" ]
+              )
+              bodies.perMember
+          )
+          <> [ "        unreachable;" ]
+
+    signature =
+      "fn " <> loopName <> "(env: []const rt.Value"
+        <> (if multi then ", " <> branchIn <> ": u32" else "")
+        <> joinWith "" (map (\j -> ", " <> inName j <> ": rt.Value") (range' 0 maxArity))
+        <> ") rt.Error!rt.Value {"
+
+    loopDef =
+      joinWith "\n"
+        ( [ signature ]
+            <> envDiscard
+            <> envBindings
+            <> branchDecl
+            <> copies
+            <> [ "    while (true) {" ]
+            <> dispatch
+            <> [ "    }", "}", "" ]
+        )
+
+    -- One curried wrapper chain per member. Its env holds the captures followed
+    -- by the arguments gathered so far, so every index is a compile-time
+    -- constant and the final wrapper hands the captures back as `env[0..c]`.
+    wrapper i m =
+      map
+        ( \j ->
+            let
+              argZig = Ident.local ("p." <> show n <> "." <> show j)
+              held = map (\k -> "env[" <> show k <> "]") (range' 0 (capCount + j))
+              usesEnv = capCount + j > 0
+              gathered =
+                map (\k -> "env[" <> show k <> "]") (range' capCount (capCount + j))
+                  <> [ argZig ]
+              padding = map (\_ -> "rt.Value.mkUnit()") (range' m.arity maxArity)
+              result =
+                if j == m.arity - 1 then
+                  "try " <> loopName <> "("
+                    <> (if capCount == 0 then "rt.no_env" else "env[0.." <> show capCount <> "]")
+                    <> (if multi then ", " <> show i else "")
+                    <> joinWith "" (map (\g -> ", " <> g) (gathered <> padding))
+                    <> ")"
+                else
+                  "rt.Value.mkClosure(" <> argName i (j + 1) <> ", rt.copyValues(&.{ "
+                    <> joinWith ", " (snoc held argZig)
+                    <> " }))"
+            in
+              joinWith "\n"
+                ( [ "fn " <> argName i j <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
+                    <> (if usesEnv then [] else [ "    _ = env;" ])
+                    <> [ "    return " <> result <> ";", "}", "" ]
+                )
+        )
+        (range' 0 m.arity)
+
+  pure
+    { lifted: concat (mapWithIndex wrapper members) <> [ loopDef ]
+    , entry: mapWithIndex (\i _ -> argName i 0) members
+    , st: st'
+    }
+
+-- | Emit each member's body in tail position, threading state and keeping the
+-- | per-member line blocks separate so the dispatch can bracket them.
+emitLoopBodies
+  :: (LoopMember -> Ctx)
+  -> St
+  -> Array LoopMember
+  -> Either String { lines :: Array String, perMember :: Array (Array String), st :: St }
+emitLoopBodies mkCtx st members = case uncons members of
+  Nothing -> Right { lines: [], perMember: [], st }
+  Just { head, tail } -> do
+    one <- emitTail (mkCtx head) st head.body
+    rest <- emitLoopBodies mkCtx one.st tail
+    pure
+      { lines: one.lines <> rest.lines
+      , perMember: cons one.lines rest.perMember
+      , st: rest.st
+      }
+
+-- | Top-level group: no captures, and each member keeps its `pub fn` entry
+-- | point returning the head of its wrapper chain.
+emitLoopBinding :: Ctx -> St -> Array LoopMember -> Either String Defs
+emitLoopBinding ctx st members = do
+  r <- emitLoopGroup (ctx { prefix = memberBase members }) st (memberBase members) [] members
+  pure
+    { defs: concat
+        ( mapWithIndex
+            ( \i m ->
+                [ "pub fn " <> Ident.topLevel m.ident <> "() rt.Error!rt.Value {"
+                , "    return rt.Value.mkClosure(" <> fromMaybe "" (indexAt r.entry i) <> ", rt.no_env);"
+                , "}"
+                , ""
+                ]
+            )
+            members
+        )
+    , st: r.st { lifted = r.st.lifted <> r.lifted }
+    }
+
+-- | Every member of a loop group must be a lambda. `tcoRoleIsLoop` already
+-- | implies it, but the emitter needs the arguments and body, so it destructures
+-- | rather than trusting.
+topLoopMembers :: Array (Tuple Ident TcoExpr) -> Maybe (Array LoopMember)
+topLoopMembers = traverse \(Tuple ident texpr) -> case unTcoExpr texpr of
+  Abs args body ->
+    Just
+      { target: LoopTop (unwrap ident)
+      , key: { name: unwrap ident, level: topLevelPseudoLevel }
+      , ident: unwrap ident
+      , arity: NEA.length args
+      , params: map (\(Tuple mIdent lvl) -> keyOf mIdent lvl) (NEA.toArray args)
+      , body
+      }
+  _ -> Nothing
+
+-- | Levels are assigned from zero upwards, so nothing a binder produces can
+-- | collide with this.
+topLevelPseudoLevel :: Int
+topLevelPseudoLevel = -1000000
+
+memberBase :: Array LoopMember -> String
+memberBase members = case uncons members of
+  Just { head } -> head.ident
+  Nothing -> "loop"
+
+-- | Emit an expression in TAIL position as statements rather than as a value.
+-- |
+-- | This is the second emission mode, and the reason TCO needs one: a jump is a
+-- | `continue`, which is a statement and cannot be the value of an expression.
+-- | Only constructs that can *hold* a tail position recurse here -- `Branch`
+-- | arms, `Let` bodies -- and everything else bottoms out in `return`.
+-- |
+-- | Nothing recurses into an `Abs`: a lambda body is a different Zig function,
+-- | so a tail call there is not a tail call of this loop.
+emitTail :: Ctx -> St -> TcoExpr -> Either String { lines :: Array String, st :: St }
+emitTail ctx st expr = case unTcoExpr expr of
+  -- Each arm's statements always end in `return` or `continue`, so the arms
+  -- need no `else` and the fallback can simply follow them.
+  Branch pairs fallback -> do
+    arms <- emitTailArms ctx st (NEA.toArray pairs)
+    fb <- emitTail ctx arms.st fallback
+    pure { lines: arms.lines <> fb.lines, st: fb.st }
+
+  Let mIdent lvl e body -> do
+    let
+      key = keyOf mIdent lvl
+      zig = zigOf key
+    o <- emitExpr ctx st e
+    let ctx' = ctx { scope = cons { key, zig, lazy: false } ctx.scope }
+    rest <- emitTail ctx' o.st body
+    pure
+      { lines: cons ("        const " <> zig <> " = " <> o.text <> ";") rest.lines
+      , st: rest.st
+      }
+
+  -- A saturated call to any member of the loop group: assign that member's
+  -- slots, select its branch, and go round again.
+  App f as
+    | Just loop <- ctx.loop
+    , Just i <- loopMemberIndex ctx loop f (NEA.length as) ->
+        emitJump ctx st loop i (NEA.toArray as)
+
+  _ -> do
+    o <- emitExpr ctx st expr
+    pure
+      { lines: [ "        " <> (if diverges expr then o.text else "return " <> o.text) <> ";" ]
+      , st: o.st
+      }
+
+emitTailArms :: Ctx -> St -> Array (Pair TcoExpr) -> Either String { lines :: Array String, st :: St }
+emitTailArms ctx st pairs = case uncons pairs of
+  Nothing -> Right { lines: [], st }
+  Just { head: Pair cond result, tail } -> do
+    c <- emitExpr ctx st cond
+    r <- emitTail ctx c.st result
+    rest <- emitTailArms ctx r.st tail
+    pure
+      { lines:
+          [ "        if (" <> c.text <> ".asBool()) {" ]
+            <> map (\l -> "    " <> l) r.lines
+            <> [ "        }" ]
+            <> rest.lines
+      , st: rest.st
+      }
+
+-- | The head of a tail call is the loop's own binding: either unqualified or
+-- | qualified with the module being emitted.
+loopMemberIndex :: Ctx -> Loop -> TcoExpr -> Int -> Maybe Int
+loopMemberIndex ctx loop f arity =
+  findIndex (\m -> m.arity == arity && isLoopCall ctx m.target f) loop.members
+
+isLoopCall :: Ctx -> LoopTarget -> TcoExpr -> Boolean
+isLoopCall ctx target f = case target, unTcoExpr f of
+  LoopTop ident, Var (Qualified mn callee) ->
+    unwrap callee == ident
+      && case mn of
+        Nothing -> true
+        Just m -> unwrap m == ctx.moduleName
+  LoopLocal key, Local mIdent lvl -> keyOf mIdent lvl == key
+  _, _ -> false
+
+-- | Assignment is SIMULTANEOUS: `go (n - 1) acc` must not see the new `n` when
+-- | it evaluates `acc`. Every argument is therefore computed into a temporary
+-- | first, and only then written back to the loop variables.
+emitJump :: Ctx -> St -> Loop -> Int -> Array TcoExpr -> Either String { lines :: Array String, st :: St }
+emitJump ctx st loop index args = do
+  parts <- emitList ctx st args
+  let
+    n = parts.st.counter
+    tmp i = Ident.local ("jump." <> show n <> "." <> show i)
+    temps = mapWithIndex (\i t -> "        const " <> tmp i <> " = " <> t <> ";") parts.texts
+    writes = mapWithIndex
+      (\i _ -> "        " <> fromMaybe "" (indexAt loop.slots i) <> " = " <> tmp i <> ";")
+      parts.texts
+    branch = case loop.branch of
+      Just b -> [ "        " <> b <> " = " <> show index <> ";" ]
+      Nothing -> []
+  pure
+    { lines: temps <> writes <> branch <> [ "        continue;" ]
+    , st: parts.st
+        { counter = parts.st.counter + 1
+        , touched = parts.st.touched <> range' 0 (length args)
+        }
+    }
+
+emitExpr :: Ctx -> St -> TcoExpr -> Either String Out
+emitExpr ctx st expr = case unTcoExpr expr of
   Lit literal -> emitLit ctx st literal
 
   -- A `Var` is always a top-level reference; locals are `Local`. `Qualified
@@ -283,19 +682,13 @@ emitExpr ctx st (NeutralExpr syntax) = case syntax of
   EffectDefer a ->
     emitThunk ctx st (freeKeys a) \c s -> emitPerform c s a
 
-  EffectBind mIdent lvl a b ->
-    let
-      node = NeutralExpr (EffectBind mIdent lvl a b)
-    in
-      emitThunk ctx st (freeKeys node) \c s -> emitEffectBlock c s node
+  EffectBind _ _ _ _ ->
+    emitThunk ctx st (freeKeys expr) \c s -> emitEffectBlock c s expr
 
-  PrimEffect eff ->
-    let
-      node = NeutralExpr (PrimEffect eff)
-    in
-      emitThunk ctx st (freeKeys node) \c s -> emitPerform c s node
+  PrimEffect _ ->
+    emitThunk ctx st (freeKeys expr) \c s -> emitPerform c s expr
 
-applyAll :: Ctx -> Out -> Array NeutralExpr -> Either String Out
+applyAll :: Ctx -> Out -> Array TcoExpr -> Either String Out
 applyAll ctx acc args = case uncons args of
   Nothing -> Right acc
   Just { head, tail } -> do
@@ -304,7 +697,7 @@ applyAll ctx acc args = case uncons args of
 
 -- | An uncurried application of no arguments still has to apply something --
 -- | `runFn0` and `runEffectFn0` are thunks in this runtime, forced by unit.
-emitUncurriedApp :: Ctx -> St -> NeutralExpr -> Array NeutralExpr -> Either String Out
+emitUncurriedApp :: Ctx -> St -> TcoExpr -> Array TcoExpr -> Either String Out
 emitUncurriedApp ctx st f args = do
   fo <- emitExpr ctx st f
   if null args then
@@ -314,12 +707,12 @@ emitUncurriedApp ctx st f args = do
 
 -- | Likewise, a nullary uncurried abstraction becomes a closure over one
 -- | ignored argument, so that applying unit runs it.
-emitUncurriedAbs :: Ctx -> St -> Array (Tuple (Maybe Ident) Level) -> NeutralExpr -> Either String Out
+emitUncurriedAbs :: Ctx -> St -> Array (Tuple (Maybe Ident) Level) -> TcoExpr -> Either String Out
 emitUncurriedAbs ctx st args body =
   if null args then emitAbsChain ctx st [ Tuple Nothing (Level (-1)) ] body
   else emitAbsChain ctx st args body
 
-emitLit :: Ctx -> St -> Literal NeutralExpr -> Either String Out
+emitLit :: Ctx -> St -> Literal TcoExpr -> Either String Out
 emitLit ctx st literal = case literal of
   LitInt n -> Right { text: "rt.Value.mkInt(" <> show n <> ")", st }
   LitNumber n -> Right { text: "rt.Value.mkNumber(" <> show n <> ")", st }
@@ -346,7 +739,7 @@ emitLit ctx st literal = case literal of
 -- | can be a struct literal -- but the VALUES are not, so `&.{ ... }` points at
 -- | a stack temporary in the enclosing frame. Whatever consumes it must copy
 -- | into the arena first.
-emitProps :: Ctx -> St -> Array (Prop NeutralExpr) -> Either String Out
+emitProps :: Ctx -> St -> Array (Prop TcoExpr) -> Either String Out
 emitProps ctx st props = do
   parts <- emitList ctx st (map propValue props)
   let
@@ -365,7 +758,7 @@ emitProps ctx st props = do
 indexAt :: Array String -> Int -> Maybe String
 indexAt xs i = findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithIndex (\j x -> { i: j, x }) xs)
 
-emitList :: Ctx -> St -> Array NeutralExpr -> Either String { texts :: Array String, st :: St }
+emitList :: Ctx -> St -> Array TcoExpr -> Either String { texts :: Array String, st :: St }
 emitList ctx st items = case uncons items of
   Nothing -> Right { texts: [], st }
   Just { head, tail } -> do
@@ -385,27 +778,27 @@ accessorText = case _ of
 -- | optimizer collects `\a b c -> ...` into one `Abs`; the runtime still wants
 -- | one argument per closure, so this peels the head and rebuilds the tail as
 -- | a fresh `Abs` node.
-emitAbsChain :: Ctx -> St -> Array (Tuple (Maybe Ident) Level) -> NeutralExpr -> Either String Out
+emitAbsChain :: Ctx -> St -> Array (Tuple (Maybe Ident) Level) -> TcoExpr -> Either String Out
 emitAbsChain ctx st args body = case uncons args of
   Nothing -> emitExpr ctx st body
   Just { head: Tuple mIdent lvl, tail } ->
     let
       inner = case NEA.fromArray tail of
         Nothing -> body
-        Just rest -> NeutralExpr (Abs rest body)
+        Just rest -> TcoExpr mempty (Abs rest body)
     in
       emitAbs ctx st (keyOf mIdent lvl) inner
 
 -- | The one genuinely non-trivial case. Lift the body to a top-level function
 -- | and pass captured locals as a flat positional slice.
-emitAbs :: Ctx -> St -> Key -> NeutralExpr -> Either String Out
+emitAbs :: Ctx -> St -> Key -> TcoExpr -> Either String Out
 emitAbs ctx st key body =
   emitLifted ctx st key (freeKeys body) (diverges body) \c s -> emitExpr c s body
 
 -- | Lift a function to the top level, given the free variables its body
 -- | mentions and a way to emit that body in the inner scope.
 -- |
--- | `emitAbs` is the ordinary case, where the body is one `NeutralExpr`. The
+-- | `emitAbs` is the ordinary case, where the body is one expression. The
 -- | effect nodes need the same lifting but their bodies are composites -- a
 -- | block of statements, or an expression wrapped in `rt.runEffect` -- so the
 -- | body is a callback rather than a node, and the free-variable set is passed
@@ -498,7 +891,7 @@ range' lo hi = if lo >= hi then [] else cons lo (range' (lo + 1) hi)
 -- | Zig has statement-level `const`, so a Let is a labelled block. Labels share
 -- | one namespace within a function, hence the counter -- a fixed `blk`
 -- | collides the moment one Let nests inside another.
-emitLet :: Ctx -> St -> Maybe Ident -> Level -> NeutralExpr -> NeutralExpr -> Either String Out
+emitLet :: Ctx -> St -> Maybe Ident -> Level -> TcoExpr -> TcoExpr -> Either String Out
 emitLet ctx st mIdent lvl e body = do
   let
     label = "blk" <> show st.counter
@@ -527,8 +920,96 @@ emitLet ctx st mIdent lvl e body = do
 -- | 0.15.0 release notes specify for backends that cannot call
 -- | `applyLazinessTransform`. Restricting the cheap path to function members is
 -- | the "light analysis" those notes sanction.
-emitLetRec :: Ctx -> St -> Level -> Array (Tuple Ident NeutralExpr) -> NeutralExpr -> Either String Out
-emitLetRec ctx st lvl bindings body = do
+-- | A `LetRec` group of one function that only ever tail-calls itself is the
+-- | `where go = ...` idiom, and is where recursion actually lives in most
+-- | PureScript. It takes the same loop treatment as a top-level binding, with
+-- | one addition: a local loop may capture enclosing variables, so the loop
+-- | function takes an `env` slice alongside its value parameters.
+-- | A local tail-recursive group -- the `where go = ...` idiom, and where
+-- | recursion actually lives in most PureScript.
+-- |
+-- | Same loop as the top-level case, plus captures: the members share one env
+-- | slice, computed as the union of their free variables minus the members and
+-- | their own parameters.
+emitLocalLoop :: Ctx -> St -> Array LoopMember -> TcoExpr -> Either String Out
+emitLocalLoop ctx st members body = do
+  let
+    n = st.counter
+    label = "blk" <> show n
+    envName = Ident.local ("env." <> show n)
+    memberKeys = map _.key members
+    allParams = concat (map _.params members)
+    free = nub (concat (map (freeKeys <<< _.body) members))
+    captured = orderKeys
+      ( filter
+          (\k -> not (elem k memberKeys) && not (elem k allParams) && isJust (lookupEntry ctx k))
+          free
+      )
+    capCount = length captured
+    envExpr =
+      if capCount == 0 then "rt.no_env"
+      else "rt.copyValues(&.{ " <> joinWith ", " (map (scopeText ctx) captured) <> " })"
+
+  r <- emitLoopGroup ctx (st { counter = st.counter + 1 }) (ctx.prefix <> ".rec" <> show n) captured members
+
+  let
+    envRef = if capCount == 0 then "rt.no_env" else envName
+    bindings = mapWithIndex
+      ( \i m ->
+          "        const " <> zigOf m.key <> " = rt.Value.mkClosure("
+            <> fromMaybe "" (indexAt r.entry i)
+            <> ", "
+            <> envRef
+            <> ");"
+      )
+      members
+    bodyCtx = ctx
+      { scope = map (\m -> { key: m.key, zig: zigOf m.key, lazy: false }) members <> ctx.scope }
+
+  outer <- emitExpr bodyCtx (r.st { lifted = r.st.lifted <> r.lifted }) body
+
+  pure
+    { text:
+        joinWith "\n"
+          ( [ label <> ": {" ]
+              -- With no captures every member closes over `rt.no_env` directly,
+              -- so binding an empty env here would leave an unused constant.
+              <> (if capCount == 0 then [] else [ "        const " <> envName <> " = " <> envExpr <> ";" ])
+              <> bindings
+              <> [ breakStmt label body outer.text, "    }" ]
+          )
+    , st: outer.st
+    }
+
+-- | The `LetRec` counterpart of `topLoopMembers`: members are `Local`, keyed by
+-- | identifier at the group's shared level.
+localLoopMembers :: Level -> Array (Tuple Ident TcoExpr) -> Maybe (Array LoopMember)
+localLoopMembers lvl = traverse \(Tuple ident texpr) -> case unTcoExpr texpr of
+  Abs args body ->
+    let
+      key = { name: unwrap ident, level: unwrap lvl }
+    in
+      Just
+        { target: LoopLocal key
+        , key
+        , ident: unwrap ident
+        , arity: NEA.length args
+        , params: map (\(Tuple mIdent l) -> keyOf mIdent l) (NEA.toArray args)
+        , body
+        }
+  _ -> Nothing
+
+emitLetRec :: Ctx -> St -> Level -> Array (Tuple Ident TcoExpr) -> TcoExpr -> Either String Out
+emitLetRec ctx st lvl bindings body = case NEA.fromArray bindings of
+  Just nea
+    | maybe false tcoRoleIsLoop (localTcoRefBindings lvl nea)
+    , Just members <- localLoopMembers lvl bindings ->
+        emitLocalLoop ctx st members body
+  _ ->
+    emitLetRecGeneral ctx st lvl bindings body
+
+emitLetRecGeneral :: Ctx -> St -> Level -> Array (Tuple Ident TcoExpr) -> TcoExpr -> Either String Out
+emitLetRecGeneral ctx st lvl bindings body = do
   let
     n = st.counter
     label = "blk" <> show n
@@ -643,7 +1124,7 @@ emitRecMembers
   -> Array Scoped
   -> Array String
   -> Array Key
-  -> Array { i :: Int, e :: NeutralExpr }
+  -> Array { i :: Int, e :: TcoExpr }
   -> Either String St
 emitRecMembers ctx st fnNameFor innerScope envBindings keys members =
   case uncons members of
@@ -660,17 +1141,17 @@ emitRecMember
   -> Array String
   -> Array Key
   -> Int
-  -> NeutralExpr
+  -> TcoExpr
   -> Either String St
-emitRecMember ctx st fnNameFor innerScope envBindings keys i expr = case expr of
-  NeutralExpr (Abs args body) -> do
+emitRecMember ctx st fnNameFor innerScope envBindings keys i expr = case unTcoExpr expr of
+  Abs args body -> do
     let
       { head: Tuple mIdent lvl, tail } = NEA.uncons args
       key = keyOf mIdent lvl
       argZig = zigOf key
       inner = case NEA.fromArray tail of
         Nothing -> body
-        Just rest -> NeutralExpr (Abs rest body)
+        Just rest -> TcoExpr mempty (Abs rest body)
       scope = cons { key, zig: argZig, lazy: false } innerScope
     bodyOut <- emitExpr (ctx { scope = scope }) st inner
     let
@@ -693,7 +1174,7 @@ emitRecMember ctx st fnNameFor innerScope envBindings keys i expr = case expr of
           bodyOut.text
     pure (bodyOut.st { lifted = snoc bodyOut.st.lifted def })
 
-recDef :: String -> String -> Array String -> Array String -> NeutralExpr -> String -> String
+recDef :: String -> String -> Array String -> Array String -> TcoExpr -> String -> String
 recDef fnName argZig envLines argDiscard body bodyText =
   joinWith "\n"
     ( [ "fn " <> fnName <> "(env: []const rt.Value, " <> argZig <> ": rt.Value) rt.Error!rt.Value {" ]
@@ -721,7 +1202,7 @@ envLinesFor envBindings keys bodyFree =
 -- | No reachability tracking is needed. The optimizer has already pruned
 -- | unreachable alternatives, and the fallback is always emitted -- it is an
 -- | expression (often `Fail`), not an optional trailing panic.
-emitBranch :: Ctx -> St -> Array (Pair NeutralExpr) -> NeutralExpr -> Either String Out
+emitBranch :: Ctx -> St -> Array (Pair TcoExpr) -> TcoExpr -> Either String Out
 emitBranch ctx st pairs fallback = do
   let
     n = st.counter
@@ -738,7 +1219,7 @@ emitBranch ctx st pairs fallback = do
     , st: fb.st
     }
 
-emitArms :: Ctx -> St -> String -> Array (Pair NeutralExpr) -> Either String { lines :: Array String, st :: St }
+emitArms :: Ctx -> St -> String -> Array (Pair TcoExpr) -> Either String { lines :: Array String, st :: St }
 emitArms ctx st label pairs = case uncons pairs of
   Nothing -> Right { lines: [], st }
   Just { head: Pair cond result, tail } -> do
@@ -764,7 +1245,7 @@ emitArms ctx st label pairs = case uncons pairs of
 -- | filters the corresponding entries out of `coreForeignSemantics`, so those
 -- | calls stay in the FFI where the semantics already match. If one of these
 -- | ever fires, the filter has drifted.
-emitPrimOp :: Ctx -> St -> BackendOperator NeutralExpr -> Either String Out
+emitPrimOp :: Ctx -> St -> BackendOperator TcoExpr -> Either String Out
 emitPrimOp ctx st op = case op of
   Op1 o a -> do
     x <- emitExpr ctx st a
@@ -835,8 +1316,8 @@ op2Text o x y = case o of
 -- | reachability itself and simply omitted the trailing panic, whereas here
 -- | `Fail` arrives as an ordinary expression in the IR, in tail position of a
 -- | branch, a let, or a whole binding.
-diverges :: NeutralExpr -> Boolean
-diverges (NeutralExpr syntax) = case syntax of
+diverges :: TcoExpr -> Boolean
+diverges expr = case unTcoExpr expr of
   Fail _ -> true
   _ -> false
 
@@ -844,10 +1325,10 @@ returnStmt :: Boolean -> String -> String
 returnStmt divergent text =
   if divergent then "    " <> text <> ";" else "    return " <> text <> ";"
 
-breakStmt :: String -> NeutralExpr -> String -> String
+breakStmt :: String -> TcoExpr -> String -> String
 breakStmt label e text = "        " <> tailText label e text <> ";"
 
-tailText :: String -> NeutralExpr -> String -> String
+tailText :: String -> TcoExpr -> String -> String
 tailText label e text = if diverges e then text else "break :" <> label <> " " <> text
 
 cmp :: BackendOperatorOrd -> String -> String -> String
@@ -891,23 +1372,23 @@ emitThunk ctx st bodyFree emitBody =
 -- | emitted inline with no closure at all. `pure x` becomes `x`; a `Ref` read
 -- | becomes a pointer dereference; a nested do-block becomes a nested Zig
 -- | block.
-emitPerform :: Ctx -> St -> NeutralExpr -> Either String Out
-emitPerform ctx st expr = case expr of
-  NeutralExpr (EffectPure a) -> emitExpr ctx st a
-  NeutralExpr (EffectDefer a) -> emitPerform ctx st a
-  NeutralExpr (EffectBind _ _ _ _) -> emitEffectBlock ctx st expr
+emitPerform :: Ctx -> St -> TcoExpr -> Either String Out
+emitPerform ctx st expr = case unTcoExpr expr of
+  EffectPure a -> emitExpr ctx st a
+  EffectDefer a -> emitPerform ctx st a
+  EffectBind _ _ _ _ -> emitEffectBlock ctx st expr
 
-  NeutralExpr (PrimEffect (EffectRefNew a)) -> do
+  PrimEffect (EffectRefNew a) -> do
     o <- emitExpr ctx st a
     pure { text: "rt.newRef(" <> o.text <> ")", st: o.st }
 
-  NeutralExpr (PrimEffect (EffectRefRead r)) -> do
+  PrimEffect (EffectRefRead r) -> do
     o <- emitExpr ctx st r
     pure { text: o.text <> ".asRef().*", st: o.st }
 
   -- A write is a statement in Zig, not an expression, so it needs a block to
   -- sit in expression position -- and `Effect Unit` still has to yield a value.
-  NeutralExpr (PrimEffect (EffectRefWrite r v)) -> do
+  PrimEffect (EffectRefWrite r v) -> do
     ro <- emitExpr ctx st r
     vo <- emitExpr ctx ro.st v
     let label = "eff" <> show vo.st.counter
@@ -938,7 +1419,7 @@ emitPerform ctx st expr = case expr of
 -- | bound -- Zig rejects an unused local constant, and PureScript produces
 -- | these constantly, since every `discard` in a do-block binds `$__unused`
 -- | and the loop combinators bind a result nobody reads.
-emitEffectBlock :: Ctx -> St -> NeutralExpr -> Either String Out
+emitEffectBlock :: Ctx -> St -> TcoExpr -> Either String Out
 emitEffectBlock ctx st expr = do
   let label = "eff" <> show st.counter
   r <- spine ctx (st { counter = st.counter + 1 }) [] expr
@@ -956,10 +1437,10 @@ emitEffectBlock ctx st expr = do
     :: Ctx
     -> St
     -> Array String
-    -> NeutralExpr
+    -> TcoExpr
     -> Either String { stmts :: Array String, tail :: String, st :: St }
-  spine c s acc e = case e of
-    NeutralExpr (EffectBind mIdent lvl a b) -> do
+  spine c s acc e = case unTcoExpr e of
+    EffectBind mIdent lvl a b -> do
       let
         key = keyOf mIdent lvl
         zig = zigOf key
@@ -1016,15 +1497,15 @@ scopeText ctx key = case lookupEntry ctx key of
   Just e -> e.zig
   Nothing -> zigOf key
 
-isAbs :: NeutralExpr -> Boolean
-isAbs (NeutralExpr syntax) = case syntax of
+isAbs :: TcoExpr -> Boolean
+isAbs expr = case unTcoExpr expr of
   Abs _ _ -> true
   _ -> false
 
-unitExpr :: NeutralExpr
-unitExpr = NeutralExpr PrimUndefined
+unitExpr :: TcoExpr
+unitExpr = TcoExpr mempty PrimUndefined
 
-indexExpr :: Array NeutralExpr -> Int -> Maybe NeutralExpr
+indexExpr :: Array TcoExpr -> Int -> Maybe TcoExpr
 indexExpr xs i = findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithIndex (\j x -> { i: j, x }) xs)
 
 indexKey :: Array Key -> Int -> Maybe Key
@@ -1035,10 +1516,10 @@ indexKey xs i = findMap (\p -> if p.i == i then Just p.x else Nothing) (mapWithI
 
 -- | Locals referenced in an expression but bound outside it. `Var` is never
 -- | free -- it compiles to a call, not a capture.
-freeKeys :: NeutralExpr -> Array Key
+freeKeys :: TcoExpr -> Array Key
 freeKeys = nub <<< go []
   where
-  go bound (NeutralExpr syntax) = case syntax of
+  go bound node = case unTcoExpr node of
     Local mIdent lvl ->
       let k = keyOf mIdent lvl
       in if elem k bound then [] else [ k ]

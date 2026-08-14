@@ -91,6 +91,27 @@ countDown n =
 viaFix :: Int -> Int
 viaFix = fix \recur n -> if n == 0 then 0 else recur (n - 1) + 1
 
+-- | DEPTH TEST, top-level. A self tail call at uniform arity, so the analysis
+-- | classifies it as a loop and it becomes a Zig `while` rather than a chain of
+-- | `rt.apply` frames. Without TCO this overflows the stack long before a
+-- | million iterations; with it, it returns.
+-- |
+-- | This is the only check here that fails by crashing rather than by returning
+-- | a wrong label, since a stack overflow is not catchable.
+deepSum :: Int -> Int -> Int
+deepSum k acc = if k == 0 then acc else deepSum (k - 1) (acc + 1)
+
+-- | DEPTH TEST, `where`-bound. Same shape, but the recursive function is a
+-- | `LetRec` member capturing an enclosing variable (`bump`), which is the
+-- | idiom most real PureScript recursion uses. Exercises the local-loop path
+-- | and its captured `env`.
+deepCount :: Int -> Int
+deepCount start = go start 0
+  where
+  bump = 1
+
+  go k acc = if k == 0 then acc else go (k - 1) (acc + bump)
+
 -- | `Ref` plus `forE`: sum 1..4 by mutation. Exercises `_new`, `read`,
 -- | `modify_` (which goes through `modifyImpl` and its `{ state, value }`
 -- | record) and the loop combinator.
@@ -173,6 +194,8 @@ target n = do
         $ check "countDown" (countDown 4 == 7)
         $ check "describe" (describe 5 == "shape5")
         $ check "viaFix" (viaFix 5 == 5)
+        $ check "deepSum" (deepSum 1000000 0 == 1000000)
+        $ check "deepCount" (deepCount 1000000 == 1000000)
         $ check "sumTo" (s == 10)
         $ check "foreachE" (joined == "abc")
         $ check "whileE" (loops == 3)

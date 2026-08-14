@@ -2,108 +2,149 @@
 
 What `Zig/Emit.purs` must produce.
 
-The best worked example is now the generated output itself: run `zig build
-codegen` and read `purs/example/output-zig/`. The whole of `purescript-prelude`
-compiles through this, so anything the spec describes can be seen in practice
-there. (`purs/example/expected/`, a hand-written reference, was deleted once
-the emitter outgrew it.)
+The best worked example is the generated output itself: run `zig build codegen`
+and read `purs/example/output-zig/`. The whole of `purescript-prelude` compiles
+through this, so anything described here can be seen in practice there.
+
+## The pipeline
+
+```
+purs compile --codegen corefn
+    output/<Module>/corefn.json
+        -> CoreFn.Json.decodeModule        (the optimizer's decoder)
+        -> CoreFn.Sort.sortModules         (dependency order, mandatory)
+        -> Builder.buildModules            (optimisation, whole-program)
+             -> BackendModule + NeutralExpr
+        -> Tco.analyze                     (tail-call decoration)
+             -> TcoExpr
+        -> Zig.Emit                        (this spec)
+    output-zig/<Module>.zig
+```
+
+The backend consumes `purescript-backend-optimizer`, not CoreFn directly.
+`docs/corefn-schema.md` is retained for historical interest only — nothing here
+reads `corefn.json` except the driver, and it hands the bytes straight to
+`decodeModule`.
+
+Three consequences of that, each of which used to be the backend's problem and
+is now the optimizer's:
+
+- **Pattern matching arrives already compiled.** There are no binders. A `case`
+  is a `Branch`: a list of condition/result pairs plus a fallback, with the
+  tests expressed as ordinary operations (`OpIsTag`, `OpIntOrd`) and the
+  destructuring as `Accessor`s.
+- **Newtypes are fully erased**, `Prim` and its submodules are filtered out of
+  the import set, and `Prim.undefined` arrives as the `PrimUndefined` node.
+- **Dead bindings and unused imports are gone** before emission.
+
+`sortModules` is not cosmetic. `buildModules` threads an `implementations` map
+forward so a definition can be inlined into its callers, so a module must be
+visited after the modules it depends on. Feeding readdir order crashes the
+optimizer inside `lookupCtorFields`.
 
 ## Typing
 
-There is one type. Every PureScript value of every type becomes a `rt.Value`,
-a tagged union with variants `unit`, `boolean`, `integer`, `number`, `string`,
-`char`, `array`, `record`, `data`, `closure`.
+There is one type. Every PureScript value of every type becomes a `rt.Value`, a
+tagged union with variants `unit`, `boolean`, `integer`, `number`, `string`,
+`char`, `array`, `record`, `data`, `closure`, `ref`.
 
-CoreFn is untyped — the compiler has already type-checked, and discards the
-types on the way out — so the backend has nothing to be type-directed *with*.
-Attempting to recover types would mean reading `externs.json` alongside
-`corefn.json`, which purerl does and which is a v2 concern at best.
+`ref` is the odd one out and the only mutable thing in the runtime. It backs
+`Effect.Ref`, and it has to be a pointer: a write must be observable through
+every copy of the reference, `Value` is passed by value everywhere, and
+`mkRecord` copies. It also backs the lazy cells described under `LetRec`.
 
-Consequences worth internalising:
+The IR is untyped — the compiler has already type-checked and discarded the
+types — so the backend has nothing to be type-directed with. Generated Zig is
+monomorphic at the Zig level and dynamically typed at the PureScript level:
+Zig's type checker will not catch backend bugs, and a wrong emission shows up as
+a runtime panic from `asString`, `asInt`, and friends.
 
-- Generated Zig is monomorphic at the Zig level and dynamically typed at the
-  PureScript level. Zig's type checker will not catch backend bugs; a wrong
-  emission shows up as a runtime panic from `asString`, `asInt`, etc.
-- Type classes need no special handling. The compiler has already desugared
-  them into dictionary records passed as ordinary arguments. Dictionaries are
-  `record` Values; method access is `Accessor`.
-- Newtypes are erased by the compiler only **halfway**, and finishing the job
-  is the backend's responsibility. CoreFn emits a newtype constructor as the
-  identity function, so the wrapper never exists at runtime — but the *binder*
-  side still arrives as a `ConstructorBinder`, carrying `meta: IsNewtype`. A
-  backend that ignores the meta emits a `hasTag` test against a value that was
-  never tagged, and it can only fail. Single-method type classes are newtypes,
-  so `Eq`, `Ord`, `Show`, `Functor` and `Semigroup` all depend on this.
+Type classes need no special handling. The compiler desugars them into
+dictionary records passed as ordinary arguments; a dictionary is a `record`
+Value and method access is an `Accessor`.
+
+## Everything is fallible
+
+`Fn1` — the type every closure body has — returns `rt.Error!rt.Value`, where
+`rt.Error` is `error{PsException}`. Zig has no stack unwinding: errors are values
+in the return type. Since the backend is untyped, any application might reach
+`Effect.Exception.throw`, so every generated function is fallible whether or not
+it can actually raise.
+
+- every emitted function returns `rt.Error!rt.Value`;
+- every `rt.apply` and every top-level reference is prefixed with `try`;
+- **every emitted `try` is parenthesised.** `try` binds looser than postfix field
+  access, so `try f().field("k")` parses as `try (f().field("k"))` and fails to
+  compile. Output is paren-heavy as a result.
+
+Zig error values carry no payload, so the thrown PureScript `Error` travels in a
+side channel: `rt.throwValue` stashes it and returns `error.PsException`,
+`rt.takeError` retrieves it in the handler.
+
+`Fn1` is the type generated code is compiled against, so the runtime signature
+and the emitter cannot change independently — nothing links in between. They are
+necessarily one commit.
 
 ## Naming
 
 Zig identifiers must not collide with Zig keywords, with each other, or with
-`main`. PureScript identifiers are worse than they look: CoreFn identifiers are
-*arbitrary strings*, because type class desugaring concatenates printed types
-into names.
-
-The rule: **prefix by role, then quote**. A dot cannot appear in an unquoted
-Zig identifier, so a prefix containing one can never collide with anything Zig
-generates or reserves, and `@"..."` absorbs whatever characters CoreFn produces.
+`main`. The rule: **prefix by role, then quote**. A dot cannot appear in an
+unquoted Zig identifier, so a prefix containing one can never collide with
+anything Zig generates or reserves, and `@"..."` absorbs whatever characters the
+IR produces.
 
 | Thing | Zig identifier | Example |
 |---|---|---|
 | Top-level binding `f` | `@"ps.f"` | `@"ps.greet"` |
-| Local binder `x` | `@"v.x"`, suffixed on collision | `@"v.name"`, `@"v.name.1"` |
-| Lambda body for binding `f` | `@"ps.f.lamN"` | `@"ps.greet.lam0"` |
-| Imported module `A.B` | `@"mod.A.B"` | `@"mod.Zig.Prelude"` |
+| Local binder | `@"v.<name>.<level>"` | `@"v.acc.3"` |
+| Anonymous local | `@"v.l.<level>"` | `@"v.l.7"` |
+| Lifted lambda | `@"ps.f.lamN"` | `@"ps.greet.lam0"` |
+| Imported module `A.B` | `@"mod.A.B"` | `@"mod.Data.Maybe"` |
 | Data constructor `C` | `@"ps.C"` | `@"ps.Just"` |
 | Recursive-let member | `@"ps.f.recN.M"` | `@"ps.target.rec2.0"` |
-| Case scrutinee temporary | `@"v.c.N.I"` | `@"v.c.3.0"` |
-| Block label | `blkN`, `caseN` | `blk0`, `case3` |
+| Lazy cell | `@"v.lazy.N.I"` | `@"v.lazy.7.0"` |
+| Loop function | `@"ps.f.loopN"` | `@"ps.deepSum.loop3"` |
+| Loop wrapper | `@"ps.f.argN.I.J"` | `@"ps.deepSum.arg3.0.1"` |
+| Loop slot | `@"v.a.N.J"` | `@"v.a.3.0"` |
+| Effect thunk parameter | `@"v.eff.-N"` | `@"v.eff.-4"` |
+| Block label | `blkN`, `caseN`, `effN` | `blk0`, `case3` |
+
+**A local is identified by `(Maybe Ident, Level)`, not by name and not by level
+alone.** Levels are assigned as the optimizer descends, and a `LetRec` gives
+every member of a group the *same* level, distinguishing them by identifier. The
+pair is therefore unique by construction, which is why nothing suffixes names on
+shadowing — the counter-appending the CoreFn emitter needed is gone.
+
+Anything that needs to *reference* a local must read the scope map rather than
+rebuild the name: a recursive-let member is a whole `mkClosure` expression, a
+captured variable inside a lifted body is an `env[i]`, and a loop parameter is a
+slot variable.
 
 Note `@"main"` and `main` are *the same identifier* in Zig — quoting is not a
 namespace. The `ps.` prefix is what keeps PureScript's `main` from colliding
 with the Zig entry point.
 
-Zig forbids shadowing, so the emitter carries a scope map from PureScript
-binder to Zig identifier and appends a counter when a name is already live.
-Anything that needs to *reference* a local must read that map rather than
-rebuild the name from the PureScript identifier — a shadowed binder carries a
-suffix, and a recursive-let member is a whole `mkClosure` expression rather
-than an identifier at all.
-
-Block labels are the exception to the quote-and-prefix rule: they are plain
-identifiers like `blk0`, because a label is not an identifier namespace Zig
-declarations live in. They still get a counter, since labels within one
-function must be distinct.
-
 ## Module structure
 
 One PureScript module → one file, named after the module verbatim:
-`Zig.Prelude` → `Zig.Prelude.zig`. Dots in filenames are legal and keep the
-mapping trivial.
-
-All generated files land in one flat directory, so cross-module references are
-plain relative imports needing no build-system registration:
+`Data.Maybe` → `Data.Maybe.zig`. Dots in filenames are legal and keep the
+mapping trivial. All generated files land in one flat directory, so cross-module
+references are plain relative imports needing no build-system registration:
 
 ```zig
-const @"mod.Zig.Prelude" = @import("Zig.Prelude.zig");
+const @"mod.Data.Maybe" = @import("Data.Maybe.zig");
 ```
 
-Two named imports are bound by `build.zig`, not by path: `@import("runtime")`
-and `@import("ffi")`.
+One named import is bound by `build.zig` rather than by path: `@import("runtime")`.
+A module's own FFI is a relative import too — see Foreign imports.
 
-**Filter out `Prim` and everything under it.** Every CoreFn module carries at
-least one, and row-polymorphic code pulls in `Prim.Row`, `Prim.RowList`,
-`Prim.Symbol`, `Prim.Ordering`, `Prim.Coerce` and `Prim.TypeError` besides.
-None corresponds to a real module, so the test is the `Prim.` prefix, not
-equality with `Prim`.
-
-`Prim` also appears in *expressions*: the compiler emits `Prim.undefined` as a
-placeholder for an erased type argument, passed around and never forced. The
-JavaScript backend emits a literal `undefined`; any value does, so this emits
-`rt.Value.mkUnit()`.
+The import set arrives already filtered: no `Prim`, no self-import, nothing
+unused.
 
 ## Top-level bindings are nullary functions
 
 ```zig
-pub fn @"ps.greet"() rt.Value { ... }
+pub fn @"ps.greet"() rt.Error!rt.Value { ... }
 ```
 
 Not constants. `rt.apply` allocates, so a `const` would have to be
@@ -112,13 +153,13 @@ ordering the emitter would have to compute. A nullary function recomputes on
 every reference, which is semantically free because PureScript is pure. purerl
 uses the same convention.
 
-The cost is real for expensive CAFs and is a known v2 item: memoise with a
-`?Value` global once something needs it.
+The cost is real for expensive CAFs and is a known item: memoise with a `?Value`
+global once something needs it.
 
-`Rec` binding groups need no special treatment — mutual recursion between
-nullary functions is fine in Zig.
+Mutual recursion between nullary functions is fine in Zig, so a recursive
+binding group needs no special treatment — unless it qualifies as a loop.
 
-## Emission per CoreFn node
+## Emission per IR node
 
 `⟦e⟧` means "the Zig expression for `e`". Every one is a `rt.Value`.
 
@@ -127,272 +168,396 @@ nullary functions is fine in Zig.
 ```
 LitInt n      →  rt.Value.mkInt(n)
 LitNumber n   →  rt.Value.mkNumber(n)
-LitString s   →  rt.Value.mkString("s")          -- escape for Zig
-LitChar c     →  rt.Value.mkChar('c')
+LitString s   →  rt.Value.mkString("s")
+LitChar c     →  rt.Value.mkChar(<code point>)
 LitBoolean b  →  rt.Value.mkBool(b)
-LitArray es   →  rt.Value.mkArray(rt.copyValues(&.{ ⟦e₀⟧, ⟦e₁⟧, ... }))
-LitObject kvs →  rt.Value.mkRecord(rt.copyFields(&.{ .{ .name = "k", .value = ⟦v⟧ }, ... }))
+LitArray es   →  rt.Value.mkArray(rt.copyValues(&.{ ⟦e₀⟧, ... }))
+LitRecord kvs →  rt.Value.mkRecord(rt.copyFields(&.{ .{ .name = "k", .value = ⟦v⟧ }, ... }))
 ```
 
-Both arrays and records go through a copy into the arena, for the same reason:
-`&.{ ... }` is a pointer to a temporary in the *enclosing function's* frame, and
-both `mkArray` and `mkRecord` store that slice inside a `Value` that outlives the
-frame. Field *names* are comptime-known, which is why the slice can be written as
-a struct literal at all — but the values are not, so the literal cannot be
-promoted to static storage and must be copied.
+`LitChar` emits the numeric code point rather than a Zig character literal: our
+`Char` is a `u21`, and the code point needs no escaping analysis.
 
-### Var
+Arrays and records both copy into the arena, for the same reason: `&.{ ... }` is
+a pointer to a temporary in the enclosing frame, and both `mkArray` and
+`mkRecord` store that slice inside a `Value` that outlives it.
 
-Local (in scope) → the scope map's Zig identifier, used directly:
+### Var and Local
+
+Top-level in this module, or in another:
 
 ```zig
-@"v.name"
+(try @"ps.greet"())
+(try @"mod.Data.Maybe".@"ps.fromMaybe"())
 ```
 
-Top-level in this module → a call:
+There is no asymmetry between foreign and generated bindings at a use site: a
+foreign import is re-exported as a nullary function too, precisely so the
+emitter never has to consult the module's `foreign` list to write a reference.
+
+A `Local` resolves through the scope map. If the entry is a lazy cell, reading
+forces it:
 
 ```zig
-@"ps.greet"()
+(try rt.forceLazy(@"v.lazy.7.0"))
 ```
 
-Top-level in another module → qualified call:
+### Abs and App
 
-```zig
-@"mod.Zig.Prelude".@"ps.log"
-```
+`Abs` collects its binders and `App` collects its spine, so both arrive
+n-ary. Both are emitted as curried chains of one argument, which is what keeps
+the FFI convention intact.
 
-Note the asymmetry: `log` is a foreign import, re-exported as a `const`, so no
-parentheses. A generated binding in another module *would* take them. The
-emitter knows which from the module's `foreign` list.
+Zig has no closures, so every lambda is lifted:
 
-### Abs
-
-The one genuinely non-trivial case, because Zig has no closures.
-
-1. Compute the free variables of the body — the only real algorithm in the
-   backend.
-2. Emit a top-level function taking `(env: []const rt.Value, arg: rt.Value)`.
+1. Compute the free variables of the body — the only real algorithm left here.
+2. Emit a top-level `fn (env: []const rt.Value, arg: rt.Value)`.
 3. Bind each free variable to `env[i]` at a fixed index, in a stable order.
-4. At the `Abs` site, emit `rt.Value.mkClosure(body, env)` where `env` is
-   `rt.no_env` if empty, else `rt.copyValues(&.{ ... })`.
+4. At the `Abs` site, emit `rt.Value.mkClosure(body, env)`, with `rt.no_env` if
+   nothing was captured.
 
 ```zig
-fn @"ps.f.lam0"(env: []const rt.Value, @"v.y": rt.Value) rt.Value {
-    const @"v.x" = env[0];
+fn @"ps.f.lam0"(env: []const rt.Value, @"v.y.2": rt.Value) rt.Error!rt.Value {
+    const @"v.x.1" = env[0];
     return ...;
 }
-// at the Abs site:
-rt.Value.mkClosure(@"ps.f.lam0", rt.copyValues(&.{@"v.x"}))
+rt.Value.mkClosure(@"ps.f.lam0", rt.copyValues(&.{@"v.x.1"}))
 ```
 
-Environments are flat positional slices, not per-lambda structs. A struct per
-`Abs` would mean naming and emitting a type for every lambda plus
-`@ptrCast`/`@alignCast` at every call — all to save one indirection that
-`purescript-backend-optimizer` would erase anyway.
+Environments are flat positional slices, not a generated struct per lambda. A
+struct would mean naming and emitting a type for every lambda plus
+`@ptrCast`/`@alignCast` at every call, to save one indirection.
 
-Discard unused parameters — Zig errors on unused function parameters, and
-PureScript produces them constantly: every `\_ -> ...` and every erased
-dictionary argument is one. Both the argument and `env` need this, on separate
-conditions:
+Discard unused parameters — Zig errors on them and PureScript produces them
+constantly. Both the argument and `env` need this, on separate conditions: the
+argument when it is not free in the body, `env` when nothing was captured.
 
-- the argument is discarded when it is not free in the body;
-- `env` is discarded when nothing was captured.
-
-For a recursive-`let` member the second condition is not enough. `env` also
-appears verbatim in every reference to a group member, including the
-self-reference, so it is discarded only when there are no captures **and** no
-member is mentioned in the body. `Data.Void.absurd` is exactly the case that
-catches this: recursive, capturing nothing.
-
-### App
+An application is nested applies, which is where the parentheses earn their
+keep:
 
 ```zig
-rt.apply(⟦f⟧, ⟦a⟧)
+(try rt.apply((try rt.apply(f, a)), b))
 ```
 
-Nested for multiple arguments. `rt.apply2` / `apply3` exist as sugar; the
-emitter may ignore them.
+**Uncurried nodes collapse to the same shape.** `UncurriedAbs`, `UncurriedApp`
+and their effectful counterparts come from `Data.Function.Uncurried` and
+`Effect.Uncurried`, i.e. from source that was already uncurried. There is no
+n-ary function value in this runtime, so they emit as curried chains; the
+nullary forms take an ignored argument, so applying unit runs them. This is why
+adopting the optimizer did not disturb the `rt.curry`/`rt.effect` FFI
+convention, and why no uncurrying layer like backend-erl's `Calling.purs` is
+needed.
 
-### Accessor
+### Accessor and Update
 
 ```zig
-⟦e⟧.field("k")
-```
-
-### ObjectUpdate
-
-```zig
+⟦e⟧.field("k")            // GetProp
+⟦e⟧.asArray()[i]          // GetIndex
+⟦e⟧.arg(i)                // GetCtorField
 rt.updateRecord(⟦e⟧, &.{ .{ .name = "k", .value = ⟦v⟧ }, ... })
 ```
 
-Copy-on-write: `updateRecord` allocates a fresh field slice, copies the base
-record's fields in their original order, and substitutes any whose name appears
-in the updates. The base is untouched, which is what makes this safe under an
-arena that never frees — nothing else can be holding a stale view of a record
-that just changed.
+`GetCtorField` always addresses a real constructor — newtype erasure happened
+upstream. `updateRecord` copies into the arena as part of its own work, so
+unlike `mkRecord` the update slice may stay a stack temporary. It panics if a
+key is missing from the base, which is a backend bug rather than bad user code,
+since record update is type-checked.
 
-No `copyFields` here. Unlike `mkRecord`, `updateRecord` copies into the arena as
-part of its own work, so the update slice may stay a stack temporary.
+### Constructors
 
-PureScript's record update syntax is type-checked, so every update key must
-already exist in the base record. A key that misses is therefore a *backend*
-bug, never bad user code, and `updateRecord` panics rather than silently adding
-or dropping a field.
+```zig
+rt.Value.mkData("Just", rt.copyValues(&.{ ⟦x⟧ }))     // CtorSaturated
+```
 
-### Let
+`CtorDef` — an unsaturated reference — becomes *n* nested closures ending in the
+same `mkData`. Arity 0 is just `mkData("Unit", &.{})`.
 
-Zig has statement-level `const`, so a `Let` becomes a labelled block:
+The tag is the constructor name as a string. `CtorMeta` carries an integer tag,
+so switching to integer tags is nearly free whenever wanted.
+
+### Let and LetRec
+
+A `Let` is a labelled block, numbered from the fresh-name counter because a
+fixed label collides as soon as one nests inside another:
 
 ```zig
 blk0: {
-    const @"v.x" = ⟦e₁⟧;
+    const @"v.x.1" = ⟦e⟧;
     break :blk0 ⟦body⟧;
 }
 ```
 
-Block labels share one namespace within a function, so the label is numbered
-from the same fresh-name counter the lifted lambdas use. A fixed `blk` collides
-as soon as one `Let` nests inside another — and record update desugaring
-introduces a `Let`, so this happens without the source containing nested
-`where` blocks at all.
+A `LetRec` group that is not a loop is handled two ways, depending on whether
+the member is a lambda.
 
-`Rec` groups inside a `Let` are the awkward case: local mutual recursion cannot
-be expressed with `const`. The group is lifted to top-level functions sharing
-one environment — the union of the members' free variables, minus the members
-themselves, so every member has the same env layout:
+**Function members** are lifted to top-level functions sharing one environment —
+the union of the members' free variables, minus the members themselves, so every
+member has the same env layout. Within the group a member is
+`rt.Value.mkClosure(fn, env)`: a **value, not a call**. Emitting a call would
+re-enter the function being defined while building its own capture list and loop
+forever.
 
-```zig
-fn @"ps.target.rec2.0"(env: []const rt.Value, @"v.b": rt.Value) rt.Value {
-    const @"v.n" = env[0];
-    return ...;                       // `pick` here is mkClosure(rec2.0, env)
-}
-// at the Let site:
-const @"v.env.2" = rt.copyValues(&.{ @"v.n" });
-const @"v.pick" = rt.Value.mkClosure(@"ps.target.rec2.0", @"v.env.2");
-```
+`env` is discarded only when there are no captures **and** no member is mentioned
+in the body — a member reference mentions `env` verbatim. `Data.Void.absurd` is
+the case that catches this.
 
-Within the group, a member — including itself — is
-`rt.Value.mkClosure(fn, env)`: a **value**, not a call. Emitting a call would
-re-enter the function being defined while building its own capture list and
-loop forever. This is what removes the need to tie a knot.
-
-Only `Abs` members are supported. A non-function recursive binding diverges
-under strict evaluation anyway; PureScript 0.15 added a laziness transform that
-turns that divergence into a runtime error, but CoreFn hands over the raw `Rec`
-group and the transform is each backend's own job (purerl implements it). Since
-a recursive *function* binding never needs laziness — the self-reference is
-only forced when called — restricting to `Abs` sidesteps the whole problem.
-
-### Constructor
+**Non-function members get a lazy cell.** PureScript permits a recursive binding
+that is not a function, and `Control.Lazy.fix` is one. The compiler offers
+`applyLazinessTransform` only to backends embedding it as a Haskell library; a
+backend reading `corefn.json` implements the fallback the 0.15.0 release notes
+describe.
 
 ```zig
-pub fn @"ps.Just"() rt.Value { ... }   // curried over its field count
+const @"v.lazy.5.0" = rt.newLazy("go", "Control.Lazy");
+const @"v.env.5" = rt.copyValues(&.{ @"v.f.4", @"v.lazy.5.0" });
+rt.setLazyInit(@"v.lazy.5.0", rt.Value.mkClosure(@"ps.fix.rec5.0", @"v.env.5"));
 ```
 
-A constructor of arity *n* is *n* nested closures ending in
-`rt.Value.mkData("Just", rt.copyValues(&.{...}))`. Arity 0 is just the `mkData`
-call, as `@"ps.Unit"` in the worked example shows.
+The ordering is forced by a mutual dependency: the initialiser closes over an
+environment that must contain the cells, so cells first, then the environment,
+then the initialisers. Env layout is captures first, then one slot per lazy
+member, so every index is a compile-time constant.
 
-The tag is the constructor name as a string. Integer tags are faster and are a
-later optimisation.
+**The load-bearing rule: reading a lazy binding forces it; capturing it does
+not.** `Local` emits `(try rt.forceLazy(cell))`; `scopeText`, which builds every
+capture list, yields the bare cell. Backwards, and `go = defer \_ -> f go` forces
+during its own initialisation and hits the cycle panic. `rt.forceLazy` panics
+rather than raising a catchable exception, because a cycle is a defect in the
+program's definitions rather than a condition to recover from.
 
-### Case
+### Branch
 
-Structured after the compiler's own JS backend (`bindersToJs`), adapted to
-Zig's constraints.
-
-Scrutinees are bound to temporaries first, since binders may test them
-repeatedly. Each alternative is a chain of tests falling through to the next
-alternative, and the whole thing is a labelled block where `break :caseN` plays
-the part of the JS backend's `return`:
+Pattern matching arrives already compiled, so this is a chain of tests in a
+labelled block:
 
 ```zig
 case3: {
-    const @"c.3.0" = ⟦scrutinee⟧;
-    if (@"c.3.0".asBool() == true) {
-        break :case3 ⟦result⟧;
-    }
-    break :case3 ⟦other result⟧;
+    if (⟦c₀⟧.asBool()) break :case3 ⟦v₀⟧;
+    if (⟦c₁⟧.asBool()) break :case3 ⟦v₁⟧;
+    break :case3 ⟦fallback⟧;
 }
 ```
 
-**A binder wraps a continuation; it is not a (test, destructure) pair.** This is
-the one idea worth borrowing wholesale. `emitBinder` takes the code to run once
-the binder has matched and wraps it in whatever test and bindings it needs, so
-nested binders compose without special handling — a sub-binder is emitted
-inside the bindings its parent introduced, which is exactly where it needs to
-be for `Just (Just x)` to work.
+No reachability tracking is needed. The optimizer has already pruned
+unreachable alternatives, and the fallback is always an expression — often
+`Fail` — rather than an optional trailing panic. All the machinery the CoreFn
+emitter needed here (the binder continuation fold, the `canFail` flag,
+per-alternative bracketing, scrutinee-discard analysis) is gone.
 
-**Reachability has to be tracked during emission.** The JS backend emits its
-"Failed pattern match" throw unconditionally, because JavaScript tolerates
-statements after a `return`. Zig rejects unreachable code outright, so the fold
-carries a `canFail` flag: an alternative whose binders emit no test always
-matches, which makes both the following alternatives and the trailing `@panic`
-dead. Emission stops at the first irrefutable alternative and the panic is
-omitted.
+### Fail
 
-Every binder form is implemented. Each addresses its sub-subject differently
-and is otherwise the same fold, which is what makes nesting free:
+`Fail` becomes `@panic("...")`, which is `noreturn`. **It is emitted as a
+diverging statement, never as the value of a `break` or `return`** — Zig rejects
+the enclosing `break :label @panic(...)` as unreachable code, since control flow
+has already diverted. All seven tail positions route through
+`returnStmt`/`breakStmt`/`tailText`.
 
-| Binder | Test | Sub-subject |
-|---|---|---|
-| `NullBinder` | none | — |
-| `VarBinder` | none | binds the subject |
-| `NamedBinder` | inner binder's | binds *and* keeps matching the same subject |
-| `ConstructorBinder` | `.hasTag("Just")` | `.arg(i)` |
-| `ConstructorBinder`, `IsNewtype` | none | the subject itself |
-| `LiteralBinder` scalar | `.asInt() == 3`, `.stringEq("x")`, … | — |
-| `LiteralBinder` array | `.asArray().len == n` | `.asArray()[i]` |
-| `LiteralBinder` record | none | `.field("k")` |
+`diverges` currently tests only for a literal `Fail`. A `Branch` whose arms all
+diverge is also `noreturn` and would produce the same error one level up; not
+reachable today.
 
-String comparison is `Value.stringEq`, not an inline `std.mem.eql`: only the
-entry module imports `std`, and generated code is meant to reference nothing
-but `rt`. A record binder needs no test because the type checker has already
-guaranteed the fields exist; an array binder does, because length is a runtime
-property.
+### PrimUndefined
 
-Guards are conditions *on* an alternative, not alternatives themselves — if
-every guard fails, matching resumes at the next alternative rather than
-failing. So a guarded alternative always reports `canFail`, even when its last
-guard is literally `true`. That can leave a redundant `@panic`, which is the
-safe direction: Zig rejects unreachable code, so over-reporting reachability
-costs a dead branch while under-reporting fails the build.
+`rt.Value.mkUnit()`. The compiler's placeholder for an erased type argument:
+passed around, never forced, so any value does.
 
-The tag is the constructor name as a string. Integer tags are faster and are a
-later optimisation.
+### PrimOp
+
+The optimizer rewrites the prelude's foreign arithmetic, comparison and append
+into primitive operations, so most of what used to be an FFI call arrives here.
+Each is a one-liner over the runtime's public surface:
+
+| Operator | Zig |
+|---|---|
+| `OpBooleanNot` | `mkBool(!x.asBool())` |
+| `OpIntNegate` | `mkInt(-%x.asInt())` |
+| `OpArrayLength` | `mkInt(@intCast(x.asArray().len))` |
+| `OpIsTag C` | `mkBool(x.hasTag("C"))` |
+| `OpArrayIndex` | `x.asArray()[@intCast(y.asInt())]` |
+| `OpBooleanAnd`/`Or` | `mkBool(x.asBool() and y.asBool())` |
+| `Op*Ord` | `mkBool(x.asInt() < y.asInt())`, etc. |
+| `OpStringOrd OpEq` | `mkBool(x.stringEq(y.asString()))` |
+| `OpIntNum` | `+%`, `-%`, `*%` — wrapping, matching JavaScript's `\| 0` |
+| `OpStringAppend` | `mkString(rt.concatString(x.asString(), y.asString()))` |
+
+Zig's `and`/`or` short-circuit and the right operand is part of the right-hand
+expression, so laziness in the second argument is preserved.
+
+**Five operators are deliberately not implemented**, because the `PrimOp` the
+optimizer produces assumes JavaScript semantics this backend does not share.
+`Main.purs` filters the corresponding entries out of `coreForeignSemantics`, so
+those calls stay ordinary FFI applications where the semantics already match:
+
+- `Data.EuclideanRing.intDiv` — ours is Euclidean and returns 0 on
+  divide-by-zero, transcribed from the original `.js`.
+- `Data.Int.Bits.shl`/`shr`/`zshr` — JavaScript masks the shift count to five
+  bits.
+- `Data.Ord.ordString` — the runtime has `stringEq` but no comparison.
+
+If one of these ever reaches the emitter, the filter has drifted, and the
+emitter returns a `Left` naming it rather than emitting something wrong.
+
+### Effects
+
+`Effect a` is a thunk: a closure ignoring a unit argument, run by
+`rt.runEffect`. All four effect nodes produce a lifted closure and differ only in
+what its body does.
+
+The thunk's parameter uses a synthetic key with a **negative level** derived from
+the fresh counter. Levels are numbered from zero, so a negative one cannot
+collide with a real binder, and using the counter keeps nested thunks from
+declaring the same parameter name.
+
+**A chain of `EffectBind`s flattens into ONE block of statements.** This is
+MagicDo, and it is the whole point of the effect nodes: emitting each bind as
+its own thunk would allocate a closure per `>>=`.
+
+```zig
+eff7: {
+    const @"v.x.3" = ⟦a⟧;
+    _ = ⟦b⟧;
+    break :eff7 ⟦c⟧;
+}
+```
+
+A bind whose result the continuation ignores is discarded rather than bound —
+Zig rejects an unused local constant, and PureScript produces these constantly,
+since every `discard` in a do-block binds `$__unused` and the loop combinators
+bind a result nobody reads.
+
+`emitPerform` is what runs one effect, and it is where the saving lands: every
+node the optimizer produced structurally is *known* to be an effect, so it needs
+no thunk at all.
+
+| Node | Performed as |
+|---|---|
+| `EffectPure x` | `⟦x⟧` — no closure, no `runEffect` |
+| `EffectDefer a` | performs `a` directly |
+| `EffectBind` | a nested block |
+| `EffectRefNew v` | `rt.newRef(⟦v⟧)` |
+| `EffectRefRead r` | `⟦r⟧.asRef().*` |
+| `EffectRefWrite r v` | a block: assign, then yield `mkUnit()` |
+| anything else | `(try rt.runEffect(⟦e⟧))` |
+
+A ref write is a statement in Zig, not an expression, hence the block — and
+`Effect Unit` still has to yield a value.
+
+### Exceptions
+
+`throwException` is `rt.throwValue(e)`; the `try` on every application
+propagates it. `catchException` runs the action and, on failure, calls the
+handler with `rt.takeError()`. It must be written
+`if (rt.runEffect(action)) |v| ... else |_| ...` rather than with `catch`,
+because the recovery branch is itself fallible — a handler may throw again — and
+`a catch b` requires `b` to be the unwrapped type.
+
+An `Error` is `mkData("Error", &.{ message, name, cause })`, a data constructor
+rather than a record: nothing in PureScript projects it structurally, since
+`message` and `name` *are* foreign imports.
+
+## Tail calls
+
+`Tco.analyze` decorates the IR with tail-call information relative to an
+environment naming a binding group's own members and their arities.
+`tcoRoleIsLoop` is true only when **every** self-reference in the group is a
+saturated tail call at uniform arity — if the function is ever passed around as
+a value, or called with the wrong number of arguments, it is not a loop and the
+ordinary curried emission is the only correct one.
+
+The analysis is the toolkit's; the loop emission is the backend's.
+
+**The ES backend's shape does not transfer.** It puts the loop inside the curried
+arrow chain, because a JavaScript closure may reassign a captured `let`. Ours
+cannot: the arguments of a curried chain live in a `[]const rt.Value` env, so a
+jump would have nothing it is allowed to write to.
+
+The loop is therefore a **separate uncurried Zig function** taking every argument
+at once, with a mutable copy of each:
+
+```zig
+fn @"ps.deepSum.loop3"(env: []const rt.Value, @"v.in.3.0": rt.Value, @"v.in.3.1": rt.Value) rt.Error!rt.Value {
+    _ = env;
+    var @"v.a.3.0" = @"v.in.3.0";
+    var @"v.a.3.1" = @"v.in.3.1";
+    while (true) {
+        if (...) return @"v.a.3.1";
+        const @"v.jump.4.0" = ...;
+        const @"v.jump.4.1" = ...;
+        @"v.a.3.0" = @"v.jump.4.0";
+        @"v.a.3.1" = @"v.jump.4.1";
+        continue;
+    }
+}
+```
+
+The curried chain still exists and is unchanged — its innermost lambda just
+calls the loop. So every call site, `rt.apply`, partial application, and the
+whole FFI convention stay exactly as they were.
+
+Points worth keeping:
+
+- **Assignment is simultaneous.** `go (n - 1) acc` must not see the new `n` while
+  evaluating `acc`, so every argument is computed into a temporary first and only
+  then written back.
+- **No trailing `return`.** Zig knows a `while (true)` with no `break` is
+  noreturn, and every tail position emits a `return` or a `continue`.
+- **A local loop takes an `env` slice** for captured variables, threaded through
+  both the loop function and the wrapper chain. The wrapper's env holds the
+  captures followed by the arguments gathered so far, so the final wrapper hands
+  the captures back as `env[0..c]` with `c` a compile-time constant.
+- **With no captures, nothing mentions `env`**: the loop discards it, a
+  self-reference closes over `rt.no_env`, and the `Let` site emits no env
+  binding at all. Zig's unused-parameter and unused-local rules are separate, so
+  each of these has to be handled independently.
+- **A mutual group shares one loop function.** Slots are numbered to the widest
+  member's arity, a narrower member leaves the high slots alone and its wrapper
+  pads the call with `mkUnit()`, and a `branch` variable selects whose body runs.
+  Dispatch is an `if` chain, since every arm is `noreturn`.
+- **Slot mutability cannot be decided before emission.** Zig rejects a `var` that
+  is never mutated, and with mixed arities a high slot may belong to a member
+  nothing ever jumps to. Jumps therefore record which slots they assign, and the
+  declaration is `var` or `const` accordingly.
+
+**Join points are deliberately not implemented.** The optimizer's analysis
+reports them (`role.joins`), and the ES backend needs them because a JavaScript
+call in tail position still grows the stack. In Zig a join is an ordinary call
+that returns before the next iteration, so it costs one transient frame and
+never accumulates. The remaining cost is one `mkClosure` per enclosing
+evaluation, which inside a loop body is an allocation per iteration — worth
+revisiting alongside the arena, not before.
 
 ## Foreign imports
 
-A module's `foreign` list names the identifiers with no CoreFn body. For each,
-emit a re-export rather than a definition:
+A module's `foreign` set names the identifiers with no body. Each becomes a
+re-export rather than a definition:
 
 ```zig
 const ffi = @import("Data.Semiring.ffi.zig");
-pub fn @"ps.intAdd"() rt.Value {
+pub fn @"ps.intAdd"() rt.Error!rt.Value {
     return ffi.@"ps.intAdd";
 }
 ```
 
 **The Zig lives beside the `.purs` source**, exactly as `Foo/Bar.js` does for
-the JavaScript backend and `Foo/Bar.erl` for purerl: `Data/Semiring.purs` pairs
-with `Data/Semiring.zig`. The driver reads `modulePath` from corefn.json —
-which points at the original source wherever the package was unpacked — and
-copies the file into the output directory as `<Module>.ffi.zig`.
+JavaScript and `Foo/Bar.erl` for purerl: `Data/Semiring.purs` pairs with
+`Data/Semiring.zig`. The driver reads `path` from the CoreFn module — which
+points at the original source wherever the package was unpacked — and copies the
+file into the output directory as `<Module>.ffi.zig`.
 
 A package therefore ships its own FFI and registers nothing anywhere. That is
-what makes a third-party package usable: there is no central directory to edit,
-and no build-system entry to add.
+what makes a third-party package usable: no central directory to edit, no
+build-system entry to add. A module declaring foreign imports with no `.zig`
+beside it is reported as `MISSING FFI` naming the path expected.
 
-A module declaring foreign imports with no `.zig` beside it is reported as
-`MISSING FFI` naming the path that was expected. The generated module will fail
-to compile in Zig regardless; the report just makes the cause legible.
+Note that `BackendModule` carries no `path`, so the driver takes it from the
+CoreFn module in `onCodegenModule`.
 
 ### Writing FFI
 
 Foreign exports are `rt.Value`s, and an *n*-argument PureScript function is *n*
-nested one-argument closures. Writing that chain by hand means *n* functions
-plus hand-managed `env` indices the compiler cannot check, so the runtime
-generates it from the function's own signature at comptime:
+nested one-argument closures. Writing that chain by hand would mean *n*
+functions plus hand-managed `env` indices the compiler cannot check, so the
+runtime generates it from the function's own signature at comptime:
 
 ```zig
 fn intAdd(x: Value, y: Value) Value {
@@ -405,18 +570,19 @@ pub const @"ps.intAdd" = rt.curry(intAdd);
 - `rt.effect(f)` — an `Effect`. Adds the trailing unit thunk, so nothing runs
   until `rt.runEffect` forces it. Works for nullary `f` too.
 
+An FFI function may return either `Value` or `rt.Error!Value` and needs no
+annotation either way: Zig coerces `T` to `E!T` on return, so the one `@call`
+site inside `curry.zig` accepts both.
+
 purerl solves the same problem by parsing arity out of the Erlang export list;
 Zig has comptime reflection, so the backend never learns about arity at all.
 
-Unlike generated code, hand-written FFI may import `std` freely, and may
-allocate from the arena through `rt.alloc()`.
+Unlike generated code, hand-written FFI may import `std` freely and may allocate
+from the arena through `rt.alloc()`.
 
-## Effects
-
-`Effect a` is a thunk: a closure ignoring a unit argument. Nothing runs until
-`rt.runEffect` applies unit. This falls out of the one-argument-closure rule
-and needs no special emission — an `Effect` is just a `Value` that happens to
-be a closure.
+Some FFI is now dead: an operation the optimizer turns into a `PrimOp` is never
+called through its foreign import. `Data.Semiring.intAdd` is emitted and
+compiled but unreachable from optimized code.
 
 ## Entry point
 
@@ -425,11 +591,24 @@ Emitted only into the module the build is rooted at:
 ```zig
 pub fn main(init: std.process.Init) !void {
     rt.init(init.io, init.arena.allocator());
-    _ = rt.runEffect(@"ps.main"());
+    _ = try rt.runEffect(try @"ps.main"());
 }
 ```
 
+Two `try`s, because both steps are fallible: building the `Effect` value is a
+call to a generated nullary function, and forcing it runs the program.
+
 Zig 0.16 routes all I/O through an `Io` instance and provides one, plus a
 process-lifetime arena, through `std.process.Init`. The runtime borrows both
-rather than constructing its own — which is why `rt.init` takes two arguments
-and there is no `rt.deinit`.
+rather than constructing its own — which is why `rt.init` takes two arguments and
+there is no `rt.deinit`.
+
+## Known rough edges
+
+- Generated block indentation is hardcoded to eight spaces, so nested blocks
+  read wrong. They compile fine.
+- Every `try` is parenthesised, including where it needn't be. Suppressing the
+  redundant ones means tracking whether an expression is about to be projected.
+- The arena never frees.
+- Top-level nullary functions are not memoised.
+- Constructor tags are strings, not integers.
