@@ -46,13 +46,18 @@ fn unsafeCompareImpl(lt: Value, eq: Value, gt: Value, x: Value, y: Value) Value 
 
 /// Note the asymmetry, which is deliberate in the original: a LONGER left
 /// array compares as -1.
-fn ordArrayImpl(f: Value, xs: Value, ys: Value) Value {
+///
+/// Fallible because `f` is the element comparison, i.e. arbitrary PureScript
+/// code that may `throw`. `rt.curry` coerces a plain `Value` return to
+/// `Error!Value`, so only the functions that actually apply something need to
+/// say so -- and this is one.
+fn ordArrayImpl(f: Value, xs: Value, ys: Value) rt.Error!Value {
     const a = xs.asArray();
     const b = ys.asArray();
 
     var i: usize = 0;
     while (i < a.len and i < b.len) : (i += 1) {
-        const o = rt.apply2(f, a[i], b[i]).asInt();
+        const o = (try rt.apply2(f, a[i], b[i])).asInt();
         if (o != 0) return Value.mkInt(o);
     }
 

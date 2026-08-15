@@ -18,10 +18,22 @@
               "exceptions": "*"
             },
             {
+              "integers": "*"
+            },
+            {
+              "maybe": ">=6.0.0 <7.0.0"
+            },
+            {
+              "numbers": "*"
+            },
+            {
               "prelude": "*"
             },
             {
               "refs": "*"
+            },
+            {
+              "strings": "*"
             }
           ]
         },
@@ -43,11 +55,23 @@
       "exceptions": {
         "path": "../lib/purescript-exceptions"
       },
+      "functions": {
+        "path": "../lib/purescript-functions"
+      },
+      "integers": {
+        "path": "../lib/purescript-integers"
+      },
+      "numbers": {
+        "path": "../lib/purescript-numbers"
+      },
       "prelude": {
         "path": "../lib/purescript-prelude"
       },
       "refs": {
         "path": "../lib/purescript-refs"
+      },
+      "strings": {
+        "path": "../lib/purescript-strings"
       },
       "unsafe-coerce": {
         "path": "../lib/purescript-unsafe-coerce"
@@ -99,6 +123,22 @@
         "prelude"
       ]
     },
+    "functions": {
+      "type": "local",
+      "path": "../lib/purescript-functions",
+      "dependencies": [
+        "prelude"
+      ]
+    },
+    "integers": {
+      "type": "local",
+      "path": "../lib/purescript-integers",
+      "dependencies": [
+        "maybe",
+        "numbers",
+        "prelude"
+      ]
+    },
     "invariant": {
       "type": "registry",
       "version": "6.0.0",
@@ -128,6 +168,14 @@
         "safe-coerce"
       ]
     },
+    "numbers": {
+      "type": "local",
+      "path": "../lib/purescript-numbers",
+      "dependencies": [
+        "functions",
+        "maybe"
+      ]
+    },
     "prelude": {
       "type": "local",
       "path": "../lib/purescript-prelude",
@@ -147,6 +195,15 @@
       "integrity": "sha256-EJrxtKt5xC7TYjBZrSBO/J7Aw3DmtilYjt4olpAXWVc=",
       "dependencies": [
         "unsafe-coerce"
+      ]
+    },
+    "strings": {
+      "type": "local",
+      "path": "../lib/purescript-strings",
+      "dependencies": [
+        "maybe",
+        "newtype",
+        "prelude"
       ]
     },
     "unsafe-coerce": {

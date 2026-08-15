@@ -5,7 +5,11 @@ const Value = rt.Value;
 
 /// The array Applicative: every function applied to every argument, in
 /// function-major order.
-fn arrayApply(fs: Value, xs: Value) Value {
+///
+/// Fallible: the elements of `fs` are PureScript functions and may throw. An
+/// error abandons the partly-filled output, which is correct -- the arena owns
+/// it and nothing observes a half-built array.
+fn arrayApply(fs: Value, xs: Value) rt.Error!Value {
     const functions = fs.asArray();
     const arguments = xs.asArray();
 
@@ -15,7 +19,7 @@ fn arrayApply(fs: Value, xs: Value) Value {
     var n: usize = 0;
     for (functions) |f| {
         for (arguments) |x| {
-            out[n] = rt.apply(f, x);
+            out[n] = try rt.apply(f, x);
             n += 1;
         }
     }

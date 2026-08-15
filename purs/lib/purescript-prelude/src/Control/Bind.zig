@@ -8,12 +8,13 @@ const std = @import("std");
 const rt = @import("runtime");
 const Value = rt.Value;
 
-fn arrayBind(xs: Value, f: Value) Value {
+/// Fallible: `f` is arbitrary PureScript code.
+fn arrayBind(xs: Value, f: Value) rt.Error!Value {
     const items = xs.asArray();
 
     var out: std.ArrayList(Value) = .empty;
     for (items) |x| {
-        const produced = rt.apply(f, x).asArray();
+        const produced = (try rt.apply(f, x)).asArray();
         out.appendSlice(rt.alloc(), produced) catch @panic("runtime: out of memory");
     }
     return Value.mkArray(out.items);

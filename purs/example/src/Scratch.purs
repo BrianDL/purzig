@@ -16,6 +16,14 @@ module Scratch (target) where
 import Prelude
 
 import Control.Lazy (fix)
+import Data.Int as Int
+import Data.Int.Bits (complement, shl, shr, zshr, (.&.), (.^.), (.|.))
+import Data.Maybe (Maybe(..))
+import Data.Number as Number
+import Data.String.CodeUnits as SCU
+import Data.String.Common as SC
+import Data.String.Pattern (Pattern(..), Replacement(..))
+import Data.String.Unsafe as SU
 import Effect (Effect, forE, foreachE, whileE)
 import Effect.Exception (catchException, error, message, name, throwException)
 import Effect.Ref as Ref
@@ -202,5 +210,100 @@ target n = do
         $ check "caught" (recovered == "Error/boom")
         $ check "uncaught" (clean == "clean")
         $ check "notResumed" (witness == 0)
+
+        -- Data.Int. `intRoundNegHalf` is the interesting one: `Math.round`
+        -- breaks ties towards positive infinity, so this is -2 and not the -3
+        -- that Zig's `@round` would give.
+        $ check "intToNumber" (Int.toNumber 3 == 3.0)
+        $ check "intFloor" (Int.floor 3.7 == 3)
+        $ check "intCeil" (Int.ceil 3.2 == 4)
+        $ check "intRoundHalf" (Int.round 2.5 == 3)
+        $ check "intRoundNegHalf" (Int.round (-2.5) == (-2))
+        $ check "intQuot" (Int.quot 7 2 == 3)
+        $ check "intQuotNeg" (Int.quot (-7) 2 == (-3))
+        $ check "intQuotZero" (Int.quot 7 0 == 0)
+        $ check "intRem" (Int.rem 7 2 == 1)
+        $ check "intPow" (Int.pow 2 10 == 1024)
+        $ check "intHex" (Int.toStringAs Int.hexadecimal 255 == "ff")
+        $ check "intBinary" (Int.toStringAs Int.binary (-5) == "-101")
+        $ check "intFromString" (Int.fromString "42" == Just 42)
+        $ check "intFromStringSigned" (Int.fromString "-42" == Just (-42))
+        $ check "intFromStringBad" (Int.fromString "12x" == Nothing)
+        $ check "intFromStringBig" (Int.fromString "99999999999" == Nothing)
+        $ check "intFromNumber" (Int.fromNumber 3.0 == Just 3)
+        $ check "intFromNumberFrac" (Int.fromNumber 3.5 == Nothing)
+
+        -- Data.Int.Bits. The first four are rewritten into PrimOps and never
+        -- reach the FFI; the shifts do reach it, and `bitsShlMask` is the
+        -- JavaScript five-bit masking rule that keeps them out of the PrimOp
+        -- table.
+        $ check "bitsAnd" ((6 .&. 3) == 2)
+        $ check "bitsOr" ((6 .|. 3) == 7)
+        $ check "bitsXor" ((6 .^. 3) == 5)
+        $ check "bitsComplement" (complement 0 == (-1))
+        $ check "bitsShl" (shl 1 4 == 16)
+        $ check "bitsShlMask" (shl 1 32 == 1)
+        $ check "bitsShr" (shr (-16) 2 == (-4))
+        $ check "bitsZshr" (zshr (-1) 28 == 15)
+
+        -- Data.Number. `numMaxNaN` and `numSignNegZero` are the two places
+        -- Zig's builtin disagrees with `Math`, and `numFromStringPrefix` is
+        -- `parseFloat` reading the longest valid prefix.
+        $ check "numSqrt" (Number.sqrt 9.0 == 3.0)
+        $ check "numRemainder" (Number.remainder 7.0 2.0 == 1.0)
+        $ check "numSign" (Number.sign (-3.0) == (-1.0))
+        $ check "numSignNegZero" (Number.sign 0.0 == 0.0)
+        $ check "numMax" (Number.max 1.0 2.0 == 2.0)
+        $ check "numMaxNaN" (Number.isNaN (Number.max Number.nan 1.0))
+        $ check "numIsFinite" (not (Number.isFinite Number.infinity))
+        $ check "numFromString" (Number.fromString "3.5" == Just 3.5)
+        $ check "numFromStringPrefix" (Number.fromString "2.5abc" == Just 2.5)
+        $ check "numFromStringInf" (Number.fromString "Infinity" == Nothing)
+        $ check "numFromStringBad" (Number.fromString "x" == Nothing)
+
+        -- Data.String.CodeUnits. `cuAstral` pins the one place this backend
+        -- disagrees with the JavaScript one: a code point above the BMP counts
+        -- as ONE unit here and as a surrogate pair there.
+        $ check "cuLength" (SCU.length "abc" == 3)
+        $ check "cuTake" (SCU.take 2 "abcd" == "ab")
+        $ check "cuTakeOver" (SCU.take 9 "ab" == "ab")
+        $ check "cuTakeNeg" (SCU.take (-1) "ab" == "")
+        $ check "cuDrop" (SCU.drop 2 "abcd" == "cd")
+        $ check "cuSlice" (SCU.slice 1 3 "abcde" == "bc")
+        $ check "cuSliceNeg" (SCU.slice 0 (-1) "abcd" == "abc")
+        $ check "cuSliceEmpty" (SCU.slice 3 1 "abcd" == "")
+        $ check "cuCharAt" (SCU.charAt 1 "abc" == Just 'b')
+        $ check "cuCharAtOver" (SCU.charAt 9 "abc" == Nothing)
+        $ check "cuToChar" (SCU.toChar "a" == Just 'a')
+        $ check "cuToCharLong" (SCU.toChar "ab" == Nothing)
+        $ check "cuSingleton" (SCU.singleton 'x' == "x")
+        $ check "cuFromCharArray" (SCU.fromCharArray [ 'a', 'b' ] == "ab")
+        $ check "cuToCharArray" (SCU.toCharArray "ab" == [ 'a', 'b' ])
+        $ check "cuCountPrefix" (SCU.countPrefix (_ == 'a') "aab" == 2)
+        $ check "cuIndexOf" (SCU.indexOf (Pattern "b") "abc" == Just 1)
+        $ check "cuIndexOfMiss" (SCU.indexOf (Pattern "z") "abc" == Nothing)
+        $ check "cuIndexOfFrom" (SCU.indexOf' (Pattern "a") 1 "aba" == Just 2)
+        $ check "cuLastIndexOf" (SCU.lastIndexOf (Pattern "a") "aba" == Just 2)
+        $ check "cuLastIndexOfFrom" (SCU.lastIndexOf' (Pattern "a") 1 "aba" == Just 0)
+        $ check "cuSplitAtBefore" ((SCU.splitAt 2 "abcd").before == "ab")
+        $ check "cuSplitAtAfter" ((SCU.splitAt 2 "abcd").after == "cd")
+        $ check "cuUnsafeCharAt" (SU.charAt 1 "abc" == 'b')
+        $ check "cuAccented" (SCU.length "clé" == 3)
+        $ check "cuRoundTrip" (SCU.fromCharArray (SCU.toCharArray "clé") == "clé")
+
+        -- Data.String.Common. The two empty-pattern checks are transcribed
+        -- JavaScript behaviour, not an accident.
+        $ check "scToUpper" (SC.toUpper "abc" == "ABC")
+        $ check "scToLower" (SC.toLower "ABC" == "abc")
+        $ check "scTrim" (SC.trim "  ab  " == "ab")
+        $ check "scReplace" (SC.replace (Pattern "a") (Replacement "X") "aba" == "Xba")
+        $ check "scReplaceMiss" (SC.replace (Pattern "z") (Replacement "X") "aba" == "aba")
+        $ check "scReplaceEmpty" (SC.replace (Pattern "") (Replacement "X") "ab" == "Xab")
+        $ check "scReplaceAll" (SC.replaceAll (Pattern "a") (Replacement "X") "aba" == "XbX")
+        $ check "scReplaceAllEmpty" (SC.replaceAll (Pattern "") (Replacement "X") "ab" == "XaXbX")
+        $ check "scSplit" (SC.split (Pattern ",") "a,b" == [ "a", "b" ])
+        $ check "scSplitMiss" (SC.split (Pattern ",") "ab" == [ "ab" ])
+        $ check "scSplitChars" (SC.split (Pattern "") "ab" == [ "a", "b" ])
+        $ check "scJoinWith" (SC.joinWith "-" [ "a", "b" ] == "a-b")
         $ ""
   pure (if failure == "" then n else failure)

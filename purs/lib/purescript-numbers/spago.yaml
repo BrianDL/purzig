@@ -1,0 +1,16 @@
+# Vendored `purescript-numbers` 9.0.1. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# `Data.Number.Format` is deliberately NOT included. Nothing else in the
+# dependency closure imports it, so omitting the file costs nothing today, and
+# its four foreign imports are `Number.prototype.toFixed`, `toPrecision` and
+# `toExponential` -- three formatters whose exact output is specified by
+# ECMA-262 and which Zig's `{d}` does not reproduce. Matching them properly is
+# real work for a module nobody is asking for; `showNumber`'s existing
+# divergence is already documented in the same spirit. Restore the file and
+# write the FFI if it is ever wanted.
+package:
+  name: numbers
+  dependencies:
+    - functions
+    - maybe

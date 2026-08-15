@@ -1,0 +1,26 @@
+# Vendored `purescript-strings` 6.0.1. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# This is a SUBSET of the package: only `Data.String.Common`,
+# `Data.String.CodeUnits`, `Data.String.Unsafe` and `Data.String.Pattern` are
+# present. The omissions are deliberate and each has a reason:
+#
+#   * `Data.String.CodePoints` and the `Data.String` umbrella that re-exports
+#     it import `Data.Array`, so they arrive with the arrays batch and the
+#     mutable-array runtime work it needs. They are the largest omission and
+#     the first to be restored.
+#   * `Data.String.Regex` and its two satellites need a regular-expression
+#     engine. Nothing else in the closure imports them.
+#   * `Data.String.NonEmpty.*`, `Data.Char`, `CaseInsensitive` and the two
+#     `Gen` modules pull in `nonempty`, `enums` and `gen` for no FFI of their
+#     own; they are cheap to restore once those packages are vendored.
+#
+# Omitting a module from a vendored package costs nothing at build time -- purs
+# only compiles what is in `src/` -- but it does mean `dependencies` below is
+# the subset's closure rather than the package's own.
+package:
+  name: strings
+  dependencies:
+    - maybe
+    - newtype
+    - prelude

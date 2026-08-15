@@ -107,7 +107,8 @@ fn showStringImpl(x: Value) Value {
     return Value.mkString(out.items);
 }
 
-fn showArrayImpl(f: Value, xs: Value) Value {
+/// Fallible: `f` is the element `show`, which is PureScript code and may throw.
+fn showArrayImpl(f: Value, xs: Value) rt.Error!Value {
     const items = xs.asArray();
 
     var out: std.ArrayList(u8) = .empty;
@@ -116,7 +117,7 @@ fn showArrayImpl(f: Value, xs: Value) Value {
 
     for (items, 0..) |x, i| {
         if (i > 0) out.append(gpa, ',') catch @panic("runtime: out of memory");
-        out.appendSlice(gpa, rt.apply(f, x).asString()) catch @panic("runtime: out of memory");
+        out.appendSlice(gpa, (try rt.apply(f, x)).asString()) catch @panic("runtime: out of memory");
     }
 
     out.append(gpa, ']') catch @panic("runtime: out of memory");

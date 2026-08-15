@@ -1,0 +1,15 @@
+# Vendored `purescript-integers` 6.0.0. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# Note that four of `Data.Int.Bits`'s seven foreign imports -- `and`, `or`,
+# `xor` and `complement` -- are rewritten by the optimizer into `OpIntBitAnd`
+# and friends, so their Zig is compiled but never called. The three shifts are
+# filtered out of `coreForeignSemantics` in the driver and DO run, because
+# JavaScript masks the shift count to five bits and we deliberately match that
+# in the FFI rather than in a PrimOp.
+package:
+  name: integers
+  dependencies:
+    - maybe
+    - numbers
+    - prelude

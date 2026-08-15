@@ -1,0 +1,12 @@
+# Vendored `purescript-functions` 6.0.0. See purescript-effect/spago.yaml for
+# why these are vendored rather than resolved from the registry.
+#
+# Vendored reluctantly: all twenty of `Data.Function.Uncurried`'s foreign
+# imports are rewritten by the optimizer into `UncurriedApp` nodes, so the Zig
+# is compiled and never called. It is here because `Data.Number` types
+# `fromStringImpl` as an `Fn4`, which makes this package a dependency of
+# `numbers` whether or not anything reaches the FFI.
+package:
+  name: functions
+  dependencies:
+    - prelude

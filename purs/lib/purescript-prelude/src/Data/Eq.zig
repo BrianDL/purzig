@@ -28,13 +28,16 @@ fn eqStringImpl(x: Value, y: Value) Value {
 }
 
 /// `f` is the element-wise equality from the Eq dictionary, so it is applied
-/// through `rt.apply2` like any other PureScript function.
-fn eqArrayImpl(f: Value, xs: Value, ys: Value) Value {
+/// through `rt.apply2` like any other PureScript function -- and like any other
+/// PureScript function it may throw, which is why this one alone returns
+/// `rt.Error!Value`. `rt.curry` coerces a plain `Value` return, so the scalar
+/// comparisons above need no annotation.
+fn eqArrayImpl(f: Value, xs: Value, ys: Value) rt.Error!Value {
     const a = xs.asArray();
     const b = ys.asArray();
     if (a.len != b.len) return Value.mkBool(false);
     for (a, b) |x, y| {
-        if (!rt.apply2(f, x, y).asBool()) return Value.mkBool(false);
+        if (!(try rt.apply2(f, x, y)).asBool()) return Value.mkBool(false);
     }
     return Value.mkBool(true);
 }
