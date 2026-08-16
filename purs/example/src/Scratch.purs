@@ -17,12 +17,18 @@ import Prelude
 
 import Control.Lazy (fix)
 import Control.Monad.ST as ST
+import Control.Monad.ST.Uncurried (mkSTFn2, runSTFn2)
+import Data.Function.Uncurried (mkFn3, runFn3)
 import Data.Array as A
+import Data.Array.NonEmpty as NEA
+import Data.Array.ST.Partial as STAP
 import Data.Char as Char
 import Data.Enum (fromEnum, toEnum)
 import Data.Array.ST as STA
 import Control.Monad.ST.Ref as STRef
 import Data.Foldable (foldl, foldr, sum)
+import Data.Semigroup.Foldable (foldl1, foldr1)
+import Data.Semigroup.Traversable (traverse1)
 import Data.FunctorWithIndex (mapWithIndex)
 import Data.Int as Int
 import Data.Int.Bits (complement, shl, shr, zshr, (.&.), (.^.), (.|.))
@@ -37,6 +43,7 @@ import Data.String.Unsafe as SU
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Data.Unfoldable (unfoldr)
+import Data.Unfoldable1 (unfoldr1)
 import Effect (Effect, forE, foreachE, whileE)
 import Effect.Exception (catchException, error, message, name, throwException)
 import Effect.Ref as Ref
@@ -244,6 +251,73 @@ stSpliceRemoved = ST.run do
   arr <- STA.unsafeThaw [ 2, 3, 4 ]
   STA.splice 1 1 [ 9, 9 ] arr
 
+-- | `Data.Array.ST` operations the earlier fixtures never reached: the three
+-- | copying conversions, `unshiftAll`, `peek`, and the assoc-array used by
+-- | `sortWith`.
+stFreeze :: Array Int
+stFreeze = ST.run do
+  arr <- STA.unsafeThaw [ 1, 2 ]
+  frozen <- STA.freeze arr
+  _ <- STA.push 3 arr
+  -- `freeze` COPIES, so pushing afterwards must not be visible through it.
+  pure frozen
+
+stThawClone :: Array Int
+stThawClone = STA.run do
+  original <- STA.thaw [ 1, 2 ]
+  copy <- STA.clone original
+  _ <- STA.push 9 original
+  pure copy
+
+stUnshift :: Array Int
+stUnshift = STA.run do
+  arr <- STA.unsafeThaw [ 3, 4 ]
+  _ <- STA.unshiftAll [ 1, 2 ] arr
+  pure arr
+
+stPeek :: Maybe Int
+stPeek = ST.run do
+  arr <- STA.unsafeThaw [ 7, 8 ]
+  STA.peek 1 arr
+
+stPeekOut :: Maybe Int
+stPeekOut = ST.run do
+  arr <- STA.unsafeThaw [ 7, 8 ]
+  STA.peek 9 arr
+
+stLength :: Int
+stLength = ST.run do
+  arr <- STA.unsafeThaw [ 1, 2, 3 ]
+  STA.length arr
+
+-- | `Data.Array.ST.Partial`, the unchecked peek and poke.
+stPartial :: Array Int
+stPartial = STA.run do
+  arr <- STA.unsafeThaw [ 1, 2, 3 ]
+  unsafePartial do
+    v <- STAP.peek 2 arr
+    STAP.poke 0 v arr
+  pure arr
+
+-- | `Control.Monad.ST.Uncurried`. Written as a partial application on purpose:
+-- | a saturated `runSTFn2` is rewritten by the optimizer into an
+-- | `UncurriedEffectApp` and never reaches the FFI, which is how the swapped
+-- | `rt.curry`/`rt.effect` wrappers went unnoticed until `Data.Array.ST.splice`
+-- | (itself a partial application) hit them.
+stUncurried :: Int
+stUncurried = ST.run do
+  cell <- STRef.new 1
+  let bump = runSTFn2 (mkSTFn2 \a b -> STRef.modify (\x -> x + a + b) cell)
+  _ <- bump 10 100
+  STRef.read cell
+
+-- | `Data.Function.Uncurried`, same partial-application trick. Pure, so there
+-- | is no thunk level to get wrong -- this guards the arity plumbing only.
+fnUncurried :: Int
+fnUncurried =
+  let apply3 = runFn3 (mkFn3 \a b c -> a + b + c)
+  in apply3 1 20 300
+
 -- | `check name ok rest` yields `name` when `ok` is false, otherwise defers to
 -- | `rest`. Right-nested, so the first failure wins.
 check :: String -> Boolean -> String -> String
@@ -364,6 +438,7 @@ target n = do
         $ check "cuSplitAtBefore" ((SCU.splitAt 2 "abcd").before == "ab")
         $ check "cuSplitAtAfter" ((SCU.splitAt 2 "abcd").after == "cd")
         $ check "cuUnsafeCharAt" (SU.charAt 1 "abc" == 'b')
+        $ check "cuUnsafeChar" (SU.char "q" == 'q')
         $ check "cuAccented" (SCU.length "clé" == 3)
         $ check "cuRoundTrip" (SCU.fromCharArray (SCU.toCharArray "clé") == "clé")
 
@@ -506,5 +581,80 @@ target n = do
         -- the header of Data/String/Common.zig.
         $ check "strUmbrella" (S.toUpper "clé" == "CLé")
         $ check "strTrim" (S.trim "  ab  " == "ab")
+
+        -- Data.Array.ST: the conversions and accessors the earlier ST checks
+        -- did not reach.
+        $ check "stFreeze" (stFreeze == [ 1, 2 ])
+        $ check "stThawClone" (stThawClone == [ 1, 2 ])
+        $ check "stUnshift" (stUnshift == [ 1, 2, 3, 4 ])
+        $ check "stPeek" (stPeek == Just 8)
+        $ check "stPeekOut" (stPeekOut == Nothing)
+        $ check "stLength" (stLength == 3)
+        $ check "stPartial" (stPartial == [ 3, 2, 3 ])
+        $ check "stUncurried" (stUncurried == 111)
+        $ check "fnUncurried" (fnUncurried == 321)
+
+        -- `toAssocArrayImpl`, reached through `sortWith` on a key that repeats.
+        $ check "arrSortWith" (A.sortWith (_ * (-1)) [ 1, 3, 2 ] == [ 3, 2, 1 ])
+
+        -- Data.Array.NonEmpty.Internal: fold1, foldMap1 and traverse1.
+        $ check "neaFoldr1" (map (foldr1 (-)) (NEA.fromArray [ 1, 2, 3 ]) == Just 2)
+        $ check "neaFoldl1" (map (foldl1 (-)) (NEA.fromArray [ 1, 2, 3 ]) == Just (-4))
+        $ check "neaTraverse1"
+            (map (traverse1 Just) (NEA.fromArray [ 1, 2, 3 ]) == Just (NEA.fromArray [ 1, 2, 3 ]))
+
+        -- Data.Unfoldable1: always yields at least one element, and the Maybe
+        -- decides whether to continue rather than whether to start.
+        $ check "unfoldr1"
+            (unfoldr1 (\seed -> Tuple seed (if seed >= 3 then Nothing else Just (seed + 1))) 1 == [ 1, 2, 3 ])
+        $ check "unfoldr1One" (unfoldr1 (\seed -> Tuple seed Nothing) 5 == [ 5 ])
+
+        -- Data.String.Common.localeCompare, which compares by code point here.
+        $ check "localeCompareLt" (SC.localeCompare "a" "b" == LT)
+        $ check "localeCompareEq" (SC.localeCompare "a" "a" == EQ)
+        $ check "localeCompareGt" (SC.localeCompare "b" "a" == GT)
+
+        -- Data.Int: the radix-taking parser, and the wrapping/edge cases the
+        -- `| 0` transcription exists for.
+        $ check "intFromStringAs" (Int.fromStringAs Int.hexadecimal "ff" == Just 255)
+        $ check "intFromStringAsBad" (Int.fromStringAs Int.binary "2" == Nothing)
+        $ check "intPowNegative" (Int.pow 2 (-1) == 0)
+        $ check "intPowOverflow" (Int.pow 2 40 == 0)
+        $ check "intRemZero" (Int.rem 7 0 == 0)
+        $ check "intToStringZero" (Int.toStringAs Int.decimal 0 == "0")
+
+        -- Data.String.CodeUnits: the remaining constructors and accessors.
+        $ check "cuIndexOfStartOut" (SCU.indexOf' (Pattern "a") 9 "aba" == Nothing)
+        $ check "cuLastIndexOfMiss" (SCU.lastIndexOf (Pattern "z") "aba" == Nothing)
+        $ check "cuDropNeg" (SCU.drop (-1) "ab" == "ab")
+        $ check "cuSplitAtOver" ((SCU.splitAt 9 "ab").before == "ab")
+
+        -- Data.String.CodePoints: `_take`, `_countPrefix` and `_singleton` on
+        -- their empty and exhausted edges.
+        $ check "cpTakeOver" (SCP.take 9 "clé" == "clé")
+        $ check "cpTakeZero" (SCP.take 0 "clé" == "")
+        $ check "cpCountPrefixNone" (SCP.countPrefix (\c -> fromEnum c == 122) "aab" == 0)
+
+        -- Data.Number: everything the earlier block skipped. `numRoundBig` is
+        -- the 2^52 guard, above which every Double is already an integer and
+        -- adding 0.5 would round the value itself rather than break a tie.
+        $ check "numAbs" (Number.abs (-2.5) == 2.5)
+        $ check "numCeil" (Number.ceil 1.2 == 2.0)
+        $ check "numFloor" (Number.floor 1.8 == 1.0)
+        $ check "numTrunc" (Number.trunc (-1.8) == (-1.0))
+        $ check "numRoundBig" (Number.round 9007199254740994.0 == 9007199254740994.0)
+        $ check "numRoundInf" (Number.round Number.infinity == Number.infinity)
+        $ check "numMin" (Number.min 1.0 2.0 == 1.0)
+        $ check "numMinNaN" (Number.isNaN (Number.min Number.nan 1.0))
+        $ check "numPow" (Number.pow 2.0 10.0 == 1024.0)
+        $ check "numExpLog" (Number.log (Number.exp 1.0) == 1.0)
+        $ check "numSqrtNaN" (Number.isNaN (Number.sqrt (-1.0)))
+        $ check "numSignNaN" (Number.isNaN (Number.sign Number.nan))
+        $ check "numSignPos" (Number.sign 3.0 == 1.0)
+        $ check "numRemainderNaN" (Number.isNaN (Number.remainder 1.0 0.0))
+        $ check "numTrig" (Number.sin 0.0 == 0.0 && Number.cos 0.0 == 1.0 && Number.tan 0.0 == 0.0)
+        $ check "numInverseTrig"
+            (Number.asin 0.0 == 0.0 && Number.acos 1.0 == 0.0 && Number.atan 0.0 == 0.0)
+        $ check "numAtan2" (Number.atan2 0.0 1.0 == 0.0)
         $ ""
   pure (if failure == "" then n else failure)

@@ -30,7 +30,7 @@
               "integers": "*"
             },
             {
-              "maybe": "*"
+              "maybe": ">=6.0.0 <7.0.0"
             },
             {
               "numbers": "*"
@@ -48,7 +48,7 @@
               "strings": "*"
             },
             {
-              "tuples": "*"
+              "tuples": ">=7.0.0 <8.0.0"
             },
             {
               "unfoldable": "*"

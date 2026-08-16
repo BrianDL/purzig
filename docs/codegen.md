@@ -46,12 +46,24 @@ optimizer inside `lookupCtorFields`.
 
 There is one type. Every PureScript value of every type becomes a `rt.Value`, a
 tagged union with variants `unit`, `boolean`, `integer`, `number`, `string`,
-`char`, `array`, `record`, `data`, `closure`, `ref`.
+`char`, `array`, `record`, `data`, `closure`, `ref`, `marray`.
 
-`ref` is the odd one out and the only mutable thing in the runtime. It backs
-`Effect.Ref`, and it has to be a pointer: a write must be observable through
-every copy of the reference, `Value` is passed by value everywhere, and
-`mkRecord` copies. It also backs the lazy cells described under `LetRec`.
+The last two are the only mutable things in the runtime, and both are pointers
+for the same reason: a write must be observable through every copy of the
+handle, `Value` is passed by value everywhere, and `mkRecord` copies.
+
+`ref` backs `Effect.Ref` and `Control.Monad.ST.Ref`, which are the same cell at
+runtime since the region parameter is erased. It also backs the lazy cells
+described under `LetRec`.
+
+`marray` is a `*std.ArrayList(Value)` and backs `Data.Array.ST`'s `STArray`. It
+cannot reuse `array`, which is a `[]const Value` with no capacity — `push` would
+be O(n) per element and `sortBy` O(n²), and `Data.Array`'s `sort`, `nub`,
+`group` and `union` all run through `Data.Array.ST`, so that is the common path
+rather than an exotic one. The runtime's whole public surface for it is
+`rt.newMutArray`; every other operation is an ordinary `std.ArrayList` call that
+`Data/Array/ST.zig` makes through `Value.asMutArray()`, which hand-written FFI
+is allowed to do. Generated code never touches an `STArray`.
 
 The IR is untyped — the compiler has already type-checked and discarded the
 types — so the backend has nothing to be type-directed with. Generated Zig is
@@ -367,18 +379,33 @@ The optimizer rewrites the prelude's foreign arithmetic, comparison and append
 into primitive operations, so most of what used to be an FFI call arrives here.
 Each is a one-liner over the runtime's public surface:
 
+`op1Text` and `op2Text` between them implement eighteen constructors:
+
 | Operator | Zig |
 |---|---|
 | `OpBooleanNot` | `mkBool(!x.asBool())` |
+| `OpIntBitNot` | `mkInt(~x.asInt())` |
 | `OpIntNegate` | `mkInt(-%x.asInt())` |
+| `OpNumberNegate` | `mkNumber(-x.asNumber())` |
 | `OpArrayLength` | `mkInt(@intCast(x.asArray().len))` |
 | `OpIsTag C` | `mkBool(x.hasTag("C"))` |
 | `OpArrayIndex` | `x.asArray()[@intCast(y.asInt())]` |
 | `OpBooleanAnd`/`Or` | `mkBool(x.asBool() and y.asBool())` |
-| `Op*Ord` | `mkBool(x.asInt() < y.asInt())`, etc. |
+| `OpBooleanOrd` | compares `@intFromBool(x.asBool())` |
+| `OpCharOrd` | compares `x.asChar()` |
+| `OpIntOrd` | compares `x.asInt()` |
+| `OpNumberOrd` | compares `x.asNumber()` |
 | `OpStringOrd OpEq` | `mkBool(x.stringEq(y.asString()))` |
+| `OpStringOrd OpNotEq` | `mkBool(!x.stringEq(y.asString()))` |
 | `OpIntNum` | `+%`, `-%`, `*%` — wrapping, matching JavaScript's `\| 0` |
+| `OpNumberNum` | `+`, `-`, `*`, `/` — no wrapping; Number is an f64 |
+| `OpIntBitAnd`/`Or`/`Xor` | `&`, `\|`, `^` on `asInt()` |
 | `OpStringAppend` | `mkString(rt.concatString(x.asString(), y.asString()))` |
+
+The four ordering operators share one `cmp` helper and differ only in the
+accessor they project through, which is why they are one row each rather than a
+table of twenty-four comparisons: `OpEq`, `OpNotEq`, `OpLt`, `OpLte`, `OpGt` and
+`OpGte` are all handled uniformly.
 
 Zig's `and`/`or` short-circuit and the right operand is part of the right-hand
 expression, so laziness in the second argument is preserved.
@@ -391,7 +418,9 @@ those calls stay ordinary FFI applications where the semantics already match:
 - `Data.EuclideanRing.intDiv` — ours is Euclidean and returns 0 on
   divide-by-zero, transcribed from the original `.js`.
 - `Data.Int.Bits.shl`/`shr`/`zshr` — JavaScript masks the shift count to five
-  bits.
+  bits, where a shift wider than the type is illegal behaviour in Zig. Note the
+  non-shift bitwise operators above ARE implemented: masking is the only part
+  of `Data.Int.Bits` whose semantics differ.
 - `Data.Ord.ordString` — the runtime has `stringEq` but no comparison.
 
 If one of these ever reaches the emitter, the filter has drifted, and the
@@ -569,6 +598,28 @@ pub const @"ps.intAdd" = rt.curry(intAdd);
 - `rt.curry(f)` — a pure function of one or more arguments.
 - `rt.effect(f)` — an `Effect`. Adds the trailing unit thunk, so nothing runs
   until `rt.runEffect` forces it. Works for nullary `f` too.
+
+**Which of the two is decided by what the function DOES, not by its PureScript
+type.** Anything that performs an effect takes `rt.effect`, including the
+`STFnN`- and `EffectFnN`-typed imports that look like they should run on
+saturation. They do not: the emitter lowers an `UncurriedEffectApp` to the
+applications followed by `rt.runEffect`, so a saturated `STFn4` still has to
+yield a thunk for that `runEffect` to force. Using `rt.curry` there runs the
+operation one step early and hands `runEffect` a finished value to apply, which
+panics with "applied a non-function" — or, worse, silently does nothing when the
+result is discarded.
+
+Two corollaries, both of which were got wrong first:
+
+- A pure function *of* an effectful value is `rt.curry`. `Control.Monad.ST.run`
+  is the example: `ST h a -> a` forces immediately and returns the result.
+- In the uncurried shim modules the two families are opposites. `runEffectFnN`
+  and `runSTFnN` FORWARD a thunk their argument already is, so they are
+  `rt.curry`; `mkEffectFnN` and `mkSTFnN` CREATE one, so they are `rt.effect`.
+  Getting either backwards adds or removes a thunk level that nothing forces.
+
+When in doubt, read the generated `.zig` for a call site rather than reasoning
+from the type.
 
 An FFI function may return either `Value` or `rt.Error!Value` and needs no
 annotation either way: Zig coerces `T` to `E!T` on return, so the one `@call`
