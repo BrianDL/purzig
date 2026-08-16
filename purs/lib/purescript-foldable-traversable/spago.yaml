@@ -1,0 +1,22 @@
+# Vendored `purescript-foldable-traversable` 6.0.0. See
+# purescript-effect/spago.yaml for why these are vendored rather than resolved
+# from the registry.
+#
+# Four foreign imports across three modules, all array specialisations of
+# operations the generic Foldable/Traversable machinery could do more slowly.
+# `traverseArrayImpl` is the one worth reading: its balanced-tree shape is a
+# real asymptotic property of the traversal, not an implementation detail.
+package:
+  name: foldable-traversable
+  dependencies:
+    - bifunctors
+    - const
+    - control
+    - either
+    - functors
+    - identity
+    - maybe
+    - newtype
+    - orders
+    - prelude
+    - tuples

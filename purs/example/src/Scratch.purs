@@ -16,17 +16,27 @@ module Scratch (target) where
 import Prelude
 
 import Control.Lazy (fix)
+import Control.Monad.ST as ST
+import Data.Array as A
+import Data.Array.ST as STA
+import Control.Monad.ST.Ref as STRef
+import Data.Foldable (foldl, foldr, sum)
+import Data.FunctorWithIndex (mapWithIndex)
 import Data.Int as Int
 import Data.Int.Bits (complement, shl, shr, zshr, (.&.), (.^.), (.|.))
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromJust)
 import Data.Number as Number
 import Data.String.CodeUnits as SCU
 import Data.String.Common as SC
 import Data.String.Pattern (Pattern(..), Replacement(..))
 import Data.String.Unsafe as SU
+import Data.Traversable (traverse)
+import Data.Tuple (Tuple(..))
+import Data.Unfoldable (unfoldr)
 import Effect (Effect, forE, foreachE, whileE)
 import Effect.Exception (catchException, error, message, name, throwException)
 import Effect.Ref as Ref
+import Partial.Unsafe (unsafePartial)
 
 -- Constructors at arity 0, 1 and 2.
 data Shape
@@ -168,6 +178,68 @@ notResumed = do
     Ref.write 1 witness
   Ref.read witness
 
+-- | `ST` end to end: a mutable accumulator, the `for` combinator, and `run`
+-- | discharging the region. Every one of these is rewritten by the optimizer
+-- | into the same effect nodes `Effect` uses, so nothing here reaches
+-- | `Control.Monad.ST.Internal`'s FFI -- which is the point being checked.
+stSum :: Int
+stSum = ST.run do
+  acc <- STRef.new 0
+  ST.for 1 5 \i -> void (STRef.modify (_ + i) acc)
+  STRef.read acc
+
+-- | `ST.while` and `ST.foreach`, the other two combinators.
+stCollect :: Int
+stCollect = ST.run do
+  remaining <- STRef.new 3
+  tally <- STRef.new 0
+  ST.while (map (_ > 0) (STRef.read remaining)) do
+    _ <- STRef.modify (_ - 1) remaining
+    void (STRef.modify (_ + 10) tally)
+  ST.foreach [ 1, 2 ] \x -> void (STRef.modify (_ + x) tally)
+  STRef.read tally
+
+-- | `Data.Array.ST` directly: build an array by mutation, then freeze it.
+-- | This is the path that needs the runtime's `marray` variant -- `push` grows
+-- | in place, and `withArray` ends in an `unsafeFreeze`.
+stArray :: Array Int
+stArray = STA.run do
+  arr <- STA.new
+  _ <- STA.push 1 arr
+  _ <- STA.pushAll [ 2, 3 ] arr
+  _ <- STA.poke 0 10 arr
+  pure arr
+
+-- | `pop`, `shift` and `splice`, each observed on its own. Kept as three
+-- | functions rather than one chain so a failure names the operation that
+-- | broke instead of just the end state.
+stPop :: Array Int
+stPop = STA.run do
+  arr <- STA.unsafeThaw [ 1, 2, 3, 4, 5 ]
+  _ <- STA.pop arr
+  pure arr
+
+stShift :: Array Int
+stShift = STA.run do
+  arr <- STA.unsafeThaw [ 1, 2, 3, 4, 5 ]
+  _ <- STA.shift arr
+  pure arr
+
+stSplice :: Array Int
+stSplice = STA.run do
+  arr <- STA.unsafeThaw [ 2, 3, 4 ]
+  _ <- STA.splice 1 1 [ 9, 9 ] arr
+  pure arr
+
+-- | The value `splice` RETURNS is what it removed, not what remains.
+-- |
+-- | `ST.run`, not `STA.run`: the latter requires the block to end in an
+-- | `STArray` and would mean thawing the result just to satisfy the type.
+stSpliceRemoved :: Array Int
+stSpliceRemoved = ST.run do
+  arr <- STA.unsafeThaw [ 2, 3, 4 ]
+  STA.splice 1 1 [ 9, 9 ] arr
+
 -- | `check name ok rest` yields `name` when `ok` is false, otherwise defers to
 -- | `rest`. Right-nested, so the first failure wins.
 check :: String -> Boolean -> String -> String
@@ -305,5 +377,102 @@ target n = do
         $ check "scSplitMiss" (SC.split (Pattern ",") "ab" == [ "ab" ])
         $ check "scSplitChars" (SC.split (Pattern "") "ab" == [ "a", "b" ])
         $ check "scJoinWith" (SC.joinWith "-" [ "a", "b" ] == "a-b")
+
+        -- The Array instances in the prelude's own FFI. Zig only analyses a
+        -- declaration something references, so before these existed
+        -- `arrayMap`, `arrayApply`, `arrayBind`, `showArrayImpl` and
+        -- `ordArrayImpl` had never been type-checked -- which is how six of
+        -- them shipped with a missing `try`.
+        $ check "arrayMap" (map (_ + 1) [ 1, 2, 3 ] == [ 2, 3, 4 ])
+        $ check "arrayApply" (([ (_ + 1), (_ * 2) ] <*> [ 10, 20 ]) == [ 11, 21, 20, 40 ])
+        $ check "arrayBind" (([ 1, 2 ] >>= \x -> [ x, x ]) == [ 1, 1, 2, 2 ])
+        $ check "arrayShow" (show [ 1, 2 ] == "[1,2]")
+        $ check "arrayOrd" (compare [ 1, 2 ] [ 1, 3 ] == LT)
+        $ check "arrayOrdLonger" (compare [ 1, 2 ] [ 1 ] == GT)
+
+        -- Data.Foldable and friends.
+        $ check "foldr" (foldr (\x acc -> x - acc) 0 [ 1, 2, 3 ] == 2)
+        $ check "foldl" (foldl (-) 0 [ 1, 2, 3 ] == (-6))
+        $ check "foldrEmpty" (foldr (+) 7 [] == 7)
+        $ check "sum" (sum [ 1, 2, 3 ] == 6)
+        $ check "mapWithIndex" (mapWithIndex (\i x -> i * x) [ 1, 2, 3 ] == [ 0, 2, 6 ])
+
+        -- Data.Traversable. Seven elements, so `traverseArrayImpl` recurses
+        -- through its balanced-tree case rather than only the 0-3 leaves.
+        $ check "traverseJust"
+            (traverse (\x -> if x > 0 then Just x else Nothing) [ 1, 2, 3, 4, 5, 6, 7 ]
+              == Just [ 1, 2, 3, 4, 5, 6, 7 ])
+        $ check "traverseNothing"
+            (traverse (\x -> if x > 0 then Just x else Nothing) [ 1, 2, 0, 4, 5, 6, 7 ] == Nothing)
+        $ check "traverseEmpty" (traverse Just ([] :: Array Int) == Just [])
+
+        -- Data.Unfoldable.
+        $ check "unfoldr"
+            (unfoldr (\seed -> if seed > 3 then Nothing else Just (Tuple seed (seed + 1))) 1 == [ 1, 2, 3 ])
+        $ check "unfoldrEmpty" (unfoldr (\_ -> Nothing :: Maybe (Tuple Int Int)) 1 == [])
+
+        -- Control.Monad.ST.
+        $ check "stSum" (stSum == 10)
+        $ check "stCollect" (stCollect == 33)
+
+        -- Partial.Unsafe. The argument is an application rather than a
+        -- literal lambda, so the optimizer's rewrite does not fire and this
+        -- reaches `_unsafePartial` in the FFI.
+        $ check "unsafePartial" (unsafePartial (fromJust (Just 5)) == 5)
+
+        -- Data.Array, the immutable surface.
+        $ check "arrRange" (A.range 1 4 == [ 1, 2, 3, 4 ])
+        $ check "arrRangeDown" (A.range 3 1 == [ 3, 2, 1 ])
+        $ check "arrRangeOne" (A.range 2 2 == [ 2 ])
+        $ check "arrReplicate" (A.replicate 3 7 == [ 7, 7, 7 ])
+        $ check "arrReplicateZero" (A.replicate 0 7 == [])
+        $ check "arrLength" (A.length [ 1, 2, 3 ] == 3)
+        $ check "arrIndex" (A.index [ 1, 2, 3 ] 1 == Just 2)
+        $ check "arrIndexOut" (A.index [ 1, 2, 3 ] 9 == Nothing)
+        $ check "arrReverse" (A.reverse [ 1, 2, 3 ] == [ 3, 2, 1 ])
+        $ check "arrConcat" (A.concat [ [ 1 ], [ 2, 3 ] ] == [ 1, 2, 3 ])
+        $ check "arrFilter" (A.filter (_ > 1) [ 1, 2, 3 ] == [ 2, 3 ])
+        $ check "arrPartition" ((A.partition (_ > 1) [ 1, 2, 3 ]).yes == [ 2, 3 ])
+        $ check "arrPartitionNo" ((A.partition (_ > 1) [ 1, 2, 3 ]).no == [ 1 ])
+        $ check "arrScanl" (A.scanl (+) 0 [ 1, 2, 3 ] == [ 1, 3, 6 ])
+        $ check "arrScanr" (A.scanr (+) 0 [ 1, 2, 3 ] == [ 6, 5, 3 ])
+        $ check "arrSlice" (A.slice 1 3 [ 1, 2, 3, 4 ] == [ 2, 3 ])
+        $ check "arrZipWith" (A.zipWith (+) [ 1, 2, 3 ] [ 10, 20 ] == [ 11, 22 ])
+        $ check "arrAny" (A.any (_ > 2) [ 1, 2, 3 ])
+        $ check "arrAll" (not (A.all (_ > 2) [ 1, 2, 3 ]))
+        $ check "arrFindIndex" (A.findIndex (_ > 1) [ 1, 2, 3 ] == Just 1)
+        $ check "arrFindLastIndex" (A.findLastIndex (_ < 3) [ 1, 2, 3 ] == Just 1)
+        $ check "arrFindMap" (A.findMap (\x -> if x > 1 then Just (x * 10) else Nothing) [ 1, 2, 3 ] == Just 20)
+        $ check "arrInsertAt" (A.insertAt 1 9 [ 1, 2 ] == Just [ 1, 9, 2 ])
+        $ check "arrInsertAtEnd" (A.insertAt 2 9 [ 1, 2 ] == Just [ 1, 2, 9 ])
+        $ check "arrInsertAtOut" (A.insertAt 9 0 [ 1, 2 ] == Nothing)
+        $ check "arrDeleteAt" (A.deleteAt 0 [ 1, 2 ] == Just [ 2 ])
+        $ check "arrUpdateAt" (A.updateAt 1 9 [ 1, 2 ] == Just [ 1, 9 ])
+        $ check "arrUncons" (map _.head (A.uncons [ 1, 2 ]) == Just 1)
+        $ check "arrUnconsEmpty" (A.uncons ([] :: Array Int) == Nothing)
+        $ check "arrFromFoldable" (A.fromFoldable (Just 3) == [ 3 ])
+        $ check "arrUnsafeIndex" (unsafePartial (A.unsafeIndex [ 1, 2, 3 ] 2) == 3)
+
+        -- Sorting. `arrSortStable` is the property that rules out handing this
+        -- to `std.sort`: equal keys must keep their original order.
+        $ check "arrSort" (A.sort [ 3, 1, 2 ] == [ 1, 2, 3 ])
+        $ check "arrSortEmpty" (A.sort ([] :: Array Int) == [])
+        $ check "arrSortLarge" (A.sort [ 9, 2, 7, 1, 8, 3, 6, 4, 5 ] == A.range 1 9)
+        $ check "arrSortStable"
+            (map _.tag (A.sortWith _.key [ { key: 1, tag: "a" }, { key: 0, tag: "b" }, { key: 1, tag: "c" } ])
+              == [ "b", "a", "c" ])
+        -- `nub` keeps the FIRST occurrence of each element in the ORIGINAL
+        -- order -- it sorts internally to find duplicates, then sorts back by
+        -- index. The docstring's `nub [1,2,1,3,3] = [1,2,3]` only looks sorted
+        -- because its input already was.
+        $ check "arrNub" (A.nub [ 3, 1, 3, 2, 1 ] == [ 3, 1, 2 ])
+        $ check "arrGroup" (map (\g -> A.length (A.fromFoldable g)) (A.group [ 1, 1, 2 ]) == [ 2, 1 ])
+
+        -- Data.Array.ST, which is what the runtime `marray` variant exists for.
+        $ check "stArrayBuild" (stArray == [ 10, 2, 3 ])
+        $ check "stPop" (stPop == [ 1, 2, 3, 4 ])
+        $ check "stShift" (stShift == [ 2, 3, 4, 5 ])
+        $ check "stSplice" (stSplice == [ 2, 9, 9, 4 ])
+        $ check "stSpliceRemoved" (stSpliceRemoved == [ 3 ])
         $ ""
   pure (if failure == "" then n else failure)

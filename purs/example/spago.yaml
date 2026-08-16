@@ -26,22 +26,31 @@
 # so that `numbers` resolves its `Fn4` against the vendored copy rather than the
 # registry one.
 #
+# `partial` is an override only: nothing here imports it directly, but
+# `unfoldable` and `st` both depend on it and must resolve it to the vendored
+# copy rather than the registry one, whose FFI is JavaScript.
+#
 # `numbers` is here because `integers` depends on it: `Data.Int.floor`,
 # `ceil`, `round` and `trunc` are all `Data.Number` calls wrapped in a range
 # clamp, so there is no way to take the one without the other.
 package:
   name: example
   dependencies:
+    - arrays: "*"
     - console: "*"
     - control: "*"
     - effect: "*"
     - exceptions: "*"
+    - foldable-traversable: "*"
     - integers: "*"
     - maybe: ">=6.0.0 <7.0.0"
     - numbers: "*"
     - prelude: "*"
     - refs: "*"
+    - st: "*"
     - strings: "*"
+    - tuples: ">=7.0.0 <8.0.0"
+    - unfoldable: "*"
 workspace:
   extraPackages:
     prelude:
@@ -66,6 +75,16 @@ workspace:
       path: ../lib/purescript-functions
     strings:
       path: ../lib/purescript-strings
+    partial:
+      path: ../lib/purescript-partial
+    unfoldable:
+      path: ../lib/purescript-unfoldable
+    foldable-traversable:
+      path: ../lib/purescript-foldable-traversable
+    st:
+      path: ../lib/purescript-st
+    arrays:
+      path: ../lib/purescript-arrays
   backend:
     cmd: node
     args:

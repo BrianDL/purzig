@@ -78,6 +78,21 @@ pub const Value = union(enum) {
     /// are computed, which a pointer allows and an inline value does not.
     ref: *Value,
 
+    /// A growable mutable array, backing `Data.Array.ST`'s `STArray`.
+    ///
+    /// The second mutable variant, and a pointer for the same reason `ref` is:
+    /// a write must be observable through every copy of the handle, and
+    /// `Value` is passed by value everywhere.
+    ///
+    /// It cannot share the `array` variant. That one is a `[]const Value` with
+    /// no capacity, so `push` would be O(n) per element and `sortBy` O(n^2) --
+    /// and `Data.Array` routes `sort`, `nub`, `group` and `union` through
+    /// `Data.Array.ST`, so those are the common path rather than an exotic one.
+    ///
+    /// The list is unmanaged and allocates from the runtime arena, like
+    /// everything else. `rt.newMutArray` is the way in.
+    marray: *std.ArrayList(Value),
+
     // ---- constructors -------------------------------------------------
     // Named `mk*` because a union cannot carry a declaration and a field
     // with the same identifier.
@@ -120,6 +135,10 @@ pub const Value = union(enum) {
 
     pub fn mkClosure(func: Fn1, env: []const Value) Value {
         return .{ .closure = .{ .func = func, .env = env } };
+    }
+
+    pub fn mkMutArray(cell: *std.ArrayList(Value)) Value {
+        return .{ .marray = cell };
     }
 
     /// Wrap an already-allocated cell. `rt.newRef` is the usual way in; this
@@ -221,6 +240,16 @@ pub const Value = union(enum) {
             else => @panic("runtime: expected a Ref"),
         };
     }
+
+    /// The list behind an `STArray`. Mutate it in place: `Data/Array/ST.zig`
+    /// appends, pokes and sorts through this pointer, and may allocate from
+    /// `rt.alloc()` to do so, as hand-written FFI is allowed to.
+    pub fn asMutArray(self: Value) *std.ArrayList(Value) {
+        return switch (self) {
+            .marray => |cell| cell,
+            else => @panic("runtime: expected an STArray"),
+        };
+    }
 };
 
 test "constructors and accessors round-trip" {
@@ -254,4 +283,25 @@ test "data constructor tag and fields" {
     try std.testing.expect(just.hasTag("Just"));
     try std.testing.expect(!just.hasTag("Nothing"));
     try std.testing.expectEqual(@as(i32, 3), just.arg(0).asInt());
+}
+
+test "mutable array grows and is observed through every copy" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var list: std.ArrayList(Value) = .empty;
+    try list.append(gpa, Value.mkInt(1));
+
+    const handle = Value.mkMutArray(&list);
+    const copy = handle;
+
+    // A write through one handle is visible through the other -- the property
+    // an immutable `array` variant cannot provide.
+    try copy.asMutArray().append(gpa, Value.mkInt(2));
+    try std.testing.expectEqual(@as(usize, 2), handle.asMutArray().items.len);
+    try std.testing.expectEqual(@as(i32, 2), handle.asMutArray().items[1].asInt());
+
+    handle.asMutArray().items[0] = Value.mkInt(9);
+    try std.testing.expectEqual(@as(i32, 9), copy.asMutArray().items[0].asInt());
 }

@@ -30,61 +30,61 @@ fn mkEffectFn1(func: Value, a: Value) Error!Value {
     return rt.runEffect(try rt.apply(func, a));
 }
 
-pub const @"ps.mkEffectFn1" = rt.curry(mkEffectFn1);
+pub const @"ps.mkEffectFn1" = rt.effect(mkEffectFn1);
 
 fn mkEffectFn2(func: Value, a: Value, b: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(func, a), b));
 }
 
-pub const @"ps.mkEffectFn2" = rt.curry(mkEffectFn2);
+pub const @"ps.mkEffectFn2" = rt.effect(mkEffectFn2);
 
 fn mkEffectFn3(func: Value, a: Value, b: Value, c: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(func, a), b), c));
 }
 
-pub const @"ps.mkEffectFn3" = rt.curry(mkEffectFn3);
+pub const @"ps.mkEffectFn3" = rt.effect(mkEffectFn3);
 
 fn mkEffectFn4(func: Value, a: Value, b: Value, c: Value, d: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d));
 }
 
-pub const @"ps.mkEffectFn4" = rt.curry(mkEffectFn4);
+pub const @"ps.mkEffectFn4" = rt.effect(mkEffectFn4);
 
 fn mkEffectFn5(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e));
 }
 
-pub const @"ps.mkEffectFn5" = rt.curry(mkEffectFn5);
+pub const @"ps.mkEffectFn5" = rt.effect(mkEffectFn5);
 
 fn mkEffectFn6(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f));
 }
 
-pub const @"ps.mkEffectFn6" = rt.curry(mkEffectFn6);
+pub const @"ps.mkEffectFn6" = rt.effect(mkEffectFn6);
 
 fn mkEffectFn7(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g));
 }
 
-pub const @"ps.mkEffectFn7" = rt.curry(mkEffectFn7);
+pub const @"ps.mkEffectFn7" = rt.effect(mkEffectFn7);
 
 fn mkEffectFn8(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value, h: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g), h));
 }
 
-pub const @"ps.mkEffectFn8" = rt.curry(mkEffectFn8);
+pub const @"ps.mkEffectFn8" = rt.effect(mkEffectFn8);
 
 fn mkEffectFn9(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value, h: Value, i: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g), h), i));
 }
 
-pub const @"ps.mkEffectFn9" = rt.curry(mkEffectFn9);
+pub const @"ps.mkEffectFn9" = rt.effect(mkEffectFn9);
 
 fn mkEffectFn10(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value, h: Value, i: Value, j: Value) Error!Value {
     return rt.runEffect(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g), h), i), j));
 }
 
-pub const @"ps.mkEffectFn10" = rt.curry(mkEffectFn10);
+pub const @"ps.mkEffectFn10" = rt.effect(mkEffectFn10);
 
 
 // -- runEffectFnN :: EffectFnN a ... r -> a -> ... -> Effect r ---------------
@@ -93,58 +93,58 @@ fn runEffectFn1(func: Value, a: Value) Error!Value {
     return rt.apply(func, a);
 }
 
-pub const @"ps.runEffectFn1" = rt.effect(runEffectFn1);
+pub const @"ps.runEffectFn1" = rt.curry(runEffectFn1);
 
 fn runEffectFn2(func: Value, a: Value, b: Value) Error!Value {
     return rt.apply(try rt.apply(func, a), b);
 }
 
-pub const @"ps.runEffectFn2" = rt.effect(runEffectFn2);
+pub const @"ps.runEffectFn2" = rt.curry(runEffectFn2);
 
 fn runEffectFn3(func: Value, a: Value, b: Value, c: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(func, a), b), c);
 }
 
-pub const @"ps.runEffectFn3" = rt.effect(runEffectFn3);
+pub const @"ps.runEffectFn3" = rt.curry(runEffectFn3);
 
 fn runEffectFn4(func: Value, a: Value, b: Value, c: Value, d: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d);
 }
 
-pub const @"ps.runEffectFn4" = rt.effect(runEffectFn4);
+pub const @"ps.runEffectFn4" = rt.curry(runEffectFn4);
 
 fn runEffectFn5(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e);
 }
 
-pub const @"ps.runEffectFn5" = rt.effect(runEffectFn5);
+pub const @"ps.runEffectFn5" = rt.curry(runEffectFn5);
 
 fn runEffectFn6(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f);
 }
 
-pub const @"ps.runEffectFn6" = rt.effect(runEffectFn6);
+pub const @"ps.runEffectFn6" = rt.curry(runEffectFn6);
 
 fn runEffectFn7(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g);
 }
 
-pub const @"ps.runEffectFn7" = rt.effect(runEffectFn7);
+pub const @"ps.runEffectFn7" = rt.curry(runEffectFn7);
 
 fn runEffectFn8(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value, h: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g), h);
 }
 
-pub const @"ps.runEffectFn8" = rt.effect(runEffectFn8);
+pub const @"ps.runEffectFn8" = rt.curry(runEffectFn8);
 
 fn runEffectFn9(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value, h: Value, i: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g), h), i);
 }
 
-pub const @"ps.runEffectFn9" = rt.effect(runEffectFn9);
+pub const @"ps.runEffectFn9" = rt.curry(runEffectFn9);
 
 fn runEffectFn10(func: Value, a: Value, b: Value, c: Value, d: Value, e: Value, f: Value, g: Value, h: Value, i: Value, j: Value) Error!Value {
     return rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(try rt.apply(func, a), b), c), d), e), f), g), h), i), j);
 }
 
-pub const @"ps.runEffectFn10" = rt.effect(runEffectFn10);
+pub const @"ps.runEffectFn10" = rt.curry(runEffectFn10);

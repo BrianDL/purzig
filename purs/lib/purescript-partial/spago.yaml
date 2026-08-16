@@ -1,0 +1,8 @@
+# Vendored `purescript-partial` 4.0.0. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# Two foreign imports, both of which crash. Both panic here rather than
+# throwing a catchable exception -- see the file comments for why.
+package:
+  name: partial
+  dependencies: []

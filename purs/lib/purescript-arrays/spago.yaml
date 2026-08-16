@@ -1,0 +1,26 @@
+# Vendored `purescript-arrays` 7.3.0. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# The only package so far that needed a runtime change: `Data.Array.ST` is
+# genuine in-place mutation, and `sort`, `nub`, `group` and `union` all run
+# through it, so the runtime grew a `marray` variant (see runtime/marray.zig).
+#
+# `Data.Array.length` and `unsafeIndexImpl` are rewritten into PrimOps by the
+# optimizer and never called; their Zig exists so the module compiles.
+package:
+  name: arrays
+  dependencies:
+    - bifunctors
+    - control
+    - foldable-traversable
+    - functions
+    - maybe
+    - nonempty
+    - partial
+    - prelude
+    - safe-coerce
+    - st
+    - tailrec
+    - tuples
+    - unfoldable
+    - unsafe-coerce

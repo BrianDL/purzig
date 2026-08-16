@@ -6,6 +6,9 @@
         "core": {
           "dependencies": [
             {
+              "arrays": "*"
+            },
+            {
               "console": "*"
             },
             {
@@ -16,6 +19,9 @@
             },
             {
               "exceptions": "*"
+            },
+            {
+              "foldable-traversable": "*"
             },
             {
               "integers": "*"
@@ -33,7 +39,16 @@
               "refs": "*"
             },
             {
+              "st": "*"
+            },
+            {
               "strings": "*"
+            },
+            {
+              "tuples": ">=7.0.0 <8.0.0"
+            },
+            {
+              "unfoldable": "*"
             }
           ]
         },
@@ -43,6 +58,9 @@
       }
     },
     "extra_packages": {
+      "arrays": {
+        "path": "../lib/purescript-arrays"
+      },
       "console": {
         "path": "../lib/purescript-console"
       },
@@ -55,6 +73,9 @@
       "exceptions": {
         "path": "../lib/purescript-exceptions"
       },
+      "foldable-traversable": {
+        "path": "../lib/purescript-foldable-traversable"
+      },
       "functions": {
         "path": "../lib/purescript-functions"
       },
@@ -64,14 +85,23 @@
       "numbers": {
         "path": "../lib/purescript-numbers"
       },
+      "partial": {
+        "path": "../lib/purescript-partial"
+      },
       "prelude": {
         "path": "../lib/purescript-prelude"
       },
       "refs": {
         "path": "../lib/purescript-refs"
       },
+      "st": {
+        "path": "../lib/purescript-st"
+      },
       "strings": {
         "path": "../lib/purescript-strings"
+      },
+      "unfoldable": {
+        "path": "../lib/purescript-unfoldable"
       },
       "unsafe-coerce": {
         "path": "../lib/purescript-unsafe-coerce"
@@ -79,6 +109,38 @@
     }
   },
   "packages": {
+    "arrays": {
+      "type": "local",
+      "path": "../lib/purescript-arrays",
+      "dependencies": [
+        "bifunctors",
+        "control",
+        "foldable-traversable",
+        "functions",
+        "maybe",
+        "nonempty",
+        "partial",
+        "prelude",
+        "safe-coerce",
+        "st",
+        "tailrec",
+        "tuples",
+        "unfoldable",
+        "unsafe-coerce"
+      ]
+    },
+    "bifunctors": {
+      "type": "registry",
+      "version": "6.1.0",
+      "integrity": "sha256-CvZRb8uI75eKIqiYntR+k05Wk6tKlMS5w8sCA2AFna0=",
+      "dependencies": [
+        "const",
+        "either",
+        "newtype",
+        "prelude",
+        "tuples"
+      ]
+    },
     "console": {
       "type": "local",
       "path": "../lib/purescript-console",
@@ -87,12 +149,46 @@
         "prelude"
       ]
     },
+    "const": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-S+m0lQsxnji0z1XRUmkn+3RFuWJ5CXWuIr1u3i8Bfoc=",
+      "dependencies": [
+        "invariant",
+        "newtype",
+        "prelude"
+      ]
+    },
+    "contravariant": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-nuckEWqL80NaPmR/l9AUyrfycNh18XcvlZV9PAamwqc=",
+      "dependencies": [
+        "const",
+        "either",
+        "newtype",
+        "prelude",
+        "tuples"
+      ]
+    },
     "control": {
       "type": "local",
       "path": "../lib/purescript-control",
       "dependencies": [
         "newtype",
         "prelude"
+      ]
+    },
+    "distributive": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-netyJK4B32PDYHD0tF2AenKgo3urzbI770ycM0pArAo=",
+      "dependencies": [
+        "identity",
+        "newtype",
+        "prelude",
+        "tuples",
+        "type-equality"
       ]
     },
     "effect": {
@@ -123,10 +219,66 @@
         "prelude"
       ]
     },
+    "exists": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-vtLbrWNaI+pzx/2fw2AQnCovoLtcosClIhjO26QKkh8=",
+      "dependencies": [
+        "unsafe-coerce"
+      ]
+    },
+    "foldable-traversable": {
+      "type": "local",
+      "path": "../lib/purescript-foldable-traversable",
+      "dependencies": [
+        "bifunctors",
+        "const",
+        "control",
+        "either",
+        "functors",
+        "identity",
+        "maybe",
+        "newtype",
+        "orders",
+        "prelude",
+        "tuples"
+      ]
+    },
     "functions": {
       "type": "local",
       "path": "../lib/purescript-functions",
       "dependencies": [
+        "prelude"
+      ]
+    },
+    "functors": {
+      "type": "registry",
+      "version": "5.0.0",
+      "integrity": "sha256-W1o/4wcp6S3chodYL8uixlXK2mfr1L+SzM1R+whqUco=",
+      "dependencies": [
+        "bifunctors",
+        "const",
+        "contravariant",
+        "control",
+        "distributive",
+        "either",
+        "invariant",
+        "maybe",
+        "newtype",
+        "prelude",
+        "profunctor",
+        "tuples",
+        "unsafe-coerce"
+      ]
+    },
+    "identity": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-RY/iXPpxpqvKHYfJeFVNI1J06kohB9rbtWYuha8t0LE=",
+      "dependencies": [
+        "control",
+        "invariant",
+        "newtype",
         "prelude"
       ]
     },
@@ -168,6 +320,19 @@
         "safe-coerce"
       ]
     },
+    "nonempty": {
+      "type": "registry",
+      "version": "7.0.0",
+      "integrity": "sha256-Ctkq8/+KiGqCE53Y/LvibA/coy7ev9HtRZU+GYS7yfQ=",
+      "dependencies": [
+        "control",
+        "foldable-traversable",
+        "maybe",
+        "prelude",
+        "tuples",
+        "unfoldable"
+      ]
+    },
     "numbers": {
       "type": "local",
       "path": "../lib/purescript-numbers",
@@ -176,10 +341,39 @@
         "maybe"
       ]
     },
+    "orders": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-nSMxZK7wxyDULkjZqvMyB71mVo6b0AyLLHosDVbv1XM=",
+      "dependencies": [
+        "newtype",
+        "prelude"
+      ]
+    },
+    "partial": {
+      "type": "local",
+      "path": "../lib/purescript-partial",
+      "dependencies": []
+    },
     "prelude": {
       "type": "local",
       "path": "../lib/purescript-prelude",
       "dependencies": []
+    },
+    "profunctor": {
+      "type": "registry",
+      "version": "6.0.1",
+      "integrity": "sha256-Ow0mJC+PIIRq/a3mzCWY5vxuTgR/e+Ee68+mWeSRnWY=",
+      "dependencies": [
+        "control",
+        "distributive",
+        "either",
+        "exists",
+        "invariant",
+        "newtype",
+        "prelude",
+        "tuples"
+      ]
     },
     "refs": {
       "type": "local",
@@ -197,6 +391,16 @@
         "unsafe-coerce"
       ]
     },
+    "st": {
+      "type": "local",
+      "path": "../lib/purescript-st",
+      "dependencies": [
+        "partial",
+        "prelude",
+        "tailrec",
+        "unsafe-coerce"
+      ]
+    },
     "strings": {
       "type": "local",
       "path": "../lib/purescript-strings",
@@ -204,6 +408,48 @@
         "maybe",
         "newtype",
         "prelude"
+      ]
+    },
+    "tailrec": {
+      "type": "registry",
+      "version": "6.1.0",
+      "integrity": "sha256-xrorCfP0xV1wubs27idQCHQqdvSUuqmmL/am7Ji1wVU=",
+      "dependencies": [
+        "bifunctors",
+        "effect",
+        "either",
+        "identity",
+        "maybe",
+        "partial",
+        "prelude",
+        "refs"
+      ]
+    },
+    "tuples": {
+      "type": "registry",
+      "version": "7.0.0",
+      "integrity": "sha256-BKy7EfK8S1KeTCwyWqyW1wwcpSAQuh3IsczSVgS6fzY=",
+      "dependencies": [
+        "control",
+        "invariant",
+        "prelude"
+      ]
+    },
+    "type-equality": {
+      "type": "registry",
+      "version": "4.0.1",
+      "integrity": "sha256-BBqYOSnAKmayRvR5mtZoCf4SlYs2ipatD/+5nQx73aw=",
+      "dependencies": []
+    },
+    "unfoldable": {
+      "type": "local",
+      "path": "../lib/purescript-unfoldable",
+      "dependencies": [
+        "foldable-traversable",
+        "maybe",
+        "partial",
+        "prelude",
+        "tuples"
       ]
     },
     "unsafe-coerce": {

@@ -1,0 +1,15 @@
+# Vendored `purescript-st` 6.2.0. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# All 31 foreign imports are dead: the optimizer intercepts every one of them,
+# rewriting ST actions into the same effect nodes `Effect` uses. Vendored
+# because `Data.Array` depends on it -- `sortBy`, `nub` and friends run in ST --
+# and because a module with foreign imports and no sibling `.zig` is reported
+# as MISSING FFI and would not link if anything did reach it.
+package:
+  name: st
+  dependencies:
+    - partial
+    - prelude
+    - tailrec
+    - unsafe-coerce
