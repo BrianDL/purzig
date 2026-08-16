@@ -18,6 +18,9 @@
               "effect": "*"
             },
             {
+              "enums": "*"
+            },
+            {
               "exceptions": "*"
             },
             {
@@ -27,7 +30,7 @@
               "integers": "*"
             },
             {
-              "maybe": ">=6.0.0 <7.0.0"
+              "maybe": "*"
             },
             {
               "numbers": "*"
@@ -45,7 +48,7 @@
               "strings": "*"
             },
             {
-              "tuples": ">=7.0.0 <8.0.0"
+              "tuples": "*"
             },
             {
               "unfoldable": "*"
@@ -69,6 +72,9 @@
       },
       "effect": {
         "path": "../lib/purescript-effect"
+      },
+      "enums": {
+        "path": "../lib/purescript-enums"
       },
       "exceptions": {
         "path": "../lib/purescript-exceptions"
@@ -207,6 +213,21 @@
         "invariant",
         "maybe",
         "prelude"
+      ]
+    },
+    "enums": {
+      "type": "local",
+      "path": "../lib/purescript-enums",
+      "dependencies": [
+        "control",
+        "either",
+        "maybe",
+        "newtype",
+        "nonempty",
+        "partial",
+        "prelude",
+        "tuples",
+        "unfoldable"
       ]
     },
     "exceptions": {
@@ -405,9 +426,14 @@
       "type": "local",
       "path": "../lib/purescript-strings",
       "dependencies": [
+        "arrays",
+        "enums",
+        "integers",
         "maybe",
         "newtype",
-        "prelude"
+        "prelude",
+        "tuples",
+        "unfoldable"
       ]
     },
     "tailrec": {

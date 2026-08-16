@@ -40,6 +40,7 @@ package:
     - console: "*"
     - control: "*"
     - effect: "*"
+    - enums: "*"
     - exceptions: "*"
     - foldable-traversable: "*"
     - integers: "*"
@@ -85,6 +86,8 @@ workspace:
       path: ../lib/purescript-st
     arrays:
       path: ../lib/purescript-arrays
+    enums:
+      path: ../lib/purescript-enums
   backend:
     cmd: node
     args:

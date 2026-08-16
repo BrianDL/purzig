@@ -1,0 +1,18 @@
+# Vendored `purescript-enums` 6.0.1. See purescript-effect/spago.yaml for why
+# these are vendored rather than resolved from the registry.
+#
+# `Data.Enum.Gen` is omitted: it exists only to build generators for
+# quickcheck-style testing and would drag in the `gen` package for no FFI of its
+# own. `Data.Enum` and `Data.Enum.Generic` are the parts anything else needs.
+package:
+  name: enums
+  dependencies:
+    - control
+    - either
+    - maybe
+    - newtype
+    - nonempty
+    - partial
+    - prelude
+    - tuples
+    - unfoldable

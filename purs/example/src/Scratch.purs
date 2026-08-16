@@ -18,6 +18,8 @@ import Prelude
 import Control.Lazy (fix)
 import Control.Monad.ST as ST
 import Data.Array as A
+import Data.Char as Char
+import Data.Enum (fromEnum, toEnum)
 import Data.Array.ST as STA
 import Control.Monad.ST.Ref as STRef
 import Data.Foldable (foldl, foldr, sum)
@@ -26,6 +28,8 @@ import Data.Int as Int
 import Data.Int.Bits (complement, shl, shr, zshr, (.&.), (.^.), (.|.))
 import Data.Maybe (Maybe(..), fromJust)
 import Data.Number as Number
+import Data.String as S
+import Data.String.CodePoints as SCP
 import Data.String.CodeUnits as SCU
 import Data.String.Common as SC
 import Data.String.Pattern (Pattern(..), Replacement(..))
@@ -474,5 +478,33 @@ target n = do
         $ check "stShift" (stShift == [ 2, 3, 4, 5 ])
         $ check "stSplice" (stSplice == [ 2, 9, 9, 4 ])
         $ check "stSpliceRemoved" (stSpliceRemoved == [ 3 ])
+
+        -- Data.Enum and Data.Char.
+        $ check "toCharCode" (fromEnum 'A' == 65)
+        $ check "fromCharCode" (toEnum 65 == Just 'A')
+        $ check "fromCharCodeOut" (toEnum 1114112 == (Nothing :: Maybe Char))
+        $ check "charToCharCode" (Char.toCharCode 'z' == 122)
+        $ check "charFromCharCode" (Char.fromCharCode 122 == Just 'z')
+
+        -- Data.String.CodePoints and the Data.String umbrella. Every one of
+        -- these runs through a PureScript fallback rather than the FFI's
+        -- native path -- see CodePoints.zig.
+        $ check "cpLength" (SCP.length "clé" == 3)
+        $ check "cpTake" (SCP.take 2 "clé" == "cl")
+        $ check "cpTakeAccent" (SCP.take 3 "clé" == "clé")
+        $ check "cpDrop" (SCP.drop 2 "clé" == "é")
+        $ check "cpCodePointAt" (map fromEnum (SCP.codePointAt 2 "clé") == Just 233)
+        $ check "cpCodePointAtOut" (SCP.codePointAt 9 "abc" == Nothing)
+        $ check "cpToArray" (A.length (SCP.toCodePointArray "clé") == 3)
+        $ check "cpRoundTrip" (SCP.fromCodePointArray (SCP.toCodePointArray "clé") == "clé")
+        $ check "cpSingleton" (map SCP.singleton (SCP.codePointAt 0 "é") == Just "é")
+        $ check "cpCountPrefix" (SCP.countPrefix (\c -> fromEnum c == 97) "aab" == 2)
+        $ check "cpIndexOf" (SCP.indexOf (Pattern "é") "clé" == Just 2)
+        $ check "cpSplitAt" ((SCP.splitAt 2 "clé").after == "é")
+        -- ASCII-only case mapping: the accent is left alone where the
+        -- JavaScript backend would produce "CLÉ". Pinned deliberately -- see
+        -- the header of Data/String/Common.zig.
+        $ check "strUmbrella" (S.toUpper "clé" == "CLé")
+        $ check "strTrim" (S.trim "  ab  " == "ab")
         $ ""
   pure (if failure == "" then n else failure)
