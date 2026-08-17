@@ -3,7 +3,7 @@
 What `Zig/Emit.purs` must produce.
 
 The best worked example is the generated output itself: run `zig build codegen`
-and read `purs/example/output-zig/`. The whole of `purescript-prelude` compiles
+and read `example/output-zig/`. The whole of `purescript-prelude` compiles
 through this, so anything described here can be seen in practice there.
 
 ## The pipeline
