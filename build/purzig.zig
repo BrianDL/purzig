@@ -89,6 +89,19 @@ pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {
     });
     shim.has_side_effects = true;
 
+    // The set ships inside the dependency, so it is by construction the one
+    // belonging to the tag the user pinned in build.zig.zon. Copying it next to
+    // their spago.yaml means their config names a fixed path and the tag appears
+    // in exactly one place. Tolerates a missing set so the in-repo fixture,
+    // which resolves packages by path instead, still builds.
+    const set = b.addSystemCommand(&.{
+        "sh", "-c",
+        "mkdir -p .purzig && cp \"$1\" .purzig/packages.json 2>/dev/null || true",
+        "sh", absFromRoot(pb, "packages.json"),
+    });
+    set.setCwd(project);
+    set.has_side_effects = true;
+
     // ---- 2. codegen -------------------------------------------------------
 
     // `has_side_effects` because spago writes into its own project tree rather
@@ -97,6 +110,7 @@ pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {
     codegen.setCwd(project);
     codegen.has_side_effects = true;
     codegen.step.dependOn(&shim.step);
+    codegen.step.dependOn(&set.step);
 
     codegen.addPathDir(bin_dir);
 
