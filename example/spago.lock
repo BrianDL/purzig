@@ -62,62 +62,62 @@
     },
     "extra_packages": {
       "arrays": {
-        "path": "../lib/purescript-arrays"
+        "path": "../packages/purescript-arrays"
       },
       "console": {
-        "path": "../lib/purescript-console"
+        "path": "../packages/purescript-console"
       },
       "control": {
-        "path": "../lib/purescript-control"
+        "path": "../packages/purescript-control"
       },
       "effect": {
-        "path": "../lib/purescript-effect"
+        "path": "../packages/purescript-effect"
       },
       "enums": {
-        "path": "../lib/purescript-enums"
+        "path": "../packages/purescript-enums"
       },
       "exceptions": {
-        "path": "../lib/purescript-exceptions"
+        "path": "../packages/purescript-exceptions"
       },
       "foldable-traversable": {
-        "path": "../lib/purescript-foldable-traversable"
+        "path": "../packages/purescript-foldable-traversable"
       },
       "functions": {
-        "path": "../lib/purescript-functions"
+        "path": "../packages/purescript-functions"
       },
       "integers": {
-        "path": "../lib/purescript-integers"
+        "path": "../packages/purescript-integers"
       },
       "numbers": {
-        "path": "../lib/purescript-numbers"
+        "path": "../packages/purescript-numbers"
       },
       "partial": {
-        "path": "../lib/purescript-partial"
+        "path": "../packages/purescript-partial"
       },
       "prelude": {
-        "path": "../lib/purescript-prelude"
+        "path": "../packages/purescript-prelude"
       },
       "refs": {
-        "path": "../lib/purescript-refs"
+        "path": "../packages/purescript-refs"
       },
       "st": {
-        "path": "../lib/purescript-st"
+        "path": "../packages/purescript-st"
       },
       "strings": {
-        "path": "../lib/purescript-strings"
+        "path": "../packages/purescript-strings"
       },
       "unfoldable": {
-        "path": "../lib/purescript-unfoldable"
+        "path": "../packages/purescript-unfoldable"
       },
       "unsafe-coerce": {
-        "path": "../lib/purescript-unsafe-coerce"
+        "path": "../packages/purescript-unsafe-coerce"
       }
     }
   },
   "packages": {
     "arrays": {
       "type": "local",
-      "path": "../lib/purescript-arrays",
+      "path": "../packages/purescript-arrays",
       "dependencies": [
         "bifunctors",
         "control",
@@ -149,7 +149,7 @@
     },
     "console": {
       "type": "local",
-      "path": "../lib/purescript-console",
+      "path": "../packages/purescript-console",
       "dependencies": [
         "effect",
         "prelude"
@@ -179,7 +179,7 @@
     },
     "control": {
       "type": "local",
-      "path": "../lib/purescript-control",
+      "path": "../packages/purescript-control",
       "dependencies": [
         "newtype",
         "prelude"
@@ -199,7 +199,7 @@
     },
     "effect": {
       "type": "local",
-      "path": "../lib/purescript-effect",
+      "path": "../packages/purescript-effect",
       "dependencies": [
         "prelude"
       ]
@@ -217,7 +217,7 @@
     },
     "enums": {
       "type": "local",
-      "path": "../lib/purescript-enums",
+      "path": "../packages/purescript-enums",
       "dependencies": [
         "control",
         "either",
@@ -232,7 +232,7 @@
     },
     "exceptions": {
       "type": "local",
-      "path": "../lib/purescript-exceptions",
+      "path": "../packages/purescript-exceptions",
       "dependencies": [
         "effect",
         "either",
@@ -250,7 +250,7 @@
     },
     "foldable-traversable": {
       "type": "local",
-      "path": "../lib/purescript-foldable-traversable",
+      "path": "../packages/purescript-foldable-traversable",
       "dependencies": [
         "bifunctors",
         "const",
@@ -267,7 +267,7 @@
     },
     "functions": {
       "type": "local",
-      "path": "../lib/purescript-functions",
+      "path": "../packages/purescript-functions",
       "dependencies": [
         "prelude"
       ]
@@ -305,7 +305,7 @@
     },
     "integers": {
       "type": "local",
-      "path": "../lib/purescript-integers",
+      "path": "../packages/purescript-integers",
       "dependencies": [
         "maybe",
         "numbers",
@@ -356,7 +356,7 @@
     },
     "numbers": {
       "type": "local",
-      "path": "../lib/purescript-numbers",
+      "path": "../packages/purescript-numbers",
       "dependencies": [
         "functions",
         "maybe"
@@ -373,12 +373,12 @@
     },
     "partial": {
       "type": "local",
-      "path": "../lib/purescript-partial",
+      "path": "../packages/purescript-partial",
       "dependencies": []
     },
     "prelude": {
       "type": "local",
-      "path": "../lib/purescript-prelude",
+      "path": "../packages/purescript-prelude",
       "dependencies": []
     },
     "profunctor": {
@@ -398,7 +398,7 @@
     },
     "refs": {
       "type": "local",
-      "path": "../lib/purescript-refs",
+      "path": "../packages/purescript-refs",
       "dependencies": [
         "effect",
         "prelude"
@@ -414,7 +414,7 @@
     },
     "st": {
       "type": "local",
-      "path": "../lib/purescript-st",
+      "path": "../packages/purescript-st",
       "dependencies": [
         "partial",
         "prelude",
@@ -424,7 +424,7 @@
     },
     "strings": {
       "type": "local",
-      "path": "../lib/purescript-strings",
+      "path": "../packages/purescript-strings",
       "dependencies": [
         "arrays",
         "enums",
@@ -469,7 +469,7 @@
     },
     "unfoldable": {
       "type": "local",
-      "path": "../lib/purescript-unfoldable",
+      "path": "../packages/purescript-unfoldable",
       "dependencies": [
         "foldable-traversable",
         "maybe",
@@ -480,7 +480,7 @@
     },
     "unsafe-coerce": {
       "type": "local",
-      "path": "../lib/purescript-unsafe-coerce",
+      "path": "../packages/purescript-unsafe-coerce",
       "dependencies": []
     }
   }

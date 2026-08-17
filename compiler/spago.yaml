@@ -1,7 +1,9 @@
+# FILE: compiler/spago.yaml
+#
 # Workspace A: the backend compiler itself.
 #
 # This one uses the DEFAULT JavaScript backend -- it is a Node program. It must
-# be a separate workspace from purs/example because `workspace.backend` is a
+# be a separate workspace from example/ because `workspace.backend` is a
 # per-workspace setting and the two need different backends.
 #
 # No `packageSet` here: with none pinned, spago uses the registry solver and
@@ -11,12 +13,18 @@
 # git dependency, which is what backend-erl does too. Its own dependency list is
 # transcribed verbatim from its `spago.yaml` at the pinned tag; the solver needs
 # it spelled out because there is no registry metadata to read it from. Every
-# entry in that list IS a registry package, so this is the only `extra_packages`
+# entry in that list IS a registry package, so this is the only `extraPackages`
 # block needed -- backend-erl carries three more only because it wants a fork
 # and specific refs of `dodo-printer` and `language-cst-parser`.
+#
+# `bundle.outfile` is `dist/bundle.js` rather than `bundle.js`: it is now a
+# RELEASE ARTIFACT, committed at tags and shipped in the tarball a downstream
+# `build.zig.zon` fetches, so that nobody consuming purzig needs spago, node's
+# package ecosystem, or a git fetch of the optimizer just to compile PureScript.
+# A fixed, declared path is what lets `build/purzig.zig` point the shim at it.
 
 package:
-  name: purs-backend-zig
+  name: purzig
   dependencies:
     - argonaut-codecs: ">=9.1.0 <10.0.0"
     - argonaut-core: ">=7.0.0 <8.0.0"
@@ -38,7 +46,7 @@ package:
     - tuples: ">=7.0.0 <8.0.0"
   bundle:
     module: Main
-    outfile: bundle.js
+    outfile: dist/bundle.js
     platform: node
     type: app
 

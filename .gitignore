@@ -1,19 +1,24 @@
 # Zig
 .zig-cache/
 zig-out/
+# 0.16 moved the dependency cache from a global directory to a project-local one
+zig-pkg/
 
 # PureScript / Spago
 output/
 output-zig/
 .spago/
+
+# The backend bundle is a RELEASE ARTIFACT and is committed at tags, so it must
+# NOT be ignored wholesale. Ignore it only where it is genuinely transient.
 bundle.js
+
 node_modules/
 
 # devenv
 .devenv/
 .devenv.flake.nix
 .direnv/
-
 
 .envrc
 

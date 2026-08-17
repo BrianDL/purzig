@@ -1,0 +1,84 @@
+# FILE: example/spago.yaml
+#
+# Workspace B: the development fixture, compiled through the Zig backend.
+#
+# `backend.cmd` is now the same string a downstream user writes -- `purzig`,
+# resolved from PATH. `build/purzig.zig` generates a shim by that name into the
+# cache and prepends its directory to PATH for the spago step alone, so this
+# file no longer contains a relative path into the compiler workspace and is
+# byte-identical in shape to what a user's own spago.yaml says.
+#
+# This workspace KEEPS its `extraPackages` block, resolving every vendored
+# package from `../packages/` by path. Step 4 deletes `extraPackages` from a
+# USER's config, not from this one: pointing the fixture at `packageSet.url`
+# would mean every FFI fix needed a tag and a push before it could be tested.
+# The set is exercised by a separate downstream smoke project instead.
+#
+# A registry package with NO foreign imports needs no override: nothing
+# references its `.js`, so it compiles through the backend untouched. That is
+# why `either`, `maybe`, `invariant`, `newtype` and `safe-coerce` are absent
+# despite being dependencies of `exceptions`.
+#
+# `functions` and `partial` are overrides only, not dependencies: nothing here
+# imports them directly, but `numbers`, `unfoldable` and `st` do, and they must
+# resolve to the vendored copies rather than the registry ones whose FFI is
+# JavaScript. `numbers` is a dependency because `integers` needs it --
+# `Data.Int.floor`, `ceil`, `round` and `trunc` are `Data.Number` calls in a
+# range clamp.
+package:
+  name: example
+  dependencies:
+    - arrays: "*"
+    - console: "*"
+    - control: "*"
+    - effect: "*"
+    - enums: "*"
+    - exceptions: "*"
+    - foldable-traversable: "*"
+    - integers: "*"
+    - maybe: ">=6.0.0 <7.0.0"
+    - numbers: "*"
+    - prelude: "*"
+    - refs: "*"
+    - st: "*"
+    - strings: "*"
+    - tuples: ">=7.0.0 <8.0.0"
+    - unfoldable: "*"
+workspace:
+  extraPackages:
+    prelude:
+      path: ../packages/purescript-prelude
+    effect:
+      path: ../packages/purescript-effect
+    console:
+      path: ../packages/purescript-console
+    refs:
+      path: ../packages/purescript-refs
+    exceptions:
+      path: ../packages/purescript-exceptions
+    control:
+      path: ../packages/purescript-control
+    unsafe-coerce:
+      path: ../packages/purescript-unsafe-coerce
+    integers:
+      path: ../packages/purescript-integers
+    numbers:
+      path: ../packages/purescript-numbers
+    functions:
+      path: ../packages/purescript-functions
+    strings:
+      path: ../packages/purescript-strings
+    partial:
+      path: ../packages/purescript-partial
+    unfoldable:
+      path: ../packages/purescript-unfoldable
+    foldable-traversable:
+      path: ../packages/purescript-foldable-traversable
+    st:
+      path: ../packages/purescript-st
+    arrays:
+      path: ../packages/purescript-arrays
+    enums:
+      path: ../packages/purescript-enums
+  backend:
+    cmd: purzig

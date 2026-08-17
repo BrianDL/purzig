@@ -1,0 +1,30 @@
+// purzig has no Zig dependencies of its own. This manifest exists solely so a
+// downstream project can name purzig in ITS build.zig.zon -- which is the one
+// thing the earlier "no build.zig.zon" decision assumed would never happen.
+//
+// `paths` deliberately excludes `example/`, `docs/`, `devenv.nix` and the spago
+// caches: a consumer needs the helper, the runtime, the prebuilt bundle, the
+// vendored packages and the set, and nothing else. Keeping the tarball to that
+// also keeps the hash stable against changes to the fixture.
+.{
+    .name = .purzig,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+
+    // Replace once, with the value `zig build` prints on first use.
+    .fingerprint = 0x746b6259601c8111,
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build",
+        "runtime",
+        "compiler/dist",
+        "packages",
+        "packages.json",
+        "LICENSE",
+        "README.md",
+    },
+}

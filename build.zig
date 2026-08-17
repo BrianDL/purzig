@@ -1,76 +1,80 @@
+//! purzig's own build. Deliberately thin: everything about turning PureScript
+//! into a binary lives in `build/purzig.zig`, and this file consumes it exactly
+//! as a downstream user's `build.zig` does. That is the point -- the example is
+//! the first client of the published API rather than a privileged special case,
+//! so a break in the helper shows up in `zig build test` here.
+
 const std = @import("std");
+const purzig = @import("build/purzig.zig");
+
+// `@import("purzig")` in a consumer's build.zig resolves to THIS file, so the
+// public API is re-exported here. The implementation stays in build/purzig.zig
+// so it can be read on its own.
+pub const Options = purzig.Options;
+pub const Artifacts = purzig.Artifacts;
+pub const addExecutable = purzig.addExecutable;
+pub const addRuntimeTests = purzig.addRuntimeTests;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // What the example is expected to print. Checked as behaviour rather than
-    // as a text diff of the generated Zig, which would break on comments,
-    // whitespace, and any edit to Main.purs.
+    // Asserted behaviour of the example. Checked as output rather than as a
+    // diff of the generated Zig, which broke on comments and on any edit to
+    // Main.purs.
     const expected_output = "Hello, Zig\n";
 
-    // -----------------------------------------------------------------
-    // 1. Hand-written Zig modules. No PureScript dependency at all, so
-    //    they build and test in parallel with everything else.
-    // -----------------------------------------------------------------
+    // The runtime module is exported so `zig build` in a dependent project can
+    // reach it by name if it ever wants to; the helper creates its own.
+    _ = b.addModule("runtime", .{ .root_source_file = b.path("runtime/root.zig") });
 
-    const runtime = b.createModule(.{
-        .root_source_file = b.path("runtime/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // A consumer's `b.dependency("purzig", .{})` RUNS this function, and the
+    // published tarball carries no `example/` or `tools/`. Everything below is
+    // development wiring, so it is skipped unless the fixture is present. The
+    // check is a file test rather than an inspection of builder internals
+    // because it stays true across Zig versions and explains itself.
+    b.build_root.handle.access(b.graph.io, "example/spago.yaml", .{}) catch return;
 
     // -----------------------------------------------------------------
-    // 2. Build the backend compiler: PureScript -> JavaScript, run on Node.
+    // The backend itself: PureScript -> JavaScript, run on node.
     //
-    //    `spago bundle`, not `spago build`: the example's spago.yaml points
-    //    backend.cmd at ../compiler/bundle.js, and only `bundle` produces it.
-    //
-    //    `has_side_effects` because spago writes into its own project tree
-    //    rather than somewhere Zig controls; spago does its own caching.
+    // `spago bundle`, not `spago build` -- only bundle produces the file the
+    // shim execs. A release tag ships this prebuilt, so a downstream user never
+    // runs this step and never fetches the optimizer's git dependency.
     // -----------------------------------------------------------------
 
     const build_compiler = b.addSystemCommand(&.{ "spago", "bundle" });
-    build_compiler.setCwd(b.path("purs/compiler"));
+    build_compiler.setCwd(b.path("compiler"));
     build_compiler.has_side_effects = true;
 
     const compiler_step = b.step("compiler", "Build the PureScript->Zig backend itself");
     compiler_step.dependOn(&build_compiler.step);
 
     // -----------------------------------------------------------------
-    // 3. Compile the example through that backend.
+    // The example, through the public helper.
     // -----------------------------------------------------------------
 
-    const codegen = b.addSystemCommand(&.{ "spago", "build" });
-    codegen.setCwd(b.path("purs/example"));
-    codegen.has_side_effects = true;
-    codegen.step.dependOn(&build_compiler.step);
+    const opts: purzig.Options = .{
+        .name = "example",
+        .main_module = "Main",
+        .project = b.path("example"),
+        .target = target,
+        .optimize = optimize,
+        // .purzig stays null: here, b IS purzig.
+    };
+
+    const app = purzig.addExecutable(b, opts);
+
+    // The one thing a downstream build does not need: our bundle is built from
+    // source, so codegen has to wait for it.
+    app.codegen.step.dependOn(&build_compiler.step);
+
+    b.installArtifact(app.exe);
 
     const codegen_step = b.step("codegen", "Generate Zig from PureScript, stopping before compilation");
-    codegen_step.dependOn(&codegen.step);
+    codegen_step.dependOn(&app.codegen.step);
 
-    // -----------------------------------------------------------------
-    // 4. Compile the GENERATED Zig.
-    //
-    //    The root source file does not exist on a clean checkout. The explicit
-    //    dependOn is what guarantees codegen has run before the compiler tries
-    //    to read it -- without it you race on first build.
-    // -----------------------------------------------------------------
-
-    const exe = b.addExecutable(.{
-        .name = "example",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("purs/example/output-zig/Main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addImport("runtime", runtime);
-    exe.step.dependOn(&codegen.step);
-
-    b.installArtifact(exe);
-
-    const run = b.addRunArtifact(exe);
+    const run = b.addRunArtifact(app.exe);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
 
@@ -78,51 +82,42 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run.step);
 
     // -----------------------------------------------------------------
-    // 5. End-to-end check: does PureScript source, run through the whole
-    //    pipeline, print what it should?
-    //
-    //    Requires purs/example/src/Main.purs to be the unmodified example.
+    // Checks.
     // -----------------------------------------------------------------
 
-    const check_generated = b.addRunArtifact(exe);
+    const check_generated = b.addRunArtifact(app.exe);
     check_generated.expectStdOutEqual(expected_output);
     const e2e_step = b.step("test-e2e", "Run the full pipeline and check the output");
     e2e_step.dependOn(&check_generated.step);
 
-    // -----------------------------------------------------------------
-    // 6. Runtime tests. Independent of the PureScript pipeline:
-    //    works with no spago, purs or node present.
-    // -----------------------------------------------------------------
-
-    const runtime_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const run_runtime_tests = b.addRunArtifact(runtime_tests);
-    const test_step = b.step("test-runtime", "Test the hand-written Zig runtime");
-    test_step.dependOn(&run_runtime_tests.step);
-
-    // -----------------------------------------------------------------
-    // 7. Everything.
-    // -----------------------------------------------------------------
+    const run_runtime_tests = purzig.addRuntimeTests(b, opts);
+    const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
+    runtime_step.dependOn(&run_runtime_tests.step);
 
     const all_tests = b.step("test", "Run every check");
     all_tests.dependOn(&run_runtime_tests.step);
     all_tests.dependOn(&check_generated.step);
 
     // -----------------------------------------------------------------
-    // 8. Housekeeping.
+    // The package set. Regenerate and commit whenever `packages/` changes,
+    // because the set is what a downstream user resolves against.
+    // -----------------------------------------------------------------
+
+    const mkset = b.addSystemCommand(&.{"tools/mkpackageset.sh"});
+    mkset.has_side_effects = true;
+    if (b.args) |args| mkset.addArgs(args);
+    const set_step = b.step("packageset", "Regenerate packages.json from packages/");
+    set_step.dependOn(&mkset.step);
+
+    // -----------------------------------------------------------------
+    // Housekeeping.
     // -----------------------------------------------------------------
 
     const clean = b.addSystemCommand(&.{
-        "rm",                       "-rf",
-        "purs/compiler/output",     "purs/compiler/.spago",
-        "purs/compiler/bundle.js",  "purs/example/output",
-        "purs/example/output-zig",  "purs/example/.spago",
+        "rm",                  "-rf",
+        "compiler/output",     "compiler/.spago",
+        "compiler/dist/bundle.js", "example/output",
+        "example/output-zig",  "example/.spago",
     });
     const clean_step = b.step("clean-purs", "Remove PureScript build artefacts");
     clean_step.dependOn(&clean.step);
