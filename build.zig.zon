@@ -7,7 +7,7 @@
 // also keeps the hash stable against changes to the fixture.
 .{
     .name = .purzig,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .minimum_zig_version = "0.16.0",
 
     // Replace once, with the value `zig build` prints on first use.
