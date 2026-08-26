@@ -30,8 +30,8 @@
     "arraybuffer-builder": "3.1.0",
     "arraybuffer-types": "3.0.2",
     "arrays": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-arrays"
     },
     "arrays-extra": "0.6.1",
@@ -78,15 +78,15 @@
     "concur-react": "0.5.0",
     "concurrent-queues": "3.0.0",
     "console": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-console"
     },
     "const": "6.0.0",
     "contravariant": "6.0.0",
     "control": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-control"
     },
     "convertable-options": "1.0.0",
@@ -117,8 +117,8 @@
     "dynamic-buffer": "3.0.1",
     "echarts-simple": "0.0.1",
     "effect": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-effect"
     },
     "either": "6.1.0",
@@ -130,16 +130,16 @@
     "email-validate": "7.0.0",
     "encoding": "0.0.9",
     "enums": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-enums"
     },
     "env-names": "0.4.0",
     "error": "2.0.0",
     "eta-conversion": "0.3.2",
     "exceptions": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-exceptions"
     },
     "exists": "6.0.0",
@@ -166,8 +166,8 @@
     "float32": "2.0.0",
     "fmt": "0.2.1",
     "foldable-traversable": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-foldable-traversable"
     },
     "foldable-traversable-extra": "0.0.6",
@@ -184,8 +184,8 @@
     "freer-free": "0.0.1",
     "freet": "7.0.0",
     "functions": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-functions"
     },
     "functor1": "3.0.0",
@@ -238,8 +238,8 @@
     "indexed-monad": "3.0.0",
     "int64": "3.0.0",
     "integers": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-integers"
     },
     "interpolate": "5.0.2",
@@ -342,8 +342,8 @@
     "nullable": "6.0.0",
     "numberfield": "0.2.2",
     "numbers": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-numbers"
     },
     "oak": "3.1.1",
@@ -369,8 +369,8 @@
     "parsing": "10.3.0",
     "parsing-dataview": "3.2.4",
     "partial": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-partial"
     },
     "pathy": "9.0.0",
@@ -389,8 +389,8 @@
     "precise": "6.0.0",
     "precise-datetime": "7.0.0",
     "prelude": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-prelude"
     },
     "prettier-printer": "3.0.0",
@@ -436,8 +436,8 @@
     "record-ptional-fields": "0.1.2",
     "record-studio": "1.0.4",
     "refs": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-refs"
     },
     "remotedata": "5.0.1",
@@ -484,16 +484,16 @@
     "splitmix": "2.1.0",
     "ssrs": "1.0.0",
     "st": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-st"
     },
     "statistics": "0.3.2",
     "strictlypositiveint": "1.0.1",
     "string-parsers": "8.0.0",
     "strings": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-strings"
     },
     "strings-extra": "4.0.0",
@@ -538,8 +538,8 @@
     "undefined": "2.0.0",
     "undefined-is-not-a-problem": "1.1.0",
     "unfoldable": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-unfoldable"
     },
     "unicode": "6.0.0",
@@ -547,8 +547,8 @@
     "unlift": "1.0.1",
     "unordered-collections": "3.1.0",
     "unsafe-coerce": {
-      "git": "https://github.com/YOUR-USER/purzig.git",
-      "ref": "v0.1.0",
+      "git": "https://github.com/BrianDL/purzig.git",
+      "ref": "v0.1.1",
       "subdir": "packages/purescript-unsafe-coerce"
     },
     "unsafe-reference": "5.0.0",
