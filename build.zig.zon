@@ -1,6 +1,5 @@
 // purzig has no Zig dependencies of its own. This manifest exists solely so a
-// downstream project can name purzig in ITS build.zig.zon -- which is the one
-// thing the earlier "no build.zig.zon" decision assumed would never happen.
+// downstream project can name purzig in ITS build.zig.zon.
 //
 // `paths` deliberately excludes `example/`, `docs/`, `devenv.nix` and the spago
 // caches: a consumer needs the helper, the runtime, the prebuilt bundle, the
