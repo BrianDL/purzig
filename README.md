@@ -1,127 +1,207 @@
 # purzig
 
-A PureScript backend targeting Zig. Zig's build system orchestrates the whole
-pipeline; devenv provides the toolchain.
+A PureScript backend that emits Zig, plus the runtime that generated code runs
+on. Write PureScript, get a native binary.
 
-**Status: plumbing only.** The build graph, runtime, FFI convention and Spago
-wiring are in place and the pipeline runs end to end, but `Zig/Emit.purs` is a
-stub — the backend currently writes a fixed `main.zig` rather than translating
-CoreFn. Everything else exists so that writing the emitter is the only remaining
-work.
+```purescript
+module Main where
 
-## Layout
+import Prelude
+import Effect (Effect)
+import Effect.Console (log)
 
-```
-build.zig               orchestrates everything
-docs/                   codegen spec, CoreFn schema, handoff notes
-devenv.nix              provisions the toolchain (see below)
-package.json            pins spago; devenv installs it locally
-purs/
-  compiler/             workspace A: the backend, PureScript -> JavaScript
-  lib/zig-prelude/      shared package, no workspace of its own
-  example/              workspace B: user code, PureScript -> Zig
-    expected/           hand-written target: what codegen must produce
-runtime/                hand-written Zig: boxed Value, apply, arena
-ffi/                    hand-written Zig: implementations of foreign imports
+main :: Effect Unit
+main = log "hello"
 ```
 
-Two Spago workspaces, because `workspace.backend` is a per-workspace setting and
-the compiler needs the JS backend while the example needs the Zig one. This is
-the polyrepo pattern from the Spago docs. `purs/lib/zig-prelude` deliberately has
-no `workspace:` key so it can be pulled into either.
+```
+$ zig build run
+hello
+```
 
-## Pipeline
+## Licence — read this first
 
-`zig build` runs, in dependency order:
+purzig is **AGPL-3.0-or-later**, and the runtime is linked into every binary it
+produces. A program compiled with purzig is therefore a combined work with an
+AGPL library and must itself be released under AGPL-3.0-or-later — including,
+under AGPL §13, offering source to the users of a network service.
 
-1. `spago build` in `purs/compiler` → `bundle.js` (Node).
-2. `spago build` in `purs/example`, whose `spago.yaml` sets
-   `workspace.backend.cmd: node` with that bundle as an arg. Spago runs
-   `purs compile --codegen corefn`, then execs the backend with cwd
-   `purs/example`.
-3. The backend reads `output/**/corefn.json`, writes `output-zig/*.zig`.
-4. Zig compiles `output-zig/Main.zig` with `runtime` and `ffi` linked in as
-   named modules.
+There is no linking exception. This is deliberate. If you need to ship software
+under other terms, purzig is not a suitable toolchain for it.
 
-The generated root source file does not exist on a clean checkout. The
-`exe.step.dependOn(&codegen.step)` line in `build.zig` is what makes that safe —
-without it the first build races.
+The vendored PureScript sources under `packages/*/src/**.purs` are their
+upstream authors' work under the licence in each package directory; everything
+else in this repository is purzig's and is AGPL. `NOTICE` carries the licences
+of everything bundled into `compiler/dist/bundle.js`.
 
-## Commands
+## > [!WARNING]
+> while not vibe-coded, this code is produced with heavy assistance from text extrusion machines.
 
-| | |
+## What you need
+
+| Tool | Why |
 |---|---|
-| `zig build run-expected` | build and run the **hand-written target**; no purs/spago/node needed |
-| `zig build test-runtime` | test the runtime alone; no purs/spago/node needed |
-| `zig build run` | full pipeline, then run the binary |
-| `zig build codegen` | stop after generating Zig, for inspection |
-| `zig build test-codegen` | diff generated Zig against the target — fails until the emitter exists |
-| `zig build clean-purs` | drop PureScript artefacts |
+| Zig 0.16.0 | Builds your program; orchestrates the whole pipeline |
+| PureScript 0.15.x (`purs`) | Compiles your sources to CoreFn |
+| Spago 1.x | Resolves packages and drives `purs` |
+| Node | Runs the backend, which is PureScript compiled to JavaScript |
 
-The first two work on a bare checkout with only Zig installed. They are the
-fastest way to confirm the runtime is sound.
+purzig ships its backend prebuilt, so you never build it — but you do need
+`node` to run it, and **you need your own spago**, since purzig does not provide
+one. Spago is not in nixpkgs at a useful version; pin it in a `package.json` and
+let your environment install it locally:
 
-## Why Node is in the toolchain
+```json
+{ "devDependencies": { "spago": "^1.0.0" } }
+```
 
-Two independent reasons:
+There is no npm package for purzig itself. It is a Zig dependency.
 
-1. **Spago.** The current Spago is written in PureScript and distributed on npm,
-   so it runs on Node. Not removable while you use it.
-2. **The backend compiler.** It is written in PureScript, and PureScript's only
-   mature backend is JavaScript — so the backend that generates Zig is itself a
-   Node program. This one *is* removable: see below.
+## A project
 
-Nothing about the compiled output touches Node. Target programs are native
-binaries with no runtime dependency beyond libc.
+Five files, the same shape any other PureScript backend gives you, plus the two
+Zig files that replace what would otherwise be a bundler config:
 
-## Design notes
+```
+my-app/
+├── build.zig
+├── build.zig.zon
+├── spago.yaml
+├── package.json      pins spago
+└── src/Main.purs
+```
 
-The decisions that shape everything else. The full emission rules are in
-[`docs/codegen.md`](docs/codegen.md); rationale, rejected alternatives and open
-questions are in the handoff alongside it.
+**`build.zig.zon`**
 
-**One boxed `Value` for everything.** CoreFn is untyped, so v0 does no
-type-directed code generation. Slow, correct, and unboxing is a later pass.
+```zig
+.{
+    .name = .my_app,
+    .version = "0.1.0",
+    .fingerprint = 0x0,               // zig prints the value to use
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .purzig = .{
+            .url = "https://github.com/BrianDL/purzig/archive/refs/tags/v0.1.1.tar.gz",
+            .hash = "...",            // zig fetch prints this
+        },
+    },
+    .paths = .{""},
+}
+```
 
-**One-argument closures.** CoreFn is fully curried — every `Abs` binds one name,
-every `App` applies one argument — so `rt.apply` needs no arity analysis. Adding
-`purescript-backend-optimizer` later brings uncurrying for free.
+**`build.zig`**
 
-**An arena that never frees.** PureScript is garbage-collected and this backend
-is not. Zig 0.16's "juicy main" hands `main` an arena described as permanent
-storage for the process, cleaned automatically on exit — exactly this strategy,
-so the runtime borrows it rather than building its own.
+```zig
+const std = @import("std");
+const purzig = @import("purzig");
 
-**Flat positional closure environments.** Zig has no closures, so every `Abs`
-becomes a top-level function plus a captured `[]const rt.Value`, indexed by
-position. A generated struct per lambda would mean naming a type for every
-lambda and casting at every call site, to save an indirection the optimizer
-would erase anyway.
+pub fn build(b: *std.Build) void {
+    const exe = purzig.addExecutable(b, .{
+        .name = "my-app",
+        .target = b.standardTargetOptions(.{}),
+        .optimize = b.standardOptimizeOption(.{}),
+        .purzig = b.dependency("purzig", .{}),
+    }).exe;
+    b.installArtifact(exe);
 
-## Toolchain
+    const run = b.addRunArtifact(exe);
+    b.step("run", "Run it").dependOn(&run.step);
+}
+```
 
-`direnv allow` is the whole setup. devenv provides `zig` and `purs` from
-nixpkgs, and installs `spago` into `./node_modules` from the root
-`package.json` on shell entry — project-local and pinned in the repo, nothing
-global. `$DEVENV_ROOT/node_modules/.bin` goes on the front of `PATH`, so
-`spago` always means the pinned one even if something else is installed
-ambiently.
+**`spago.yaml`**
 
-`check-tools` prints the four versions and runs automatically on entry.
+```yaml
+package:
+  name: my-app
+  dependencies:
+    - prelude
+    - effect
+    - console
+workspace:
+  packageSet:
+    path: .purzig/packages.json
+  backend:
+    cmd: purzig
+```
 
-Neither `spago.yaml` pins a package set, so the registry solver resolves
-dependency versions from the lists themselves. This means the first build needs
-network access and will write a `spago.lock` — commit it.
+**`.gitignore`** wants `.purzig/`, `.spago/`, `output/`, `output-zig/`,
+`.zig-cache/`, `zig-out/`, `node_modules/`.
 
-## Next steps, in order
+Then:
 
-1. Run `zig build run-expected` and `zig build test-runtime` to confirm the
-   runtime compiles on your toolchain. Everything downstream assumes it does.
-2. ~~`CoreFn/Decode.purs`~~ — written, against the schema in
-   `docs/corefn-schema.md`. `zig build codegen` now logs what it decoded per
-   module, so it can be checked against real compiler output before any
-   emission exists.
-3. `Zig/Emit.purs` — `Lit`, `Var`, `Abs`, `App` and module-level `Bind`, per
-   `docs/codegen.md`. Done when `zig build test-codegen` passes.
-4. `Case`, records, ADTs. `Case` is most of the remaining work.
-5. Grow `zig-prelude` and its FFI only as the programs you compile demand it.
+```sh
+zig fetch https://github.com/BrianDL/purzig/archive/refs/tags/v0.1.1.tar.gz
+zig build run
+```
+
+### Why `packageSet: path:` and not a URL
+
+purzig needs its own package set: the PureScript registry ships JavaScript FFI,
+and a package with foreign imports needs Zig FFI instead. The set lives inside
+the purzig tarball, and the build copies it to `.purzig/packages.json` before
+running spago — so the set you resolve against always belongs to the exact tag
+you pinned in `build.zig.zon`, and the version number appears in your project
+exactly once.
+
+Do not edit `.purzig/`; it is regenerated on every build.
+
+## Foreign function interface
+
+A module's Zig FFI lives beside its source, exactly as `.js` does for the
+JavaScript backend:
+
+```
+src/Data/Thing.purs
+src/Data/Thing.zig
+```
+
+Nothing is registered anywhere. The build copies the sibling `.zig` into the
+output directory next to the generated code.
+
+```purescript
+foreign import addOne :: Int -> Int
+```
+
+```zig
+const rt = @import("runtime");
+const Value = rt.Value;
+
+fn addOne(x: Value) Value {
+    return Value.mkInt(x.asInt() +% 1);
+}
+pub const @"ps.addOne" = rt.curry(addOne);
+```
+
+`rt.curry` for pure functions, `rt.effect` for anything that performs an effect.
+The runtime builds the closure chain from the function's signature at comptime,
+so you never manage arity or environment indices. See `docs/codegen.md`,
+"Writing FFI", for the details — particularly which of the two to use, which is
+decided by what the function *does* rather than by its PureScript type.
+
+## Which packages work
+
+`docs/SUPPORTED.md`. Short version: the seventeen vendored packages work, a
+registry package with no `foreign import` works untouched, and a registry
+package *with* foreign imports resolves and then fails at `MISSING FFI` naming
+the file it wanted.
+
+## Differences from the JavaScript backend
+
+Deliberate, and documented in `docs/SUPPORTED.md`: Int is 32-bit wrapping,
+strings are indexed by code point rather than UTF-16 code unit, division by zero
+returns 0, and **the arena never frees** — fine for a program that exits, wrong
+for a long-running process today.
+
+## Development
+
+```
+zig build test           everything
+zig build test-runtime   the Zig runtime alone; needs no purs, spago or node
+zig build run            build and run example/
+zig build codegen        generate Zig, stop before compiling
+zig build packageset     regenerate packages.json
+```
+
+`docs/codegen.md` is the specification of what the emitter produces and the
+best thing to read before touching `compiler/src/Zig/Emit.purs`.
