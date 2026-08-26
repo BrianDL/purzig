@@ -76,6 +76,12 @@
         exit 1
       fi
 
+      MANIFEST=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -1)
+      if [ "v$MANIFEST" != "$TAG" ]; then
+        echo "build.zig.zon says $MANIFEST, tagging $TAG -- bump it first" >&2
+        exit 1
+      fi
+
       # Rebuild from scratch: the bundle is the artifact downstream consumes,
       # and a stale one is the worst possible thing to ship.
       rm -f compiler/dist/bundle.js
