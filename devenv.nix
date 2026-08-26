@@ -97,10 +97,10 @@
 
       echo
       echo "Tagged $TAG locally. To publish:"
-      echo "  git push origin master \"$TAG\""
+      echo "  git push github main \"$TAG\""
       echo
       echo "Then get the hash for a consumer's build.zig.zon:"
-      echo "  zig fetch https://github.com/YOUR-USER/purzig/archive/refs/tags/$TAG.tar.gz"
+      echo "  zig fetch https://github.com/BrianDL/purzig/archive/refs/tags/$TAG.tar.gz"
     '';
   };
 
