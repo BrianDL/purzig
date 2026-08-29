@@ -21,9 +21,9 @@ hello
 
 ## Licence — read this first
 
-purzig is **AGPL-3.0-or-later**, and the runtime is linked into every binary it
+purzig is **AGPL-3.0**, and the runtime is linked into every binary it
 produces. A program compiled with purzig is therefore a combined work with an
-AGPL library and must itself be released under AGPL-3.0-or-later — including,
+AGPL library and must itself be released under AGPL-3.0 — including,
 under AGPL §13, offering source to the users of a network service.
 
 There is no linking exception. This is deliberate. If you need to ship software
