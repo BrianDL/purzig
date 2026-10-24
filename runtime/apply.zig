@@ -61,20 +61,25 @@ const host = if (freestanding) struct {} else struct {
         initAlloc(allocator);
     }
 
-    fn io() std.Io {
-        return io_inst orelse @panic("runtime: io() before init()");
+    /// The stored `Io`, as a value. Deliberately named `ioInst` and not `io`:
+    /// the file-scope `io` below is exactly this function, and two `io`
+    /// declarations reachable from one expression inside this struct is an
+    /// "ambiguous reference" error. `ioInst` exists only inside `host`, so on a
+    /// freestanding target the name -- like the `Io` it returns -- is gone.
+    fn ioInst() std.Io {
+        return io_inst orelse @panic("runtime: io before init");
     }
 
     fn writeLine(bytes: []const u8) void {
         const out = std.Io.File.stdout();
-        out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
-        out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
+        out.writeStreamingAll(ioInst(), bytes) catch @panic("runtime: write failed");
+        out.writeStreamingAll(ioInst(), "\n") catch @panic("runtime: write failed");
     }
 
     fn writeLineErr(bytes: []const u8) void {
         const out = std.Io.File.stderr();
-        out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
-        out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
+        out.writeStreamingAll(ioInst(), bytes) catch @panic("runtime: write failed");
+        out.writeStreamingAll(ioInst(), "\n") catch @panic("runtime: write failed");
     }
 };
 
@@ -103,7 +108,10 @@ pub fn alloc() std.mem.Allocator {
 }
 
 /// The one `Io` generated code and FFI may use. Native only, with `writeLine`.
-pub const io = if (freestanding) unavailable("rt.io") else host.io;
+/// A nullary accessor rather than a stored value: the instance only exists
+/// once `init` has been handed one, and a runtime `std.Io` cannot be a comptime
+/// `const`, so `rt.io` keeps the nullary-function shape native callers use.
+pub const io = if (freestanding) unavailable("rt.io") else host.ioInst;
 
 /// Apply a one-argument closure. The hot path of the entire backend.
 ///
@@ -238,8 +246,8 @@ pub const writeLine = if (freestanding) unavailable("rt.writeLine") else host.wr
 pub const writeLineErr = if (freestanding) unavailable("rt.writeLineErr") else host.writeLineErr;
 
 // --- tests -----------------------------------------------------------------
-// These exercise the pure parts only. Anything touching `io()` needs a real
-// `Io`, which tests get from `std.testing.io`.
+// These exercise the pure parts only. Anything touching the console writers
+// needs a real `Io`, which tests get from `std.testing.io`.
 
 fn incBody(env: []const Value, argument: Value) Error!Value {
     _ = env;

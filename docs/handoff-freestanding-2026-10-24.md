@@ -83,9 +83,9 @@ and they are untested here — out of scope, not deliberately blessed.
 | `rt.init` | `host.init(io, allocator)`: stores the `Io`, calls `initAlloc` | `unavailable("rt.init")` → `@compileError` |
 | `rt.initAlloc` | sets `alloc_inst` | sets `alloc_inst` (the whole entry) |
 | `rt.alloc` | reads `alloc_inst` | identical |
-| `rt.io` | `host.io()` | `unavailable("rt.io")` → `@compileError` |
+| `rt.io` | `host.ioInst()` | `unavailable("rt.io")` → `@compileError` |
 | `rt.writeLine` / `writeLineErr` | `host.writeLine` → `std.Io.File.stdout/stderr` | `unavailable("rt.writeLine…")` → `@compileError` |
-| `host` (private) | struct with `io_inst: ?std.Io`, `init`, `io`, `writeLine`, `writeLineErr` | `struct {}` — the declarations do not exist |
+| `host` (private) | struct with `io_inst: ?std.Io`, `init`, `ioInst`, `writeLine`, `writeLineErr` | `struct {}` — the declarations do not exist |
 | emitted `main` | `mainNative` (unchanged body) | `mainFreestanding`: `@trap()` |
 | emitted `runWithAllocator` | emitted, referenced by nothing | emitted, referenced by nothing |
 
@@ -107,13 +107,13 @@ numbers are this tree (old number in parentheses).
 |---|---|---|
 | `runtime/apply.zig:57` | `apply.zig:17` | `var io_inst: ?std.Io = null` — now inside `host`, which is `struct {}` on freestanding |
 | `runtime/apply.zig:59-62` | `apply.zig:25` | `host.init(io_value: std.Io, allocator)` — the only writer of `io_inst` |
-| `runtime/apply.zig:64-66` | `apply.zig:36` | `host.io() std.Io` |
-| `runtime/apply.zig:69` | `apply.zig:166` | `std.Io.File.stdout()` |
-| `runtime/apply.zig:75` | `apply.zig:174` | `std.Io.File.stderr()` |
+| `runtime/apply.zig:69-71` | `apply.zig:36` | `host.ioInst() std.Io` (was `host.io()`, renamed in the repair below) |
+| `runtime/apply.zig:74` | `apply.zig:166` | `std.Io.File.stdout()` |
+| `runtime/apply.zig:80` | `apply.zig:174` | `std.Io.File.stderr()` |
 | `runtime/apply.zig:50` | — (new) | `std.process.Init`, the only `std.process` in the runtime, behind `if (freestanding)` |
 | `runtime/apply.zig:96` | `apply.zig:25` | `pub const init = if (freestanding) unavailable(…) else host.init` |
-| `runtime/apply.zig:106` | `apply.zig:36` | `pub const io = …` |
-| `runtime/apply.zig:234,238` | `apply.zig:165,173` | `pub const writeLine` / `writeLineErr` |
+| `runtime/apply.zig:114` | `apply.zig:36` | `pub const io = …` |
+| `runtime/apply.zig:242,246` | `apply.zig:165,173` | `pub const writeLine` / `writeLineErr` |
 | `runtime/root.zig:27,32,36,40,42,53,54` | `root.zig:24,26,37,38` (plus the new lines) | the re-exports: `freestanding`, `ProcessInit`, `init`, `initAlloc`, `io`, `writeLine`, `writeLineErr` |
 | `compiler/src/Zig/Emit.purs:159` | `Emit.purs:149` | the driver's `main` parameter, now `rt.ProcessInit` |
 | `compiler/src/Zig/Emit.purs:167,171` | — (new) | `mainFreestanding`, and the `pub const main` choice |
@@ -246,3 +246,30 @@ listed `rt.init`).
    the fix is the deferred one: `build/purzig.zig` roots the freestanding
    artifact at a generated entry file that declares no `main`, and the fixture
    keeps rooting at `Main.zig`.
+
+---
+
+## Repair: "ambiguous reference" at `apply.zig:70,76`
+
+The change above did not compile on **either** target: `runtime/apply.zig:70:31`
+and `:76:31`, `error: ambiguous reference`, with `fn io() std.Io` (`apply.zig:64`)
+and `pub const io = … else host.io` (`apply.zig:106`) both named as the
+competing declarations. The cause is that the previous edit moved the accessor
+*inside* `host` while leaving the file-scope alias pointing at it, so `host.io`
+and `apply.zig`'s `io` were two reachable declarations of one name in one
+expression — and deleting `host.io` alone would only have moved the error to
+line 106, which *is* `host.io`. The repair keeps exactly one accessor and one
+public name: the private helper was renamed to `host.ioInst` (`apply.zig:69-71`,
+same body, panic text now `runtime: io before init` so no `io()` substring is
+left anywhere in `runtime/`), the four call sites became
+`out.writeStreamingAll(ioInst(), …)` (`apply.zig:75,76,81,82`), and the public
+alias followed it as `pub const io = if (freestanding) unavailable("rt.io") else
+host.ioInst` (`apply.zig:114`). Deliberate deviation from the instruction that
+`io` become a *value*: `std.Io` only exists after `init` stores one, and a
+runtime value cannot initialise a container-level `const`, so `io` stays the
+nullary accessor that native callers (and `root.zig:42`'s `pub const io =
+apply_mod.io`) already use — same native behaviour, same call shape, same
+freestanding `@compileError` gate; nothing about the gate, the writers, the
+emitter, `build/purzig.zig` or the public surface changed. `grep -rn 'fn io(\|io()'
+runtime/` is now empty. Still unverified by execution: all of criteria 1-4, and
+this repair in particular, since no zig is available here.
