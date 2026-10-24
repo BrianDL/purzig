@@ -21,7 +21,23 @@ pub const Fn1 = value.Fn1;
 pub const no_env = value.no_env;
 pub const Error = value.Error;
 
+/// `true` when the runtime is compiled for a target with no OS underneath it
+/// (`wasm32-freestanding`): no process, no `std.Io`, no console. Re-exported so
+/// the generated driver can pick its entry point at comptime.
+pub const freestanding = apply_mod.freestanding;
+
+/// The type of Zig's `main` parameter on a native target (`std.process.Init`),
+/// `void` on a freestanding one. The driver spells its parameter
+/// `rt.ProcessInit`, which keeps `std.process` out of the generated sources.
+pub const ProcessInit = apply_mod.ProcessInit;
+
+/// Native only: takes the `Io` and the process arena from `std.process.Init`.
+/// Referencing it on a freestanding target is a compile error.
 pub const init = apply_mod.init;
+
+/// Every target: the allocator, supplied by the caller. This is the whole
+/// freestanding entry, where no process exists to hand one in.
+pub const initAlloc = apply_mod.initAlloc;
 pub const alloc = apply_mod.alloc;
 pub const io = apply_mod.io;
 pub const apply = apply_mod.apply;

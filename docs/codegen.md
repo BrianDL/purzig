@@ -640,19 +640,50 @@ compiled but unreachable from optimized code.
 Emitted only into the module the build is rooted at:
 
 ```zig
-pub fn main(init: std.process.Init) !void {
+fn mainNative(init: rt.ProcessInit) !void {
     rt.init(init.io, init.arena.allocator());
+    _ = try rt.runEffect(try @"ps.main"());
+}
+
+fn mainFreestanding() void {
+    @trap();
+}
+
+pub const main = if (rt.freestanding) mainFreestanding else mainNative;
+
+pub fn runWithAllocator(allocator: std.mem.Allocator) rt.Error!void {
+    rt.initAlloc(allocator);
     _ = try rt.runEffect(try @"ps.main"());
 }
 ```
 
-Two `try`s, because both steps are fallible: building the `Effect` value is a
-call to a generated nullary function, and forcing it runs the program.
+Two `try`s in `mainNative`, because both steps are fallible: building the
+`Effect` value is a call to a generated nullary function, and forcing it runs the
+program.
 
 Zig 0.16 routes all I/O through an `Io` instance and provides one, plus a
 process-lifetime arena, through `std.process.Init`. The runtime borrows both
 rather than constructing its own — which is why `rt.init` takes two arguments and
-there is no `rt.deinit`.
+there is no `rt.deinit`. The driver spells that type `rt.ProcessInit`, so
+`std.process` never appears in `output-zig/`; the alias is `std.process.Init` on a
+native target and `void` on a freestanding one.
+
+### Freestanding targets
+
+`rt.freestanding` is `builtin.target.os.tag == .freestanding`, so
+`-Dtarget=wasm32-freestanding` selects `mainFreestanding` and `mainNative` is
+never referenced. Zig analyses what is *referenced*, not what runs, so the whole
+native half — `rt.init`, `rt.io`, `rt.writeLine`, and the console FFI that calls
+it — stays out of the compiled graph. The runtime also turns those names into
+`@compileError`s on that target, so an accidental reference fails loudly instead
+of trapping at runtime.
+
+`mainFreestanding` traps, because there is no process to hand in an allocator and
+therefore nothing to run. `runWithAllocator` is the seam where a host supplies
+one: it is emitted on every target, is referenced by nothing, and so is analysed
+only when a host links against it. Nothing calls it yet — the host ABI (entry
+symbol, state buffer, allocator ownership) is the contract work, and until it
+exists a freestanding artifact starts, traps, and is otherwise an empty module.
 
 ## Known rough edges
 

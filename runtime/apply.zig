@@ -5,37 +5,105 @@
 //! arena described as "permanent storage for the entire process, cleaned
 //! automatically on exit". That arena is exactly the allocation strategy this
 //! backend wants -- PureScript is garbage-collected and this backend is not --
-//! so the runtime borrows both from `main` rather than building its own.
+//! so on a native target the runtime borrows both from `main` rather than
+//! building its own.
+//!
+//! A freestanding target (`wasm32-freestanding`) has neither. There is no
+//! process to hand anything in, there is no console to write to, and
+//! `std.Io.Threaded` does not even compile where the target defines no syscalls
+//! (`getrandom`, `IOV_MAX`). Zig analyses what is REFERENCED, not what runs, so
+//! the gate below is on DECLARATIONS: everything that mentions `std.Io` or
+//! `std.process` either moves behind `initAlloc` or becomes a `@compileError`
+//! when `freestanding` is true, which keeps those names out of the compiled
+//! graph instead of merely out of the executed path.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("value.zig");
 
 const Value = value.Value;
 const Field = value.Field;
 const Error = value.Error;
 
-var io_inst: ?std.Io = null;
+/// The one comptime condition the whole target gate hangs on: true for
+/// `wasm32-freestanding` (and any other `*-freestanding` target), false for
+/// every host target this backend has run on. `builtin.target` is the resolved
+/// target, so `zig build -Dtarget=` reaches the runtime without the build
+/// helper passing anything through.
+pub const freestanding = builtin.target.os.tag == .freestanding;
+
+/// A target-unavailable name. The runtime's public surface stays the same on
+/// every target -- `rt.writeLine` is still *declared* on freestanding -- but
+/// referring to one of these is a compile error there rather than a trap at
+/// runtime, so the reference disappears from the graph instead of dragging
+/// `std.Io` in behind it.
+fn unavailable(comptime what: []const u8) noreturn {
+    @compileError("runtime: " ++ what ++ " does not exist on a freestanding target: " ++
+        "there is no process, no std.Io and no console; use initAlloc");
+}
+
+/// The type of Zig's `main` parameter on a native target: `std.process.Init`,
+/// which is where the `Io` and the process arena come from. Spelled through the
+/// runtime so the generated driver never writes `std.process` into
+/// `output-zig/`, and so there is exactly one place that says "not on
+/// freestanding".
+pub const ProcessInit = if (freestanding) void else std.process.Init;
+
+/// Everything that needs a host process: the `Io` handed over by
+/// `std.process.Init` and the two console writers that go through
+/// `std.Io.File`. Empty -- not merely unused -- on a freestanding target, so no
+/// `std.Io` name survives there at all.
+const host = if (freestanding) struct {} else struct {
+    var io_inst: ?std.Io = null;
+
+    fn init(io_value: std.Io, allocator: std.mem.Allocator) void {
+        io_inst = io_value;
+        initAlloc(allocator);
+    }
+
+    fn io() std.Io {
+        return io_inst orelse @panic("runtime: io() before init()");
+    }
+
+    fn writeLine(bytes: []const u8) void {
+        const out = std.Io.File.stdout();
+        out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
+        out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
+    }
+
+    fn writeLineErr(bytes: []const u8) void {
+        const out = std.Io.File.stderr();
+        out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
+        out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
+    }
+};
+
 var alloc_inst: ?std.mem.Allocator = null;
 
-/// Called once, at the top of generated `main`, with the `Io` and arena
-/// allocator handed over by `std.process.Init`.
-///
-/// Parameters are suffixed because Zig forbids a parameter from shadowing a
-/// container-level declaration, and `io` is the accessor below.
-pub fn init(io_value: std.Io, allocator: std.mem.Allocator) void {
-    io_inst = io_value;
+/// Freestanding entry: nothing hands a wasm module a process arena, so the host
+/// supplies the allocator itself. Native code may use it too -- a test or an
+/// embedder with its own arena needs no `Io` at all.
+pub fn initAlloc(allocator: std.mem.Allocator) void {
     alloc_inst = allocator;
 }
 
+/// Called once, at the top of generated `main`, with the `Io` and arena
+/// allocator handed over by `std.process.Init`. Native only: a freestanding
+/// target has nothing to hand over and calls `initAlloc` instead.
+///
+/// Parameters are suffixed because Zig forbids a parameter from shadowing a
+/// container-level declaration, and `io` is the accessor below.
+pub const init = if (freestanding) unavailable("rt.init") else host.init;
+
 /// The one allocator generated code and FFI are allowed to use. Never frees;
-/// the process arena is reclaimed on exit.
+/// the process arena is reclaimed on exit, and a freestanding host owns the
+/// memory it handed to `initAlloc`.
 pub fn alloc() std.mem.Allocator {
     return alloc_inst orelse @panic("runtime: alloc() before init()");
 }
 
-pub fn io() std.Io {
-    return io_inst orelse @panic("runtime: io() before init()");
-}
+/// The one `Io` generated code and FFI may use. Native only, with `writeLine`.
+pub const io = if (freestanding) unavailable("rt.io") else host.io;
 
 /// Apply a one-argument closure. The hot path of the entire backend.
 ///
@@ -161,20 +229,13 @@ pub fn concatString(a: []const u8, b: []const u8) []const u8 {
     return out;
 }
 
-/// Write bytes plus a newline to stdout. Backs `Effect.Console.log`.
-pub fn writeLine(bytes: []const u8) void {
-    const out = std.Io.File.stdout();
-    out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
-    out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
-}
+/// Write bytes plus a newline to stdout. Backs `Effect.Console.log`. Native
+/// only: a freestanding module has no file descriptors to write to.
+pub const writeLine = if (freestanding) unavailable("rt.writeLine") else host.writeLine;
 
 /// Write bytes plus a newline to stderr. Backs `Effect.Console.warn` and
 /// `Effect.Console.error`, which go to stderr in Node exactly as they do here.
-pub fn writeLineErr(bytes: []const u8) void {
-    const out = std.Io.File.stderr();
-    out.writeStreamingAll(io(), bytes) catch @panic("runtime: write failed");
-    out.writeStreamingAll(io(), "\n") catch @panic("runtime: write failed");
-}
+pub const writeLineErr = if (freestanding) unavailable("rt.writeLineErr") else host.writeLineErr;
 
 // --- tests -----------------------------------------------------------------
 // These exercise the pure parts only. Anything touching `io()` needs a real
@@ -249,6 +310,16 @@ test "a ref is mutable through every copy of the reference" {
     const alias = r;
     r.asRef().* = Value.mkInt(2);
     try std.testing.expectEqual(@as(i32, 2), alias.asRef().*.asInt());
+}
+
+test "initAlloc alone is enough to allocate" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    initAlloc(arena.allocator());
+
+    // No `Io` and no `std.process.Init`: this is the freestanding contract, and
+    // a native target can run it too.
+    try std.testing.expectEqualStrings("ab", concatString("a", "b"));
 }
 
 test "string concatenation" {
