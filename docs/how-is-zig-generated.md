@@ -25,7 +25,7 @@ Zig.Emit                             (emits Zig source text)
    ▼
 output-zig/<Module>.zig              (generated Zig, one file per module)
 output-zig/manifest.json             (what the run wrote; modules + main_export)
-   │  zig build (writes the program into the cache, imports Main as purs_main)
+   │  zig build (embeds entry/entry.zig, imports Main as purs_main)
    ▼
 native binary
 ```
@@ -75,8 +75,12 @@ copied to `output-zig/Data.Semiring.ffi.zig`.
 
 After every module it writes `output-zig/manifest.json`, describing the modules
 it produced and naming the one that exports `main`. It writes no program:
-`build/purzig.zig` generates the entry point itself, into the build cache, and
-imports `output-zig/<main_module>.zig` into it under the fixed name `purs_main`.
+`build/purzig.zig` embeds the shipped entry file `entry/entry.zig` (a file at
+the package root, next to `build.zig`, not a template) and writes those bytes
+into the build cache, importing `output-zig/<main_module>.zig` into it under the
+fixed name `purs_main`. A second helper, `addLibrary`, runs the same codegen but
+stops at the module: it hands the generated module out with the runtime bound
+and decides nothing about a program.
 That is why `output-zig/` holds modules and a manifest and nothing else, and why
 the helper never needs to read the manifest.
 
@@ -111,6 +115,8 @@ This is the actual code generator. It consumes the optimizer's `BackendModule`
 | Piece | Location | Role |
 |---|---|---|
 | Build orchestration | `build.zig` | Runs the whole pipeline in dependency order |
+| Build helper | `build/purzig.zig` | `addExecutable` (a program) and `addLibrary` (the modules, no program) |
+| Entry text | `entry/entry.zig` | The driver a compiled `main` is run by, embedded by the helper |
 | Backend driver | `purs/compiler/src/Main.purs` | Reads CoreFn, drives the optimizer, writes files |
 | Code generator | `purs/compiler/src/Zig/Emit.purs` | `BackendModule` → Zig source text |
 | Identifier mangling | `purs/compiler/src/Zig/Ident.purs` | PureScript name → legal Zig identifier |
@@ -127,13 +133,20 @@ This is the actual code generator. It consumes the optimizer's `BackendModule`
 1. `spago bundle` in `purs/compiler` → `bundle.js` (the backend, as a Node
    program).
 2. `spago build` in `purs/example` → runs `purs compile --codegen corefn`, then
-   execs the backend, which writes `output-zig/*.zig` plus the entry file and
-   the manifest.
-3. `zig build` writes the program into the cache and compiles it with `runtime`
-   bound as an import, importing `output-zig/<main_module>.zig` as `purs_main`.
+   execs the backend, which writes `output-zig/*.zig` and the manifest. No entry
+   file: the backend writes modules only.
+3. `zig build` writes the program into the cache — the bytes of
+   `entry/entry.zig` — and compiles it with `runtime` bound as an import,
+   importing `output-zig/<main_module>.zig` as `purs_main`.
    The generated modules do not exist on a clean checkout; the explicit
    `exe.step.dependOn(&codegen.step)` in `build.zig` is what makes the first
    build safe instead of racing.
+
+`zig build test-library` takes the other shape: it calls `addLibrary`, roots the
+fixture `example/library/libmain.zig` at the returned module and runtime, runs
+it, and asserts stdout is exactly `Hello, Zig`. That is the gate that a library
+consumer — a wasm host, an embedding, a test harness — can attach without the
+helper deciding there is a `main`.
 
 ## Two workspaces, and why
 

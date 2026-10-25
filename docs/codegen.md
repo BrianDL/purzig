@@ -646,8 +646,18 @@ declares `main`, and that root is the build helper's business:
 `build/purzig.zig` writes it into the build cache, so `output-zig/` never
 contains one.
 
-The driver text, reproduced here because a downstream project's `test-e2e`
-asserts the program's exact stdout (so this text may not change behaviour):
+The driver text lives in **`entry/entry.zig`**, a shipped file at the package
+root next to `build.zig`. The helper embeds it at build-script compile time
+(`@embedFile`) and writes those bytes into the cache with
+`b.addWriteFiles()` — no templating, no substitution, the file is the program.
+It used to be a string literal in `build/purzig.zig`; a convention this
+important has to be readable on its own, not buried in build logic. A consumer
+that pulls purzig as a *tarball* needs `entry` listed in `build.zig.zon`'s
+`.paths` allowlist; one that depends on it by *path* reads the checkout
+directly and needs nothing.
+
+The text, reproduced here because a downstream project's `test-e2e` asserts the
+program's exact stdout (so this text may not change behaviour):
 
 ```zig
 const std = @import("std");
@@ -698,6 +708,44 @@ there is no `rt.deinit`. The driver spells that type `rt.ProcessInit`, so
 `std.process` never appears in generated code; the alias is `std.process.Init`
 on a native target and `void` on a freestanding one.
 
+### Two shapes
+
+`build/purzig.zig` offers two entry points. They share the shim, the package
+set, `spago build` and the runtime module; they differ in whether a program is
+decided.
+
+```zig
+pub fn addExecutable(b: *std.Build, opts: Options) Artifacts
+// Artifacts = { exe, codegen, runtime }
+
+pub fn addLibrary(b: *std.Build, opts: Options) LibraryArtifacts
+// LibraryArtifacts = { codegen, runtime, module }
+```
+
+| | `addExecutable` | `addLibrary` |
+|---|---|---|
+| entry file | `entry/entry.zig`, embedded and written to the cache | **none** |
+| `addExecutable` call | yes | no |
+| installed | yes, by the caller (`b.installArtifact`) | no |
+| returns | `exe`, `codegen`, `runtime` | `codegen`, `runtime`, `module` |
+
+`addLibrary`'s `module` is a Zig module over
+`output-zig/<opts.main_module>.zig` with the purzig runtime bound as `runtime`.
+That is the *same* module `addExecutable` binds as `purs_main`: a consumer roots
+its own artifact at it and imports it under any name it likes — its own `main`,
+a test harness, a wasm host, or nothing at all. Nothing is written outside the
+build cache, so a library-only build leaves `output-zig/` holding modules and
+`manifest.json` and no `purzig_entry.zig`.
+
+Because the generated modules do not exist on a clean checkout, a caller rooting
+its own artifact at `module` must order it after the codegen step itself:
+`artifact.step.dependOn(&lib.codegen.step)`. `addLibrary` cannot do it, since it
+never sees the artifact.
+
+`zig build test-library` is the in-repo gate: `example/library/libmain.zig`
+binds `module` as `purs_main`, binds `runtime`, runs `@"ps.main"` through
+`rt.runEffect`, and the step asserts stdout is exactly `Hello, Zig`.
+
 ### The manifest
 
 `output-zig/manifest.json` is written once, after every module:
@@ -724,8 +772,9 @@ thunk whose Zig identifier is `@"ps.main"`. With no module exporting `main`,
 executable at.
 
 There is no `entry_file`: the program is the build helper's, it lives in the
-build cache, and nothing in purzig reads the manifest. It is emitted so that
-`addLibrary`, the wasm host ABI and any downstream tool can find the output
+build cache, and nothing in purzig reads the manifest. It is emitted so that the
+wasm host ABI and any downstream tool can find the output — and so a consumer of
+`addLibrary` can see which generated module is the one exporting `main` —
 without globbing the directory.
 
 ### Freestanding targets

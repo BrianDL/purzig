@@ -12,7 +12,9 @@ const purzig = @import("build/purzig.zig");
 // so it can be read on its own.
 pub const Options = purzig.Options;
 pub const Artifacts = purzig.Artifacts;
+pub const LibraryArtifacts = purzig.LibraryArtifacts;
 pub const addExecutable = purzig.addExecutable;
+pub const addLibrary = purzig.addLibrary;
 pub const addRuntimeTests = purzig.addRuntimeTests;
 
 pub fn build(b: *std.Build) void {
@@ -90,6 +92,48 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("test-e2e", "Run the full pipeline and check the output");
     e2e_step.dependOn(&check_generated.step);
 
+    // -----------------------------------------------------------------
+    // The second shape: `addLibrary`, proved in-tree.
+    //
+    // The same codegen as the program above, minus the decision that the
+    // output IS a program. The fixture root in `example/library/` is an
+    // ordinary consumer: it binds the returned module as `purs_main`, binds
+    // the returned runtime, and runs `@"ps.main"` through `rt.runEffect`.
+    // Asserted as OUTPUT, like the program, so this gate is that the library
+    // actually runs rather than merely compiles.
+    // -----------------------------------------------------------------
+
+    const lib = purzig.addLibrary(b, opts);
+
+    // Our bundle is built from source, so library codegen waits for it as the
+    // program's does -- and for the program's codegen, because both run
+    // `spago build` in the same project directory and the build runner would
+    // otherwise start the two in parallel.
+    lib.codegen.step.dependOn(&build_compiler.step);
+    lib.codegen.step.dependOn(&app.codegen.step);
+
+    const lib_root = b.createModule(.{
+        .root_source_file = b.path("example/library/libmain.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_root.addImport("runtime", lib.runtime);
+    lib_root.addImport("purs_main", lib.module);
+
+    const lib_probe = b.addExecutable(.{
+        .name = "library-probe",
+        .root_module = lib_root,
+    });
+    lib_probe.step.dependOn(&lib.codegen.step);
+
+    // Not installed: `addLibrary` installs nothing, and this probe is a check,
+    // not an artifact. It only has to run.
+    const check_library = b.addRunArtifact(lib_probe);
+    check_library.expectStdOutEqual(expected_output);
+
+    const library_step = b.step("test-library", "Compile the example as a library and check the output");
+    library_step.dependOn(&check_library.step);
+
     const run_runtime_tests = purzig.addRuntimeTests(b, opts);
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
@@ -97,6 +141,7 @@ pub fn build(b: *std.Build) void {
     const all_tests = b.step("test", "Run every check");
     all_tests.dependOn(&run_runtime_tests.step);
     all_tests.dependOn(&check_generated.step);
+    all_tests.dependOn(&check_library.step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,
