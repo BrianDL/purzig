@@ -1,5 +1,12 @@
 # Handoff: the entry point moves out of the generated modules (issue #7)
 
+> **Superseded by `docs/handoff-entry-deletion-2026-10-25.md`.** This session
+> moved the driver out of the modules and into `output-zig/purzig_entry.zig`,
+> which was one step short: the emitter must write no program at all. The
+> driver now lives in `build/purzig.zig` and lands in the build cache. The text
+> below is the record of that intermediate state, and its description of the
+> emitter and of `manifest.json`'s `entry_file` no longer matches the code.
+
 **Date:** 2026-10-25
 **Scope:** `sophos/purzig` issue #7 — the emitter emits **modules only**; the
 program becomes `output-zig/purzig_entry.zig`, the output gets described by
