@@ -746,6 +746,42 @@ never sees the artifact.
 binds `module` as `purs_main`, binds `runtime`, runs `@"ps.main"` through
 `rt.runEffect`, and the step asserts stdout is exactly `Hello, Zig`.
 
+### Byte entry point
+
+A host that is not Zig has no `rt.Value`, so the runtime also offers one
+bytes-level call:
+
+```zig
+pub const Status = enum { ok, invalid };
+pub const Reply = struct { status: Status, bytes: []const u8 };
+pub fn callBytes(f: Value, in: []const u8) Reply
+```
+
+`callBytes` takes a PureScript function value and an input slice and returns a
+status plus the output bytes. The caller never constructs an argument value and
+never applies a closure: decoding the input and encoding the result happen
+behind the boundary.
+
+This is the entry point for a platform package, and it is **internal to them for
+now** — not a stable public surface. Typed wrappers (generated from the
+PureScript type, one Zig function per callback, no byte plumbing at the call
+site) are the intended surface, and the byte form is what they will be built on.
+Until they exist, anything reaching for `callBytes` directly is writing against a
+contract that may still change.
+
+**The returned bytes are allocated from the runtime's allocator and are never
+freed by us.** There is no `free`, no `deinit`, and no ownership transfer: the
+slice is valid for the life of the runtime, which on a native target is the
+process arena reclaimed at exit and on a freestanding one is whatever the host
+handed to `initAlloc`. A caller must copy the bytes if it needs them to outlive
+that, and must not assume a subsequent call reuses or invalidates the buffer.
+
+`example/abi/abi_probe.zig` is the in-repo gate: it calls
+`rt.abi.callBytes(purs_main.@"ps.echo", "hi")` and `zig build test-abi` asserts
+stdout is exactly `hi!`. The function lives in `Main` because `addLibrary`
+exposes only the module named by `main_module`; `main`'s own output is
+unchanged.
+
 ### The manifest
 
 `output-zig/manifest.json` is written once, after every module:

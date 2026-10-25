@@ -21,3 +21,11 @@ main :: Effect Unit
 main = do
   result <- target "Zig"
   log (greet result)
+
+-- | Reached from Zig rather than from `main`: `example/abi/abi_probe.zig` calls
+-- | it through `rt.abi.callBytes` and `zig build test-abi` asserts the result.
+-- | It lives in `Main` on purpose -- `addLibrary` exposes only the module named
+-- | by `main_module`, so a separate module would need a second module handle.
+-- | `main`'s output is unaffected.
+echo :: String -> String
+echo s = s <> "!"
