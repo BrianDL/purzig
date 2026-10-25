@@ -134,6 +134,46 @@ pub fn build(b: *std.Build) void {
     const library_step = b.step("test-library", "Compile the example as a library and check the output");
     library_step.dependOn(&check_library.step);
 
+    // -----------------------------------------------------------------
+    // The byte ABI, proved in-tree (issue #15).
+    //
+    // Same `addLibrary` codegen as `test-library`, but the fixture root in
+    // `example/abi/` never touches a `rt.Value`: it hands `@"ps.echo"` and the
+    // bytes `hi` to `rt.abi.callBytes` and prints the bytes that come back.
+    // That is the whole point -- a host outside Zig's type system (a wasm
+    // embedder, another language) can call compiled PureScript through this
+    // one entry point, and this step is the gate that it works at all.
+    // -----------------------------------------------------------------
+
+    const abi_lib = purzig.addLibrary(b, opts);
+
+    // Same ordering as `test-library`: our bundle is built from source, and
+    // both library-shaped runs `spago build` in `example/`, so they are
+    // serialised behind the program's codegen as well.
+    abi_lib.codegen.step.dependOn(&build_compiler.step);
+    abi_lib.codegen.step.dependOn(&app.codegen.step);
+
+    const abi_root = b.createModule(.{
+        .root_source_file = b.path("example/abi/abi_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    abi_root.addImport("purs_main", abi_lib.module);
+    abi_root.addImport("runtime", abi_lib.runtime);
+
+    const abi_probe = b.addExecutable(.{
+        .name = "abi-probe",
+        .root_module = abi_root,
+    });
+    abi_probe.step.dependOn(&abi_lib.codegen.step);
+
+    // Not installed: it is a check, not an artifact.
+    const check_abi = b.addRunArtifact(abi_probe);
+    check_abi.expectStdOutEqual("hi!\n");
+
+    const abi_step = b.step("test-abi", "Call a compiled PureScript function through the byte ABI and check the output");
+    abi_step.dependOn(&check_abi.step);
+
     const run_runtime_tests = purzig.addRuntimeTests(b, opts);
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
@@ -142,6 +182,7 @@ pub fn build(b: *std.Build) void {
     all_tests.dependOn(&run_runtime_tests.step);
     all_tests.dependOn(&check_generated.step);
     all_tests.dependOn(&check_library.step);
+    all_tests.dependOn(&check_abi.step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,
