@@ -3,7 +3,13 @@
 -- | Spago invokes this with the project root as its working directory, after
 -- | running `purs compile --codegen corefn`. The contract is entirely
 -- | filesystem-based: read ./output/<Module.Name>/corefn.json, write
--- | ./output-zig/<Module.Name>.zig. No arguments, no stdin.
+-- | ./output-zig/<Module.Name>.zig, plus -- once, after the modules -- the
+-- | program (`output-zig/purzig_entry.zig`) and a description of the run
+-- | (`output-zig/manifest.json`). No arguments, no stdin.
+-- |
+-- | The emitter writes modules only (issue #7). The entry point is a separate
+-- | file that imports the module exporting `main`, and `build/purzig.zig` roots
+-- | the executable at it by name -- it does not read the manifest.
 -- |
 -- | Unlike the CoreFn-direct version this replaces, the whole program is read
 -- | before anything is emitted. `purescript-backend-optimizer` is a
@@ -35,12 +41,12 @@ import Prelude
 
 import Data.Argonaut.Decode.Error (printJsonDecodeError)
 import Data.Argonaut.Parser (jsonParser)
-import Data.Array (catMaybes, filter, length, sort)
+import Data.Array (catMaybes, filter, find, fromFoldable, length, mapWithIndex, sort)
 import Data.Either (Either(..))
 import Data.List (List)
 import Data.List as List
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (unwrap)
 import Data.Set (Set)
 import Data.Set as Set
@@ -58,8 +64,8 @@ import PureScript.Backend.Optimizer.CoreFn.Sort (sortModules)
 import PureScript.Backend.Optimizer.Directives (parseDirectiveFile)
 import PureScript.Backend.Optimizer.Directives.Defaults (defaultDirectives)
 import PureScript.Backend.Optimizer.Semantics.Foreign (coreForeignSemantics, qualified)
-import Zig.Emit (emitModule)
-import Zig.Ident (ffiFile, moduleFile)
+import Zig.Emit (emitEntry, emitModule, entryFile, mainModule)
+import Zig.Ident (ffiFile, moduleFile, stringLit)
 
 corefnDir :: String
 corefnDir = "output"
@@ -69,6 +75,10 @@ corefnDir = "output"
 -- | convention.
 zigDir :: String
 zigDir = "output-zig"
+
+-- | The description of a run, written beside the modules.
+manifestFile :: String
+manifestFile = "manifest.json"
 
 main :: Effect Unit
 main = do
@@ -87,6 +97,7 @@ main = do
           <> " module director(ies) decoded"
       )
     build sorted
+    finish (fromFoldable sorted)
 
 -- | The only `BuildOptions` fields carrying any weight are `foreignSemantics`
 -- | and `onCodegenModule`. The rest are at their trivial value deliberately:
@@ -159,6 +170,96 @@ codegen (Module coreFnMod) backendMod = do
       writeTextFile UTF8 out code
       log ("[purs-backend-zig]   " <> name <> " -> " <> out)
       copyForeign name coreFnMod.path (Set.size backendMod.foreign)
+
+-- | The program, then the manifest. Both once, after every module.
+-- |
+-- | The entry is NOT a module, which is the point of the split: it lives in
+-- | `output-zig/purzig_entry.zig`, imports exactly the module that exports
+-- | `main`, and is what `build/purzig.zig` roots the executable at. It is
+-- | written only when that module was actually emitted, so a failed emit leaves
+-- | a missing root rather than a root that calls a decl nobody wrote.
+-- |
+-- | The manifest describes what is on disk, not what was attempted: a module
+-- | that failed to emit is absent from `modules`, so nothing reading the file
+-- | can mistake it for one that exists.
+finish :: Array (Module Ann) -> Effect Unit
+finish mods = do
+  emitted <- catMaybes <$> traverse describe mods
+  let entry = find (\e -> e.name == mainModule) emitted
+  case entry of
+    Nothing -> pure unit
+    Just m -> do
+      let entryPath = zigDir <> "/" <> entryFile
+      writeTextFile UTF8 entryPath (emitEntry m.name)
+      log ("[purs-backend-zig]   program -> " <> entryPath)
+  let manifestPath = zigDir <> "/" <> manifestFile
+  writeTextFile UTF8 manifestPath (renderManifest emitted entry)
+  log
+    ( "[purs-backend-zig]   " <> show (length emitted) <> " module(s) -> "
+        <> manifestPath
+    )
+
+-- | One row of the manifest.
+type Emitted =
+  { name :: String
+  , file :: String
+  , ffi :: Maybe String
+  }
+
+-- | A row per generated `.zig` module, in emission order.
+-- |
+-- | `ffi` is answered by the filesystem rather than by the module's foreign
+-- | set, because the manifest promises FILES: a module whose declared foreign
+-- | imports had no `.zig` beside them gets no `.ffi.zig` in the output and must
+-- | not claim one.
+describe :: Module Ann -> Effect (Maybe Emitted)
+describe (Module m) = do
+  let name = unwrap m.name
+  generated <- exists (zigDir <> "/" <> moduleFile name)
+  hasFfi <- exists (zigDir <> "/" <> ffiFile name)
+  let
+    row =
+      { name: name
+      , file: moduleFile name
+      , ffi: if hasFfi then Just (ffiFile name) else Nothing
+      }
+  pure (if generated then Just row else Nothing)
+
+-- | The manifest: valid JSON, and enough to find every file this run wrote.
+-- |
+-- | `main_module` and `entry_file` are null together when no module exported
+-- | `main`, in which case no entry file was written either.
+renderManifest :: Array Emitted -> Maybe Emitted -> String
+renderManifest rows entry =
+  String.joinWith "\n"
+    ( [ "{"
+      , "  \"main_module\": " <> maybe "null" (\e -> stringLit e.name) entry <> ","
+      , "  \"entry_file\": " <> maybe "null" (\_ -> stringLit entryFile) entry <> ","
+      , "  \"modules\": " <> renderModules rows
+      , "}"
+      ]
+    )
+    <> "\n"
+
+renderModules :: Array Emitted -> String
+renderModules rows =
+  String.joinWith "\n"
+    ([ "[" ] <> commaSeparated (map renderRow rows) <> [ "  ]" ])
+
+renderRow :: Emitted -> String
+renderRow row =
+  "{ \"name\": " <> stringLit row.name
+    <> ", \"file\": " <> stringLit row.file
+    <> ", \"ffi\": " <> maybe "null" stringLit row.ffi
+    <> " }"
+
+-- | One line per row, indented, with a comma on all but the last -- so the
+-- | array stays valid JSON whether or not it is empty.
+commaSeparated :: Array String -> Array String
+commaSeparated rows =
+  mapWithIndex
+    (\i line -> "    " <> line <> (if i == length rows - 1 then "" else ","))
+    rows
 
 -- | Dependency order is not optional. `buildModules` threads an
 -- | `implementations` map forward, and a module's constructors and inlinable

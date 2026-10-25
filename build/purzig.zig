@@ -15,9 +15,13 @@
 //!      the shim once per build. The backend writes `output-zig/<Module>.zig`
 //!      beside the project, and copies each package's `<Module>.zig` FFI in as
 //!      `<Module>.ffi.zig` itself -- the build system is not involved in that.
+//!      It also writes the program, `output-zig/purzig_entry.zig`, and a
+//!      `output-zig/manifest.json` describing the run.
 //!
-//!   3. The generated root module is compiled as an ordinary Zig executable
-//!      with `runtime` bound as an import.
+//!   3. The generated entry point is compiled as an ordinary Zig executable
+//!      with `runtime` bound as an import. The entry file is the root, never a
+//!      module: `output-zig/<Module>.zig` files are compiled as imports of it
+//!      and know nothing about `main`.
 //!
 //! Step 3 depends on step 2 explicitly. The root source file does not exist on
 //! a clean checkout, so without that edge the first build races.
@@ -30,7 +34,11 @@ pub const Options = struct {
     /// Name of the produced binary.
     name: []const u8,
 
-    /// PureScript module holding `main`. Its generated Zig is the root source.
+    /// PureScript module that exports `main`. It no longer names the root
+    /// source file: the executable is always rooted at
+    /// `output-zig/purzig_entry.zig`, the generated program that imports this
+    /// module. The name is kept because a consumer's build still has to say
+    /// which module the program starts from.
     main_module: []const u8 = "Main",
 
     /// Directory containing `spago.yaml`. Defaults to the build root.
@@ -116,7 +124,12 @@ pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {
 
     // ---- 3. compile the generated Zig -------------------------------------
 
-    const root = project.path(b, b.fmt("output-zig/{s}.zig", .{opts.main_module}));
+    // The generated program, not the main module: the emitter keeps `main` out
+    // of every generated module, so `output-zig/<main_module>.zig` is a module
+    // like any other. The filename is fixed on purpose -- `output-zig/
+    // manifest.json` names it too, but parsing that here would make the build
+    // depend on the manifest's shape for one constant string.
+    const root = project.path(b, "output-zig/purzig_entry.zig");
 
     const exe = b.addExecutable(.{
         .name = opts.name,

@@ -18,7 +18,9 @@ purs compile --codegen corefn
         -> Tco.analyze                     (tail-call decoration)
              -> TcoExpr
         -> Zig.Emit                        (this spec)
-    output-zig/<Module>.zig
+    output-zig/<Module>.zig                (modules only)
+    output-zig/purzig_entry.zig            (the program, `emitEntry`)
+    output-zig/manifest.json               (what the run wrote)
 ```
 
 The backend consumes `purescript-backend-optimizer`, not CoreFn directly.
@@ -637,12 +639,19 @@ compiled but unreachable from optimized code.
 
 ## Entry point
 
-Emitted only into the module the build is rooted at:
+The emitter produces **modules only**. `output-zig/<Module>.zig` holds the
+compiled module and nothing else — no `main`, no `std.process`, no runtime init.
+The program is a separate file, `output-zig/purzig_entry.zig`, written once
+when the module that exports `main` (`Main`) was emitted:
 
 ```zig
+const std = @import("std");
+const rt = @import("runtime");
+const @"mod.Main" = @import("Main.zig");
+
 fn mainNative(init: rt.ProcessInit) !void {
     rt.init(init.io, init.arena.allocator());
-    _ = try rt.runEffect(try @"ps.main"());
+    _ = try rt.runEffect(try @"mod.Main".@"ps.main"());
 }
 
 fn mainFreestanding() void {
@@ -653,9 +662,23 @@ pub const main = if (rt.freestanding) mainFreestanding else mainNative;
 
 pub fn runWithAllocator(allocator: std.mem.Allocator) rt.Error!void {
     rt.initAlloc(allocator);
-    _ = try rt.runEffect(try @"ps.main"());
+    _ = try rt.runEffect(try @"mod.Main".@"ps.main"());
 }
 ```
+
+The only difference from the driver that used to sit at the foot of `Main.zig`
+is the qualification: `@"ps.main"` was a sibling decl and is now reached through
+the import. Signature, `rt.init`, both `runEffect` calls, the comptime branch,
+the `@trap()` fallback and `runWithAllocator` are moved verbatim — a downstream
+project's `test-e2e` asserts the program's exact stdout, so the move may not
+change behaviour.
+
+`build/purzig.zig`'s `addExecutable` roots the executable at that fixed
+filename, and does **not** read the manifest to find it: one constant string is
+not worth a JSON parse in every consumer's build.
+
+`Options.main_module` keeps its default `"Main"` and still means "the module
+that exports `main`". It no longer names the root source file.
 
 Two `try`s in `mainNative`, because both steps are fallible: building the
 `Effect` value is a call to a generated nullary function, and forcing it runs the
@@ -667,6 +690,31 @@ rather than constructing its own — which is why `rt.init` takes two arguments 
 there is no `rt.deinit`. The driver spells that type `rt.ProcessInit`, so
 `std.process` never appears in `output-zig/`; the alias is `std.process.Init` on a
 native target and `void` on a freestanding one.
+
+### The manifest
+
+`output-zig/manifest.json` is written once, after every module:
+
+```json
+{
+  "main_module": "Main",
+  "entry_file": "purzig_entry.zig",
+  "modules": [
+    { "name": "Main", "file": "Main.zig", "ffi": null },
+    { "name": "Greeting", "file": "Greeting.zig", "ffi": "Greeting.ffi.zig" }
+  ]
+}
+```
+
+`modules` has one row per generated `.zig` module in emission (dependency)
+order. `ffi` is null unless a `.ffi.zig` was actually written beside it — the
+manifest promises files, so it is answered by the filesystem rather than by the
+module's foreign set. With no module exporting `main`, `main_module` and
+`entry_file` are both null and no entry file is written.
+
+Nothing in purzig reads it yet. It is emitted so that `addLibrary`, the wasm
+host ABI and any downstream tool can find the output without globbing the
+directory; the build helper deliberately stays on the fixed entry filename.
 
 ### Freestanding targets
 
@@ -683,7 +731,7 @@ therefore nothing to run. `runWithAllocator` is the seam where a host supplies
 one: it is emitted on every target, is referenced by nothing, and so is analysed
 only when a host links against it. Nothing calls it yet — the host ABI (entry
 symbol, state buffer, allocator ownership) is the contract work, and until it
-exists a freestanding artifact starts, traps, and is otherwise an empty module.
+exists a freestanding artifact starts, traps, and is otherwise an empty program.
 
 ## Known rough edges
 

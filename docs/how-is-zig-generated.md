@@ -24,7 +24,9 @@ Zig.Emit                             (emits Zig source text)
    │
    ▼
 output-zig/<Module>.zig              (generated Zig, one file per module)
-   │  zig build
+output-zig/purzig_entry.zig          (the program, one file, imports Main)
+output-zig/manifest.json             (what the run wrote)
+   │  zig build (roots the executable at purzig_entry.zig)
    ▼
 native binary
 ```
@@ -65,11 +67,18 @@ The driver does not read CoreFn itself. It hands the raw bytes of each
 3. **Runs `Tco.analyze`**, which decorates the IR with tail-call information —
    whether a recursive binding group is a genuine loop.
 4. **Calls `Zig.Emit.emitModule`** per module, which produces the Zig source
-   text, and writes it to `output-zig/<Module>.zig`.
+   text, and writes it to `output-zig/<Module>.zig`. A module contains its own
+   compiled bindings and nothing else: no `main`, no runtime init.
 
 The driver also copies each module's hand-written FFI: a `Data/Semiring.purs`
 pairs with a `Data/Semiring.zig` sitting beside it in the package, which is
 copied to `output-zig/Data.Semiring.ffi.zig`.
+
+After every module it writes the program once — `output-zig/purzig_entry.zig`,
+from `Zig.Emit.emitEntry`, containing the `main` that imports the module
+exporting `main` — and then `output-zig/manifest.json`, describing the run.
+Neither is a module: `build/purzig.zig` roots the executable at the fixed entry
+filename and does not read the manifest.
 
 A module that fails to emit is reported and skipped rather than aborting the
 run, so one unsupported construct in a library does not hide progress on
@@ -118,13 +127,12 @@ This is the actual code generator. It consumes the optimizer's `BackendModule`
 1. `spago bundle` in `purs/compiler` → `bundle.js` (the backend, as a Node
    program).
 2. `spago build` in `purs/example` → runs `purs compile --codegen corefn`, then
-   execs the backend, which writes `output-zig/*.zig`.
-3. Zig compiles `output-zig/Main.zig` with `runtime` and the FFI linked in as
-   named modules.
-
-The generated root source file does not exist on a clean checkout; the explicit
-`exe.step.dependOn(&codegen.step)` in `build.zig` is what makes the first build
-safe instead of racing.
+   execs the backend, which writes `output-zig/*.zig` plus the entry file and
+   the manifest.
+3. Zig compiles `output-zig/purzig_entry.zig` with `runtime` and the FFI linked
+   in as named modules. The generated entry file does not exist on a clean
+   checkout; the explicit `exe.step.dependOn(&codegen.step)` in `build.zig` is
+   what makes the first build safe instead of racing.
 
 ## Two workspaces, and why
 
