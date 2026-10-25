@@ -769,6 +769,11 @@ site) are the intended surface, and the byte form is what they will be built on.
 Until they exist, anything reaching for `callBytes` directly is writing against a
 contract that may still change.
 
+The argument is the PureScript *function value*, not the generated decl's name:
+every generated module decl `@"ps.<name>"` is a thunk `fn () rt.Error!rt.Value`
+and must be called (`try purs_main.@"ps.echo"()`) to obtain the `Value`.
+Applying that value to arguments is the runtime's job, not the caller's.
+
 **The returned bytes are allocated from the runtime's allocator and are never
 freed by us.** There is no `free`, no `deinit`, and no ownership transfer: the
 slice is valid for the life of the runtime, which on a native target is the
@@ -776,8 +781,9 @@ process arena reclaimed at exit and on a freestanding one is whatever the host
 handed to `initAlloc`. A caller must copy the bytes if it needs them to outlive
 that, and must not assume a subsequent call reuses or invalidates the buffer.
 
-`example/abi/abi_probe.zig` is the in-repo gate: it calls
-`rt.abi.callBytes(purs_main.@"ps.echo", "hi")` and `zig build test-abi` asserts
+`example/abi/abi_probe.zig` is the in-repo gate: it binds the thunk with
+`const f = try purs_main.@"ps.echo"();`, calls
+`rt.abi.callBytes(f, "hi")` and `zig build test-abi` asserts
 stdout is exactly `hi!`. The function lives in `Main` because `addLibrary`
 exposes only the module named by `main_module`; `main`'s own output is
 unchanged.

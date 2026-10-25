@@ -1,11 +1,17 @@
 //! The byte-ABI fixture root (issue #15): proof that a Zig root can call a
 //! compiled PureScript function through `rt.abi.callBytes`.
 //!
-//! Unlike `example/library/libmain.zig`, nothing here constructs or applies a
-//! `rt.Value` itself: the whole call crosses the bytes boundary. `rt.abi` takes
-//! the closure and an input slice and hands back a `Reply` -- a status and a
-//! byte slice -- so the caller needs no knowledge of tags, closures or the
-//! runtime's representation.
+//! Unlike `example/library/libmain.zig`, nothing here constructs an argument
+//! `rt.Value` or applies a closure: the whole call crosses the bytes boundary.
+//! `rt.abi` takes the function value and an input slice and hands back a
+//! `Reply` -- a status and a byte slice -- so the caller needs no knowledge of
+//! tags, closures or the runtime's representation.
+//!
+//! Note the one step that is still the caller's: every generated module decl
+//! `@"ps.<name>"` is a THUNK `fn () rt.Error!rt.Value`, not a `Value`. It must
+//! be called (`try purs_main.@"ps.echo"()`) to obtain the value; passing the
+//! function name itself would pass a function, not a `Value`. Applying the
+//! arguments stays the runtime's job (`callBytes` does that).
 //!
 //! `ps.echo` is `\s -> s <> "!"` in `example/src/Main.purs`, and
 //! `zig build test-abi` asserts this program's stdout is exactly `hi!`.
@@ -25,6 +31,7 @@ const purs_main = @import("purs_main");
 
 pub fn main(init: rt.ProcessInit) !void {
     rt.init(init.io, init.arena.allocator());
-    const reply = rt.abi.callBytes(purs_main.@"ps.echo", "hi");
+    const f = try purs_main.@"ps.echo"();
+    const reply = rt.abi.callBytes(f, "hi");
     rt.writeLine(reply.bytes);
 }
