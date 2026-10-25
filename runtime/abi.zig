@@ -1,14 +1,24 @@
-//! The bytes call path: one `String -> String` function, bytes in, bytes out.
+//! The bytes call path: compiled PureScript functions, bytes in, bytes out.
 //!
 //! A compiled PureScript module exports plain Zig functions over `Value`, which
 //! is not a boundary another consumer wants to cross: `Value` is an untyped
-//! union with a panicking accessor per shape and no ownership story. `callBytes`
-//! is the smallest honest crossing -- a compiled function in, bytes in, a
-//! `Reply` out, and an explicit error channel instead of a trap.
+//! union with a panicking accessor per shape and no ownership story. `call` is
+//! the smallest honest crossing -- a compiled function in, k byte slices in, a
+//! `Reply` out, and an explicit transport status instead of a trap.
 //!
 //! Deliberately absent: any description of what the bytes MEAN. The layout
-//! inside `in` and inside the reply is the consumer's business, so this file has
-//! no schema, no registry and no knowledge of any host.
+//! inside each input and inside the reply is the consumer's business, so this
+//! file has no schema, no registry and no knowledge of any host.
+//!
+//! ## Status is transport, never application meaning
+//!
+//! `Status.ok` says only that the call crossed: the callee returned a `String`
+//! and `Reply.bytes` is it. `Status.error` says the call did not cross: the
+//! callee raised, or it returned something that is not a `String`. Neither
+//! status says anything about what the bytes SAY -- a reply of `"no"` is `ok`,
+//! and an error reason is not an error code. Whatever a consumer wants its
+//! payload to mean, it decides on its side of the boundary. purzig does not
+//! know what "valid" is.
 //!
 //! ## Memory
 //!
@@ -18,26 +28,29 @@
 //! binds it once through `initAlloc`, and nothing in this file reaches for an
 //! `Io` instance, the console or the panic printer.
 //!
-//! - `in` is COPIED into that allocator before the callee sees it. The callee is
-//!   untyped -- it may keep the string in a ref, a record or a captured
-//!   environment -- and `in` may be a temporary in the caller's frame. After the
-//!   copy the caller may drop `in` immediately.
-//! - Nothing here is ever freed: a reply's `bytes` are valid for the life of the
-//!   runtime. They point at the string the callee returned, at a copy of a
-//!   thrown string, or at a comptime literal.
+//! - each element of `ins` is COPIED into that allocator before the callee sees
+//!   it. The callee is untyped -- it may keep the string in a ref, a record or a
+//!   captured environment -- and an element may be a temporary in the caller's
+//!   frame. After the copy the caller may drop every element immediately.
+//! - `out.buf` is the caller's: written, never freed, never retained.
+//! - Nothing else here is ever freed: a reply's `bytes` are valid for the life
+//!   of the runtime. They point at the string the callee returned, at a copy of
+//!   a thrown string, or at a comptime literal.
 //!
-//! ## Never a trap
+//! ## Never a trap for callee-refused input
 //!
-//! Input the callee refuses is a RESULT, not a panic. `invalid` comes from
-//! exactly two things, and both leave a reason in `bytes`:
+//! Input the callee refuses is a RESULT, not a panic. `error` comes from exactly
+//! two things, and both leave a reason in `bytes`:
 //!
 //! 1. the callee raised a PureScript exception (`Effect.Exception.throw`);
 //! 2. the callee returned something that is not a `String`.
 //!
-//! Only an `f` that is not applicable at all -- not a closure -- panics, and it
-//! panics inside `rt.apply`: there is no bytes-shaped answer for "you handed me
-//! an `Int` instead of a function", and that is a caller bug rather than input a
-//! callee can reject.
+//! An `f` that is not applicable with `ins.len` arguments -- an `Int`, or a
+//! two-argument function applied once -- panics inside `rt.apply`. That is a
+//! caller bug in the Zig program linking this module, not input a callee can
+//! reject, so there is no bytes-shaped answer to give. So does an `out.buf` too
+//! small for the result: sizes are the caller's business here, and the reply is
+//! never silently truncated.
 
 const std = @import("std");
 
@@ -47,15 +60,34 @@ const apply_mod = @import("apply.zig");
 const Value = value.Value;
 const Error = value.Error;
 
-/// How a call ended. Never a trap: `invalid` is how the callee -- or the shape
-/// of its result -- says "no result", with the reason in `Reply.bytes`.
-pub const Status = enum { ok, invalid };
+/// How a call crossed. Transport only: `ok` means the callee produced a
+/// `String`, `error` means it did not. Neither says what the bytes MEAN.
+pub const Status = enum { ok, error };
+
+/// Where a successful call's bytes go: a caller-owned buffer and the length
+/// actually written, so `out.buf[0..out.len]` is the result.
+///
+/// An out-sink rather than a returned slice because a consumer that owns its
+/// own buffer (a wasm host's linear memory, a C struct field) should not have to
+/// receive memory it can neither free nor size. The runtime still allocates for
+/// its own uses; it just does not hand the result out that way.
+pub const Reader = struct { buf: []u8, len: usize = 0 };
+
+/// The bytes of `reply`: the buffer when `ok`, the reason when `error`.
+/// The one place a caller should ask, so a status check cannot be forgotten.
+pub fn bytes(reply: Reply, out: *const Reader) []const u8 {
+    return switch (reply.status) {
+        .ok => out.buf[0..out.len],
+        .error => reply.bytes,
+    };
+}
 
 pub const Reply = struct {
     status: Status,
-    /// `ok`: the bytes the callee returned. `invalid`: a human-readable reason.
-    /// Allocated from the runtime's already-initialised allocator, or a comptime
-    /// literal; never freed here, valid for the life of the runtime.
+    /// `ok`: empty -- the bytes are in the `Reader` that was passed in.
+    /// `error`: a human-readable reason, allocated from the runtime's
+    /// already-initialised allocator or a comptime literal; never freed here,
+    /// valid for the life of the runtime.
     bytes: []const u8,
 };
 
@@ -65,32 +97,75 @@ pub const Reply = struct {
 const threw_non_string = "PureScript exception with a non-String value";
 const returned_non_string = "PureScript function returned a non-String value";
 
-/// Call `f`, a compiled PureScript function of type `String -> String`, with
-/// `in` as its one argument.
+/// Apply `f` to `ins` IN ORDER, then read the result with `out`.
 ///
-/// Panics only when `f` is not applicable at all (see the module docs); every
-/// other failure is `Status.invalid`.
-pub fn callBytes(f: Value, in: []const u8) Reply {
-    // Copy first: the callee may keep the argument, and `in` is the caller's.
-    const argument = copyOf(in);
+/// Each element is one argument: `ins.len` is the arity, applied left to right
+/// through `rt.apply`, so this is exactly the nested-`apply` chain the
+/// generated code writes for an application node.
+///
+/// - `ins.len == 0`: `f` is used as the result (`f` is then a `String`, e.g. a
+///   `String`-valued definition such as a top-level constant);
+/// - `ins.len == 1`: `f` is applied once;
+/// - `ins.len == k`: `f` is applied k times, in order.
+///
+/// A successful result is written into `out.buf` and `out.len` is set. A result
+/// longer than `out.buf` panics -- see the module docs.
+///
+/// Panics only when `f` is not applicable with `ins.len` arguments, or when
+/// `out.buf` cannot hold the result; every other failure is `Status.error`.
+pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply {
+    var current = f;
 
-    const result = apply_mod.apply(f, Value.mkString(argument)) catch {
-        // `apply` fails only with `error.PsException`, which always carries the
-        // thrown value in the runtime's side channel. Consuming it here is what
-        // keeps a later catch from seeing a stale one.
-        return .{ .status = .invalid, .bytes = exceptionBytes(apply_mod.takeError()) };
-    };
+    for (ins) |in| {
+        // Copy first: the callee may keep the argument, and `in` is the
+        // caller's -- possibly a temporary that dies at the end of this loop.
+        const argument = copyOf(in);
 
-    return switch (result) {
-        .string => |s| .{ .status = .ok, .bytes = s },
-        else => .{ .status = .invalid, .bytes = returned_non_string },
+        current = apply_mod.apply(current, Value.mkString(argument)) catch {
+            // `apply` fails only with `error.PsException`, which always carries
+            // the thrown value in the runtime's side channel. Consuming it here
+            // is what keeps a later catch from seeing a stale one.
+            return .{ .status = .error, .bytes = exceptionBytes(apply_mod.takeError()) };
+        };
+    }
+
+    return switch (current) {
+        .string => |s| {
+            if (out.buf.len < s.len) @panic("runtime: abi.Reader too small for the reply");
+            @memcpy(out.buf[0..s.len], s);
+            out.len = s.len;
+            return .{ .status = .ok, .bytes = "" };
+        },
+        else => .{ .status = .error, .bytes = returned_non_string },
     };
 }
 
+/// Call `f`, a one-argument compiled PureScript function, with `in` as its one
+/// argument. A thin wrapper over `call`, kept so existing callers compile and
+/// read unchanged.
+pub fn callBytes(f: Value, in: []const u8) Reply {
+    // Sized to `in` is wrong in general (the reply may be longer), so the
+    // wrapper gives one ample buffer rather than a growing one: a one-argument
+    // call's reply is bounded by what the callee builds, and 64 KiB per call is
+    // cheaper than a reallocating out-sink for callers that only want a slice.
+    const buf = apply_mod.alloc().alloc(u8, callBytes_buffer) catch
+        @panic("runtime: out of memory");
+    var out: Reader = .{ .buf = buf };
+    const reply = call(f, &.{in}, &out);
+    if (reply.status == .error) return reply;
+    // Re-point at the runtime's copy so the returned slice outlives `buf`'s
+    // role as a plain buffer: `ok` always answers with allocated bytes here.
+    return .{ .status = .ok, .bytes = copyOf(out.buf[0..out.len]) };
+}
+
+/// The buffer `callBytes` hands to `call`. Not a promise about the callee: a
+/// longer reply panics, which is why new code should size its own `Reader`.
+const callBytes_buffer = 64 * 1024;
+
 /// A thrown `String` is the callee's own reason, so report it verbatim -- copied
-/// into the runtime allocator, so an `invalid` reply obeys the same lifetime
-/// rule as an `ok` one. Anything else has no bytes to report, so say that
-/// instead of inventing a rendering for arbitrary `Value`s.
+/// into the runtime allocator, so an `error` reply obeys the same lifetime rule
+/// as an `ok` one. Anything else has no bytes to report, so say that instead of
+/// inventing a rendering for arbitrary `Value`s.
 fn exceptionBytes(err: Value) []const u8 {
     return switch (err) {
         .string => |s| copyOf(s),
@@ -99,8 +174,7 @@ fn exceptionBytes(err: Value) []const u8 {
 }
 
 /// Copy bytes into the runtime's allocator. The only allocation this file
-/// makes, and the reason a reply outlives the call: everything returned points
-/// at memory the runtime owns.
+/// makes besides `callBytes`'s fixed buffer.
 fn copyOf(bytes: []const u8) []const u8 {
     const out = apply_mod.alloc().dupe(u8, bytes) catch
         @panic("runtime: out of memory");
@@ -109,9 +183,9 @@ fn copyOf(bytes: []const u8) []const u8 {
 
 // --- tests -----------------------------------------------------------------
 // No PureScript needed: a closure built with the runtime's own constructors
-// stands in for a compiled `String -> String`. The allocator is a fixed buffer,
-// so a test leaks nothing it has to clean up -- the runtime never frees, by
-// design -- and nothing here needs a process or an `Io`.
+// stands in for a compiled function. The allocator is a fixed buffer, so a test
+// leaks nothing it has to clean up -- the runtime never frees, by design -- and
+// nothing here needs a process or an `Io`.
 
 fn echoBody(env: []const Value, argument: Value) Error!Value {
     _ = env;
@@ -142,58 +216,31 @@ fn throwIntBody(env: []const Value, argument: Value) Error!Value {
     return apply_mod.throwValue(Value.mkInt(7));
 }
 
-test "callBytes answers ok with the bytes the callee returned" {
-    var buffer: [256]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
-    apply_mod.initAlloc(fba.allocator());
-
-    const reply = callBytes(Value.mkClosure(echoBody, value.no_env), "hello");
-    try std.testing.expectEqual(Status.ok, reply.status);
-    try std.testing.expectEqualStrings("hello", reply.bytes);
-
-    // A callee that ignores its argument still answers ok: the shape of the
-    // reply depends on the result, not on the input.
-    const fixed = callBytes(Value.mkClosure(constBody, value.no_env), "");
-    try std.testing.expectEqual(Status.ok, fixed.status);
-    try std.testing.expectEqualStrings("hi!", fixed.bytes);
+/// `\a -> \b -> a <> b`, i.e. `pair a b = a <> b`. Two applications, so it
+/// exercises `ins.len == 2` and the ORDER of application.
+fn pairBody(env: []const Value, first: Value) Error!Value {
+    _ = env;
+    const captured = Value.mkClosure(pairSecond, apply_mod.copyValues(&.{first}));
+    return captured;
 }
 
-test "callBytes answers invalid when the callee throws" {
-    var buffer: [256]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
-    apply_mod.initAlloc(fba.allocator());
-
-    // A thrown String is reported verbatim.
-    const thrown = callBytes(Value.mkClosure(throwStringBody, value.no_env), "in");
-    try std.testing.expectEqual(Status.invalid, thrown.status);
-    try std.testing.expectEqualStrings("rejected", thrown.bytes);
-
-    // A thrown non-String still answers invalid, with a fixed reason.
-    const other = callBytes(Value.mkClosure(throwIntBody, value.no_env), "in");
-    try std.testing.expectEqual(Status.invalid, other.status);
-    try std.testing.expectEqualStrings(threw_non_string, other.bytes);
+fn pairSecond(env: []const Value, second: Value) Error!Value {
+    return Value.mkString(apply_mod.concatString(env[0].asString(), second.asString()));
 }
 
-test "callBytes answers invalid when the callee returns a non-String" {
-    var buffer: [256]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
-    apply_mod.initAlloc(fba.allocator());
+/// A closure that records the address and bytes of its argument, so a test can
+/// prove the callee saw a COPY rather than the caller's buffer.
+var seen: []const u8 = &.{};
 
-    const reply = callBytes(Value.mkClosure(intBody, value.no_env), "in");
-    try std.testing.expectEqual(Status.invalid, reply.status);
-    try std.testing.expectEqualStrings(returned_non_string, reply.bytes);
+fn recordBody(env: []const Value, argument: Value) Error!Value {
+    _ = env;
+    seen = argument.asString();
+    return argument;
 }
 
-test "callBytes copies its input, so the caller may drop it" {
-    var buffer: [256]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+fn initRuntime(buffer: []u8) std.heap.FixedBufferAllocator {
+    var fba: std.heap.FixedBufferAllocator = .init(buffer);
     apply_mod.initAlloc(fba.allocator());
-
-    var input = [_]u8{ 'a', 'b', 'c' };
-    const reply = callBytes(Value.mkClosure(echoBody, value.no_env), &input);
-    @memset(&input, 'z');
-
-    // The echo read its own copy, not the buffer we just scribbled on.
-    try std.testing.expectEqual(Status.ok, reply.status);
-    try std.testing.expectEqualStrings("abc", reply.bytes);
+    return fba;
 }
+

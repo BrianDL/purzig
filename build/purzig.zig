@@ -31,7 +31,10 @@
 //!   3. `output-zig/<main_module>.zig` is wrapped in a Zig module with
 //!      `runtime` bound, so that a root importing it needs no other wiring.
 //!      That module is `LibraryArtifacts.module`, and it is the module
-//!      `addExecutable` imports under the fixed name `purs_main`.
+//!      `addExecutable` imports under the fixed name `purs_main`. Every OTHER
+//!      module the run emitted is reachable the same way through
+//!      `LibraryArtifacts.module(name)`, with the name taken from the manifest's
+//!      `modules[]` (see `LibraryArtifacts`).
 //!
 //! Only `addExecutable` goes further: it writes the entry text (a file shipped
 //! in this package, `entry/entry.zig`, embedded at build-script compile time)
@@ -88,6 +91,25 @@ pub const Artifacts = struct {
 /// What `addLibrary` hands back. No executable, no entry file, nothing
 /// installed: a caller compiles its own root against `module`.
 pub const LibraryArtifacts = struct {
+    /// The generated modules of the package, keyed by PureScript module name
+    /// (`main_module`, `Api`, `Data.Maybe`, ...) and owned by this struct.
+    modules: Modules,
+
+    /// The Zig module for a generated PureScript module, `runtime` bound, or
+    /// `null` when the package has no module of that name.
+    ///
+    /// ```zig
+    /// const api = lib.module("Api") orelse @panic("no Api");
+    /// root.addImport("api", api);
+    /// ```
+    ///
+    /// Names come from `output-zig/manifest.json`'s `modules[]`, read at
+    /// configure time with `std.json` -- not hand-rolled, and not by globbing
+    /// `output-zig/`, which does not exist yet on a clean checkout.
+    pub fn module(self: LibraryArtifacts, name: []const u8) ?*std.Build.Module {
+        return self.modules.get(name);
+    }
+
     /// The `spago build` invocation, exactly as `Artifacts.codegen`. A caller
     /// rooting its own artifact at `module` has to order that artifact after
     /// this step itself (`artifact.step.dependOn(&lib.codegen.step)`), because
@@ -105,7 +127,26 @@ pub const LibraryArtifacts = struct {
     /// under that name, or any other name the caller prefers. It exports the
     /// compiled PureScript module and nothing else -- no `main` decl, so a root
     /// that wants a program supplies its own.
-    module: *std.Build.Module,
+    ///
+    /// The same module as `module(opts.main_module)`; kept as a field so
+    /// existing callers keep compiling. Null only if the package has no module
+    /// called `opts.main_module`, which `addCodegen` already panics on.
+    module_main: ?*std.Build.Module,
+};
+
+/// Every generated module of one package, by PureScript module name. A flat
+/// list rather than a map: a package has tens of modules, lookups happen once
+/// per consumer at configure time, and a list keeps the type printable.
+pub const Modules = struct {
+    names: []const []const u8,
+    mods: []const *std.Build.Module,
+
+    pub fn get(self: Modules, name: []const u8) ?*std.Build.Module {
+        for (self.names, self.mods) |n, m| {
+            if (std.mem.eql(u8, n, name)) return m;
+        }
+        return null;
+    }
 };
 
 /// The program, as source text.
@@ -139,9 +180,12 @@ const Codegen = struct {
     /// The runtime module built for `opts.target` / `opts.optimize`.
     runtime: *std.Build.Module,
 
-    /// The module exporting `main`, `runtime` bound. No program: a root that
-    /// imports it decides what, if anything, to call.
+    /// The module exporting `main` (`opts.main_module`), `runtime` bound. No
+    /// program: a root that imports it decides what, if anything, to call.
     main: *std.Build.Module,
+
+    /// Every emitted module, by PureScript module name, `runtime` bound.
+    modules: Modules,
 };
 
 fn addCodegen(b: *std.Build, opts: Options) Codegen {
@@ -200,20 +244,94 @@ fn addCodegen(b: *std.Build, opts: Options) Codegen {
 
     codegen.addPathDir(bin_dir);
 
-    // ---- 3. the generated module ------------------------------------------
+    // ---- 3. the generated modules ----------------------------------------
 
-    // The module that exports `main`, bound under a fixed import name so the
-    // generated program can call it. `output-zig/manifest.json` names it too,
-    // but parsing that here would make the build depend on the manifest's shape
-    // for one constant string.
-    const main = b.createModule(.{
-        .root_source_file = project.path(b, b.fmt("output-zig/{s}.zig", .{opts.main_module})),
+    // Every module the run emitted, by PureScript module name, from the
+    // manifest's `modules[]`. `std.json`, not a hand-rolled scan: the manifest
+    // is the backend's contract and its rows carry strings with escapes
+    // (`Data.Maybe`), so a real parser is both shorter and less likely to be
+    // wrong. It is read when the build SCRIPT configures, in purzig's own
+    // builder `pb` -- not when the user's build runs.
+    //
+    // A missing manifest means no codegen has run yet, so the names are not
+    // known: the list is empty and `module(name)` answers null until the next
+    // configure. `main` (below) is still created, because `addExecutable`
+    // needs it on a clean checkout before any manifest exists.
+    const names = readModuleNames(b, project) orelse &.{};
+
+    const mods = b.allocator.alloc(*std.Build.Module, names.len) catch @panic("purzig: out of memory");
+    for (names, 0..) |name, i| mods[i] = moduleFor(b, project, opts, runtime, name);
+
+    const main = moduleFor(b, project, opts, runtime, opts.main_module);
+
+    return .{
+        .codegen = codegen,
+        .runtime = runtime,
+        .main = main,
+        .modules = .{ .names = names, .mods = mods },
+    };
+}
+
+/// The module over `output-zig/<name>.zig` with `runtime` bound. Creating a
+/// module never reads the generated sources; only COMPILING it does, so a
+/// missing file is a compile error at that point and never a build-script one.
+/// `name` is a PureScript module name and the file is named after it verbatim
+/// (`Data.Maybe` -> `Data.Maybe.zig`), so this is the whole mapping.
+fn moduleFor(
+    b: *std.Build,
+    project: std.Build.LazyPath,
+    opts: Options,
+    runtime: *std.Build.Module,
+    name: []const u8,
+) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = project.path(b, b.fmt("output-zig/{s}.zig", .{name})),
         .target = opts.target,
         .optimize = opts.optimize,
     });
-    main.addImport("runtime", runtime);
+    m.addImport("runtime", runtime);
+    return m;
+}
 
-    return .{ .codegen = codegen, .runtime = runtime, .main = main };
+/// The `modules[]` names from `<project>/output-zig/manifest.json`, or null
+/// when the file is not there (nothing has run codegen yet).
+///
+/// Read at the moment this build script is CONFIGURED, which is the only moment
+/// a Zig build script can read a file. A manifest written by a later codegen
+/// run is therefore not seen until the next configure -- true of any
+/// configure-time read of a generated file. That is also why the file is only
+/// ever read for the module NAMES: a stale name can at worst name a file that
+/// does not exist, and the compile says so.
+fn readModuleNames(
+    b: *std.Build,
+    project: std.Build.LazyPath,
+) ?[]const []const u8 {
+    const manifest = std.fs.path.join(b.allocator, &.{
+        project.getPath(b), "output-zig", "manifest.json",
+    }) catch @panic("purzig: out of memory");
+
+    const text = std.fs.cwd().readFileAlloc(
+        b.allocator,
+        manifest,
+        8 * 1024 * 1024,
+    ) catch return null;
+
+    const Manifest = struct {
+        modules: []const struct { name: []const u8 } = &.{},
+    };
+
+    // `std.json`, not a hand-rolled scan: the rows carry strings (`Data.Maybe`)
+    // and the shape is the backend's to change, so a real parser is shorter and
+    // tells us when it disagrees. Unknown keys (`main_module`, `main_export`,
+    // `file`, `ffi`) are ignored: the helper needs the names only.
+    const parsed = std.json.parseFromSlice(Manifest, b.allocator, text, .{
+        .ignore_unknown_fields = true,
+    }) catch @panic("purzig: output-zig/manifest.json is not valid JSON");
+
+    const names = b.allocator.alloc([]const u8, parsed.value.modules.len) catch
+        @panic("purzig: out of memory");
+    for (parsed.value.modules, 0..) |row, i| names[i] = row.name;
+    return names;
 }
 
 pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {
@@ -245,14 +363,16 @@ pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {
 }
 
 /// The same codegen path, minus the program: no entry file, no
-/// `addExecutable`, nothing installed. The caller gets the generated module
-/// with the runtime bound and roots whatever it likes at it.
+/// `addExecutable`, nothing installed. The caller gets every generated module
+/// with the runtime bound -- by PureScript name, through `module(name)` -- and
+/// roots whatever it likes at it.
 pub fn addLibrary(b: *std.Build, opts: Options) LibraryArtifacts {
     const gen = addCodegen(b, opts);
     return .{
         .codegen = gen.codegen,
         .runtime = gen.runtime,
-        .module = gen.main,
+        .modules = gen.modules,
+        .module_main = gen.main,
     };
 }
 
