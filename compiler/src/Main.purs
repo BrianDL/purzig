@@ -3,13 +3,14 @@
 -- | Spago invokes this with the project root as its working directory, after
 -- | running `purs compile --codegen corefn`. The contract is entirely
 -- | filesystem-based: read ./output/<Module.Name>/corefn.json, write
--- | ./output-zig/<Module.Name>.zig, plus -- once, after the modules -- the
--- | program (`output-zig/purzig_entry.zig`) and a description of the run
--- | (`output-zig/manifest.json`). No arguments, no stdin.
+-- | ./output-zig/<Module.Name>.zig, and -- once, after the modules -- a
+-- | description of the run (`output-zig/manifest.json`). No arguments, no
+-- | stdin.
 -- |
--- | The emitter writes modules only (issue #7). The entry point is a separate
--- | file that imports the module exporting `main`, and `build/purzig.zig` roots
--- | the executable at it by name -- it does not read the manifest.
+-- | The emitter writes modules only (issue #7). No program is written here at
+-- | all: `build/purzig.zig` generates the entry point into the build cache,
+-- | roots the executable at it, and never reads the manifest. What this program
+-- | records is which module exports `main`, so tooling does not have to guess.
 -- |
 -- | Unlike the CoreFn-direct version this replaces, the whole program is read
 -- | before anything is emitted. `purescript-backend-optimizer` is a
@@ -64,8 +65,8 @@ import PureScript.Backend.Optimizer.CoreFn.Sort (sortModules)
 import PureScript.Backend.Optimizer.Directives (parseDirectiveFile)
 import PureScript.Backend.Optimizer.Directives.Defaults (defaultDirectives)
 import PureScript.Backend.Optimizer.Semantics.Foreign (coreForeignSemantics, qualified)
-import Zig.Emit (emitEntry, emitModule, entryFile, mainModule)
-import Zig.Ident (ffiFile, moduleFile, stringLit)
+import Zig.Emit (emitModule)
+import Zig.Ident (ffiFile, moduleFile, stringLit, topLevel)
 
 corefnDir :: String
 corefnDir = "output"
@@ -79,6 +80,19 @@ zigDir = "output-zig"
 -- | The description of a run, written beside the modules.
 manifestFile :: String
 manifestFile = "manifest.json"
+
+-- | The module that exports `main`. It is compiled exactly like every other
+-- | module; nothing in `output-zig/` is a program.
+-- |
+-- | `build/purzig.zig`'s `Options.main_module` defaults to this name and means
+-- | the same thing: the module that exports `main`, not a root source file.
+mainModule :: String
+mainModule = "Main"
+
+-- | The export the program calls. A PureScript `main` is an `Effect` thunk, so
+-- | the Zig name is `@"ps.main"` and running the program is calling it.
+mainExport :: String
+mainExport = "main"
 
 main :: Effect Unit
 main = do
@@ -171,13 +185,13 @@ codegen (Module coreFnMod) backendMod = do
       log ("[purs-backend-zig]   " <> name <> " -> " <> out)
       copyForeign name coreFnMod.path (Set.size backendMod.foreign)
 
--- | The program, then the manifest. Both once, after every module.
+-- | The manifest, once, after every module.
 -- |
--- | The entry is NOT a module, which is the point of the split: it lives in
--- | `output-zig/purzig_entry.zig`, imports exactly the module that exports
--- | `main`, and is what `build/purzig.zig` roots the executable at. It is
--- | written only when that module was actually emitted, so a failed emit leaves
--- | a missing root rather than a root that calls a decl nobody wrote.
+-- | There is no entry file to point at: the program belongs to the build
+-- | helper, which writes it into the build cache rather than into `output-zig/`.
+-- | What is recorded here is the MODULES on disk, plus which of them exports
+-- | `main` and how that export is spelled -- so `addLibrary`, a wasm host ABI
+-- | or any other tool can find the output without globbing the directory.
 -- |
 -- | The manifest describes what is on disk, not what was attempted: a module
 -- | that failed to emit is absent from `modules`, so nothing reading the file
@@ -185,15 +199,8 @@ codegen (Module coreFnMod) backendMod = do
 finish :: Array (Module Ann) -> Effect Unit
 finish mods = do
   emitted <- catMaybes <$> traverse describe mods
-  let entry = find (\e -> e.name == mainModule) emitted
-  case entry of
-    Nothing -> pure unit
-    Just m -> do
-      let entryPath = zigDir <> "/" <> entryFile
-      writeTextFile UTF8 entryPath (emitEntry m.name)
-      log ("[purs-backend-zig]   program -> " <> entryPath)
   let manifestPath = zigDir <> "/" <> manifestFile
-  writeTextFile UTF8 manifestPath (renderManifest emitted entry)
+  writeTextFile UTF8 manifestPath (renderManifest emitted)
   log
     ( "[purs-backend-zig]   " <> show (length emitted) <> " module(s) -> "
         <> manifestPath
@@ -227,19 +234,33 @@ describe (Module m) = do
 
 -- | The manifest: valid JSON, and enough to find every file this run wrote.
 -- |
--- | `main_module` and `entry_file` are null together when no module exported
--- | `main`, in which case no entry file was written either.
-renderManifest :: Array Emitted -> Maybe Emitted -> String
-renderManifest rows entry =
-  String.joinWith "\n"
-    ( [ "{"
-      , "  \"main_module\": " <> maybe "null" (\e -> stringLit e.name) entry <> ","
-      , "  \"entry_file\": " <> maybe "null" (\_ -> stringLit entryFile) entry <> ","
-      , "  \"modules\": " <> renderModules rows
-      , "}"
-      ]
-    )
-    <> "\n"
+-- | `main_module` and `main_export` are null together when no module exported
+-- | `main`, in which case there is nothing to root an executable at. No entry
+-- | file is named: the build helper does not read this file, and the filename
+-- | is the helper's business.
+renderManifest :: Array Emitted -> String
+renderManifest rows =
+  let
+    entry = find (\e -> e.name == mainModule) rows
+  in
+    String.joinWith "\n"
+      ( [ "{"
+        , "  \"main_module\": " <> maybe "null" (\e -> stringLit e.name) entry <> ","
+        , "  \"main_export\": " <> maybe "null" (const renderMainExport) entry <> ","
+        , "  \"modules\": " <> renderModules rows
+        , "}"
+        ]
+      )
+      <> "\n"
+
+-- | What `main` is, so a consumer needs to know nothing about the backend's
+-- | naming: a PureScript `Effect` thunk, called in Zig as `@"ps.main"()`.
+-- | `kind` says what it is; `zig` is the identifier to call.
+renderMainExport :: String
+renderMainExport =
+  "{ \"name\": " <> stringLit mainExport
+    <> ", \"zig\": " <> stringLit (topLevel mainExport)
+    <> ", \"kind\": \"effect-thunk\" }"
 
 renderModules :: Array Emitted -> String
 renderModules rows =
