@@ -60,10 +60,17 @@ pub const setLazyInit = lazy_mod.setLazyInit;
 pub const forceLazy = lazy_mod.forceLazy;
 pub const newMutArray = marray_mod.newMutArray;
 
+/// The bytes call path: `abi.Status`, `abi.Reply` and the single function that
+/// crosses from bytes to a compiled module and back. The one module of the
+/// surface rather than a re-exported declaration, so the contract stays fixed
+/// while everything above may be rewritten.
+pub const abi = @import("abi.zig");
+
 test {
     _ = value;
     _ = apply_mod;
     _ = curry_mod;
     _ = lazy_mod;
     _ = marray_mod;
+    _ = abi;
 }
