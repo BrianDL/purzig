@@ -382,3 +382,30 @@ one-line fix is recorded here instead:
 It must land before the next tag, or the tarball is missing the program. Also
 note that adding it changes the package hash, which is why it belongs to the
 release step rather than to this PR.
+
+### Done: `.paths` now ships `entry/`
+
+Applied on a follow-up branch. `build.zig.zon` gains one line, in the style of
+its neighbours:
+
+```diff
+         "compiler/dist",
++        "entry",
+         "packages",
+```
+
+Nothing else in the manifest changed — no version bump, no fingerprint, no
+reordering. `entry/` is now part of the packaged tree, so a consumer fetching
+purzig as a URL/tarball gets `entry/entry.zig` and `@embedFile("../entry/entry.zig")`
+in `build/purzig.zig` resolves when the consumer's build script is compiled.
+
+Why it stayed invisible: every gate in this repo — `zig build test-e2e`,
+`zig build test-library`, `zig build test-runtime`, and the downstream
+`purzig-template` parity run — reaches purzig as a **path** dependency, which
+uses the working tree directly and never applies `.paths`. The allowlist only
+filters a fetched package, so the omission could not fail any of them.
+
+Consequence: the package hash changes. Anything pinning purzig by URL and
+recording its hash must be updated on the next tag. The program text itself is
+untouched, so the parity gate's stdout assumption still holds. **UNVERIFIED**:
+no `zig` here, so the new hash was not computed and no fetch was exercised.

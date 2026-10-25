@@ -21,6 +21,7 @@
         "build",
         "runtime",
         "compiler/dist",
+        "entry",
         "packages",
         "packages.json",
         "LICENSE",
