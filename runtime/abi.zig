@@ -186,6 +186,11 @@ fn copyOf(bytes: []const u8) []const u8 {
 // stands in for a compiled function. The allocator is a fixed buffer, so a test
 // leaks nothing it has to clean up -- the runtime never frees, by design -- and
 // nothing here needs a process or an `Io`.
+//
+// Each test installs its own `FixedBufferAllocator` through
+// `apply_mod.initAlloc` rather than sharing a helper, because `fba` must outlive
+// the allocator it hands out: a helper returning it by value would leave the
+// installed allocator pointing at a dead stack frame.
 
 fn echoBody(env: []const Value, argument: Value) Error!Value {
     _ = env;
@@ -238,9 +243,122 @@ fn recordBody(env: []const Value, argument: Value) Error!Value {
     return argument;
 }
 
-fn initRuntime(buffer: []u8) std.heap.FixedBufferAllocator {
-    var fba: std.heap.FixedBufferAllocator = .init(buffer);
+
+test "call answers ok: one argument, two arguments, zero arguments" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
     apply_mod.initAlloc(fba.allocator());
-    return fba;
+
+    var out_buf: [256]u8 = undefined;
+
+    // 1 argument: applied once.
+    var one: Reader = .{ .buf = &out_buf };
+    const single = call(Value.mkClosure(echoBody, value.no_env), &.{"hello"}, &one);
+    try std.testing.expectEqual(Status.ok, single.status);
+    try std.testing.expectEqualStrings("hello", bytes(single, &one));
+
+    // 2 arguments: applied left to right, so ORDER is visible in the result.
+    var two: Reader = .{ .buf = &out_buf };
+    const paired = call(Value.mkClosure(pairBody, value.no_env), &.{ "ab", "cd" }, &two);
+    try std.testing.expectEqual(Status.ok, paired.status);
+    try std.testing.expectEqualStrings("abcd", bytes(paired, &two));
+
+    // 0 arguments: `f` IS the result, e.g. a `String`-valued constant. No
+    // `apply` happens, so nothing can be non-applicable.
+    var zero: Reader = .{ .buf = &out_buf };
+    const constant = call(Value.mkString("hi!"), &.{}, &zero);
+    try std.testing.expectEqual(Status.ok, constant.status);
+    try std.testing.expectEqualStrings("hi!", bytes(constant, &zero));
 }
 
+test "call answers error when the callee throws" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    var out_buf: [256]u8 = undefined;
+
+    // A thrown String is reported verbatim.
+    var one: Reader = .{ .buf = &out_buf };
+    const thrown = call(Value.mkClosure(throwStringBody, value.no_env), &.{"in"}, &one);
+    try std.testing.expectEqual(Status.error, thrown.status);
+    try std.testing.expectEqualStrings("rejected", thrown.bytes);
+
+    // A thrown non-String still answers error, with a fixed reason.
+    var two: Reader = .{ .buf = &out_buf };
+    const other = call(Value.mkClosure(throwIntBody, value.no_env), &.{"in"}, &two);
+    try std.testing.expectEqual(Status.error, other.status);
+    try std.testing.expectEqualStrings(threw_non_string, other.bytes);
+}
+
+test "call answers error when the callee returns a non-String" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    var out_buf: [256]u8 = undefined;
+    var out: Reader = .{ .buf = &out_buf };
+    const reply = call(Value.mkClosure(intBody, value.no_env), &.{"in"}, &out);
+    try std.testing.expectEqual(Status.error, reply.status);
+    try std.testing.expectEqualStrings(returned_non_string, reply.bytes);
+}
+
+test "call copies every input, so the caller may drop them" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    // Two SEPARATE caller-owned temporaries, both scribbled on after the call.
+    // If either argument had been retained by reference, `abcd` would be `zzzz`
+    // or worse.
+    var first = [_]u8{ 'a', 'b' };
+    var second = [_]u8{ 'c', 'd' };
+
+    var out_buf: [256]u8 = undefined;
+    var out: Reader = .{ .buf = &out_buf };
+    const reply = call(Value.mkClosure(pairBody, value.no_env), &.{ &first, &second }, &out);
+    @memset(&first, 'z');
+    @memset(&second, 'z');
+
+    try std.testing.expectEqual(Status.ok, reply.status);
+    try std.testing.expectEqualStrings("abcd", bytes(reply, &out));
+}
+
+test "call copies its input, and the callee sees the copy" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    var input = [_]u8{ 'a', 'b', 'c' };
+    seen = &.{};
+
+    var out_buf: [256]u8 = undefined;
+    var out: Reader = .{ .buf = &out_buf };
+    const reply = call(Value.mkClosure(recordBody, value.no_env), &.{&input}, &out);
+
+    // The callee's view is not the caller's buffer.
+    try std.testing.expect(seen.ptr != input[0..].ptr);
+    try std.testing.expectEqualStrings("abc", seen);
+
+    @memset(&input, 'z');
+
+    // And what it read survived the scribble.
+    try std.testing.expectEqual(Status.ok, reply.status);
+    try std.testing.expectEqualStrings("abc", bytes(reply, &out));
+    try std.testing.expectEqualStrings("abc", seen);
+}
+
+test "callBytes is call with one buffer" {
+    var buffer: [1024 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    const reply = callBytes(Value.mkClosure(echoBody, value.no_env), "hello");
+    try std.testing.expectEqual(Status.ok, reply.status);
+    try std.testing.expectEqualStrings("hello", reply.bytes);
+
+    // An error passes through unchanged: same reason, same status.
+    const refused = callBytes(Value.mkClosure(intBody, value.no_env), "in");
+    try std.testing.expectEqual(Status.error, refused.status);
+    try std.testing.expectEqualStrings(returned_non_string, refused.bytes);
+}

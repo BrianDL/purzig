@@ -719,7 +719,8 @@ pub fn addExecutable(b: *std.Build, opts: Options) Artifacts
 // Artifacts = { exe, codegen, runtime }
 
 pub fn addLibrary(b: *std.Build, opts: Options) LibraryArtifacts
-// LibraryArtifacts = { codegen, runtime, module }
+// LibraryArtifacts = { modules, codegen, runtime, module_main }
+//   fn module(self, name) ?*std.Build.Module   // any emitted module, by name
 ```
 
 | | `addExecutable` | `addLibrary` |
@@ -727,15 +728,31 @@ pub fn addLibrary(b: *std.Build, opts: Options) LibraryArtifacts
 | entry file | `entry/entry.zig`, embedded and written to the cache | **none** |
 | `addExecutable` call | yes | no |
 | installed | yes, by the caller (`b.installArtifact`) | no |
-| returns | `exe`, `codegen`, `runtime` | `codegen`, `runtime`, `module` |
+| returns | `exe`, `codegen`, `runtime` | `modules`, `codegen`, `runtime`, `module_main` |
 
-`addLibrary`'s `module` is a Zig module over
+`addLibrary`'s `module_main` is a Zig module over
 `output-zig/<opts.main_module>.zig` with the purzig runtime bound as `runtime`.
 That is the *same* module `addExecutable` binds as `purs_main`: a consumer roots
 its own artifact at it and imports it under any name it likes — its own `main`,
 a test harness, a wasm host, or nothing at all. Nothing is written outside the
 build cache, so a library-only build leaves `output-zig/` holding modules and
 `manifest.json` and no `purzig_entry.zig`.
+
+`module(name)` is the same thing for **any** emitted module, keyed by PureScript
+module name (`"Api"`, `"Data.Maybe"`, ...), so a consumer whose exports are not
+in `Main` names the module it wants instead of moving code into `Main`:
+
+```zig
+const api = lib.module("Api") orelse @panic("no Api module");
+root.addImport("api", api);
+```
+
+The names come from `output-zig/manifest.json`'s `modules[]`, parsed with
+`std.json` in the build script at **configure** time. That is the one moment a
+Zig build script can read a file, so on a clean checkout — before any codegen
+has run — the list is empty and `module(name)` answers `null`: configure once
+after a `zig build codegen` and the names are there. `module_main` is unaffected,
+because `addExecutable` needs it before any manifest exists.
 
 Because the generated modules do not exist on a clean checkout, a caller rooting
 its own artifact at `module` must order it after the codegen step itself:
@@ -752,15 +769,36 @@ A host that is not Zig has no `rt.Value`, so the runtime also offers one
 bytes-level call:
 
 ```zig
-pub const Status = enum { ok, invalid };
+pub const Status = enum { ok, error };
+pub const Reader = struct { buf: []u8, len: usize = 0 };
 pub const Reply = struct { status: Status, bytes: []const u8 };
-pub fn callBytes(f: Value, in: []const u8) Reply
+pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply
+pub fn bytes(reply: Reply, out: *const Reader) []const u8
+pub fn callBytes(f: Value, in: []const u8) Reply   // = call(f, &.{in}, ...)
 ```
 
-`callBytes` takes a PureScript function value and an input slice and returns a
-status plus the output bytes. The caller never constructs an argument value and
-never applies a closure: decoding the input and encoding the result happen
-behind the boundary.
+`call` takes a PureScript function value, k input slices and a caller-owned
+out-sink, and returns a status. The caller never constructs an argument value
+and never applies a closure: decoding the inputs and encoding the result happen
+behind the boundary. `ins.len` is the arity — `0` (the value is the result, e.g.
+a `String`-valued constant), `1`, or `k`: the arguments are applied left to
+right, so `pair a b = a <> b` called with `{"ab", "cd"}` answers `abcd`.
+`callBytes` is the one-slice wrapper, unchanged for existing callers.
+
+A callee that is not applicable with that many arguments — an `Int`, or a
+two-argument function applied once — **panics** inside `rt.apply`. That is a bug
+in the Zig program linking the runtime, not input a consumer can supply, so
+there is no bytes-shaped answer to give. So does an `out.buf` too small for the
+result: the reply is never silently truncated.
+
+### `Status` is transport, never application meaning
+
+`ok` says the call crossed: the callee returned a `String`. `error` says it did
+not: the callee threw, or returned something that is not a `String`, and the
+reason is in `Reply.bytes`. **Neither status says what the bytes MEAN.** A reply
+of `"no"` is `ok`; an error reason is a message, not an error code. Whether a
+payload is valid, acceptable or meaningful is decided on the consumer's side of
+the boundary — purzig has no `validate` step and no domain.
 
 This is the entry point for a platform package, and it is **internal to them for
 now** — not a stable public surface. Typed wrappers (generated from the
@@ -774,19 +812,28 @@ every generated module decl `@"ps.<name>"` is a thunk `fn () rt.Error!rt.Value`
 and must be called (`try purs_main.@"ps.echo"()`) to obtain the `Value`.
 Applying that value to arguments is the runtime's job, not the caller's.
 
-**The returned bytes are allocated from the runtime's allocator and are never
-freed by us.** There is no `free`, no `deinit`, and no ownership transfer: the
-slice is valid for the life of the runtime, which on a native target is the
-process arena reclaimed at exit and on a freestanding one is whatever the host
-handed to `initAlloc`. A caller must copy the bytes if it needs them to outlive
-that, and must not assume a subsequent call reuses or invalidates the buffer.
+**Each input slice is copied into the runtime's allocator before the callee sees
+it**, so a caller may drop every buffer immediately after `call` returns; the
+callee is untyped and may keep what it is given. **`out.buf` is the caller's**:
+written, never freed, never retained. On success `out.buf[0..out.len]` is the
+result and `Reply.bytes` is empty; on `error`, `Reply.bytes` is a reason
+allocated the same way and valid for the life of the runtime, which on a native
+target is the process arena reclaimed at exit and on a freestanding one is
+whatever the host handed to `initAlloc`.
 
-`example/abi/abi_probe.zig` is the in-repo gate: it binds the thunk with
-`const f = try purs_main.@"ps.echo"();`, calls
-`rt.abi.callBytes(f, "hi")` and `zig build test-abi` asserts
-stdout is exactly `hi!`. The function lives in `Main` because `addLibrary`
-exposes only the module named by `main_module`; `main`'s own output is
-unchanged.
+Two in-repo gates, and the second is why `call` exists:
+
+- `example/abi/abi_probe.zig` binds `const f = try purs_main.@"ps.echo"();` and
+  calls `rt.abi.callBytes(f, "hi")`; `zig build test-abi` asserts stdout is
+  exactly `hi!`.
+- `example/abi/abi_multi.zig` obtains a **non-`Main`** module with
+  `lib.module("Api")`, binds `const f = try api.@"ps.pair"();` and calls
+  `rt.abi.call(f, &.{ "ab", "cd" }, &out)`; `zig build test-abi-multi` asserts
+  stdout is exactly `abcd`. Two buffers, a two-argument function and a module
+  that is not the entry — the three things a real consumer needs and
+  `callBytes` alone could not reach.
+
+`main`'s own output is unchanged by either: `Api` is a separate module.
 
 ### The manifest
 

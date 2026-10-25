@@ -91,24 +91,14 @@ pub const Artifacts = struct {
 /// What `addLibrary` hands back. No executable, no entry file, nothing
 /// installed: a caller compiles its own root against `module`.
 pub const LibraryArtifacts = struct {
+    // Zig requires every container FIELD before any DECLARATION, so the order
+    // below is: fields (`modules`, `codegen`, `runtime`, `module_main`), then
+    // `module`. Moving `module` up between two fields is exactly the error
+    // "declarations are not allowed between container fields".
+
     /// The generated modules of the package, keyed by PureScript module name
     /// (`main_module`, `Api`, `Data.Maybe`, ...) and owned by this struct.
     modules: Modules,
-
-    /// The Zig module for a generated PureScript module, `runtime` bound, or
-    /// `null` when the package has no module of that name.
-    ///
-    /// ```zig
-    /// const api = lib.module("Api") orelse @panic("no Api");
-    /// root.addImport("api", api);
-    /// ```
-    ///
-    /// Names come from `output-zig/manifest.json`'s `modules[]`, read at
-    /// configure time with `std.json` -- not hand-rolled, and not by globbing
-    /// `output-zig/`, which does not exist yet on a clean checkout.
-    pub fn module(self: LibraryArtifacts, name: []const u8) ?*std.Build.Module {
-        return self.modules.get(name);
-    }
 
     /// The `spago build` invocation, exactly as `Artifacts.codegen`. A caller
     /// rooting its own artifact at `module` has to order that artifact after
@@ -128,10 +118,26 @@ pub const LibraryArtifacts = struct {
     /// compiled PureScript module and nothing else -- no `main` decl, so a root
     /// that wants a program supplies its own.
     ///
-    /// The same module as `module(opts.main_module)`; kept as a field so
-    /// existing callers keep compiling. Null only if the package has no module
-    /// called `opts.main_module`, which `addCodegen` already panics on.
-    module_main: ?*std.Build.Module,
+    /// The same module as `module(opts.main_module)`, when the manifest already
+    /// lists it; kept as a field so existing callers keep compiling. Never
+    /// null: `addCodegen` always creates it, manifest or not, because
+    /// `addExecutable` needs it on a clean checkout before any manifest exists.
+    module_main: *std.Build.Module,
+
+    /// The Zig module for a generated PureScript module, `runtime` bound, or
+    /// `null` when the package has no module of that name.
+    ///
+    /// ```zig
+    /// const api = lib.module("Api") orelse @panic("no Api");
+    /// root.addImport("api", api);
+    /// ```
+    ///
+    /// Names come from `output-zig/manifest.json`'s `modules[]`, read at
+    /// configure time with `std.json` -- not hand-rolled, and not by globbing
+    /// `output-zig/`, which does not exist yet on a clean checkout.
+    pub fn module(self: LibraryArtifacts, name: []const u8) ?*std.Build.Module {
+        return self.modules.get(name);
+    }
 };
 
 /// Every generated module of one package, by PureScript module name. A flat
