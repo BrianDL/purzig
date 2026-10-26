@@ -780,7 +780,7 @@ A host that is not Zig has no `rt.Value`, so the runtime also offers one
 bytes-level call:
 
 ```zig
-pub const Status = enum { ok, error };
+pub const Status = enum { ok, failed };
 pub const Reader = struct { buf: []u8, len: usize = 0 };
 pub const Reply = struct { status: Status, bytes: []const u8 };
 pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply
@@ -804,10 +804,10 @@ result: the reply is never silently truncated.
 
 ### `Status` is transport, never application meaning
 
-`ok` says the call crossed: the callee returned a `String`. `error` says it did
+`ok` says the call crossed: the callee returned a `String`. `failed` says it did
 not: the callee threw, or returned something that is not a `String`, and the
 reason is in `Reply.bytes`. **Neither status says what the bytes MEAN.** A reply
-of `"no"` is `ok`; an error reason is a message, not an error code. Whether a
+of `"no"` is `ok`; a failure reason is a message, not an error code. Whether a
 payload is valid, acceptable or meaningful is decided on the consumer's side of
 the boundary — purzig has no `validate` step and no domain.
 
@@ -827,7 +827,7 @@ Applying that value to arguments is the runtime's job, not the caller's.
 it**, so a caller may drop every buffer immediately after `call` returns; the
 callee is untyped and may keep what it is given. **`out.buf` is the caller's**:
 written, never freed, never retained. On success `out.buf[0..out.len]` is the
-result and `Reply.bytes` is empty; on `error`, `Reply.bytes` is a reason
+result and `Reply.bytes` is empty; on `failed`, `Reply.bytes` is a reason
 allocated the same way and valid for the life of the runtime, which on a native
 target is the process arena reclaimed at exit and on a freestanding one is
 whatever the host handed to `initAlloc`.
