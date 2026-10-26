@@ -13,10 +13,10 @@
 //! ## Status is transport, never application meaning
 //!
 //! `Status.ok` says only that the call crossed: the callee returned a `String`
-//! and `Reply.bytes` is it. `Status.error` says the call did not cross: the
+//! and `Reply.bytes` is it. `Status.failed` says the call did not cross: the
 //! callee raised, or it returned something that is not a `String`. Neither
 //! status says anything about what the bytes SAY -- a reply of `"no"` is `ok`,
-//! and an error reason is not an error code. Whatever a consumer wants its
+//! and a failure reason is not an error code. Whatever a consumer wants its
 //! payload to mean, it decides on its side of the boundary. purzig does not
 //! know what "valid" is.
 //!
@@ -39,8 +39,8 @@
 //!
 //! ## Never a trap for callee-refused input
 //!
-//! Input the callee refuses is a RESULT, not a panic. `error` comes from exactly
-//! two things, and both leave a reason in `bytes`:
+//! Input the callee refuses is a RESULT, not a panic. `failed` comes from
+//! exactly two things, and both leave a reason in `bytes`:
 //!
 //! 1. the callee raised a PureScript exception (`Effect.Exception.throw`);
 //! 2. the callee returned something that is not a `String`.
@@ -61,8 +61,8 @@ const Value = value.Value;
 const Error = value.Error;
 
 /// How a call crossed. Transport only: `ok` means the callee produced a
-/// `String`, `error` means it did not. Neither says what the bytes MEAN.
-pub const Status = enum { ok, error };
+/// `String`, `failed` means it did not. Neither says what the bytes MEAN.
+pub const Status = enum { ok, failed };
 
 /// Where a successful call's bytes go: a caller-owned buffer and the length
 /// actually written, so `out.buf[0..out.len]` is the result.
@@ -73,19 +73,19 @@ pub const Status = enum { ok, error };
 /// its own uses; it just does not hand the result out that way.
 pub const Reader = struct { buf: []u8, len: usize = 0 };
 
-/// The bytes of `reply`: the buffer when `ok`, the reason when `error`.
+/// The bytes of `reply`: the buffer when `ok`, the reason when `failed`.
 /// The one place a caller should ask, so a status check cannot be forgotten.
 pub fn bytes(reply: Reply, out: *const Reader) []const u8 {
     return switch (reply.status) {
         .ok => out.buf[0..out.len],
-        .error => reply.bytes,
+        .failed => reply.bytes,
     };
 }
 
 pub const Reply = struct {
     status: Status,
     /// `ok`: empty -- the bytes are in the `Reader` that was passed in.
-    /// `error`: a human-readable reason, allocated from the runtime's
+    /// `failed`: a human-readable reason, allocated from the runtime's
     /// already-initialised allocator or a comptime literal; never freed here,
     /// valid for the life of the runtime.
     bytes: []const u8,
@@ -112,7 +112,7 @@ const returned_non_string = "PureScript function returned a non-String value";
 /// longer than `out.buf` panics -- see the module docs.
 ///
 /// Panics only when `f` is not applicable with `ins.len` arguments, or when
-/// `out.buf` cannot hold the result; every other failure is `Status.error`.
+/// `out.buf` cannot hold the result; every other failure is `Status.failed`.
 pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply {
     var current = f;
 
@@ -125,7 +125,7 @@ pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply {
             // `apply` fails only with `error.PsException`, which always carries
             // the thrown value in the runtime's side channel. Consuming it here
             // is what keeps a later catch from seeing a stale one.
-            return .{ .status = .error, .bytes = exceptionBytes(apply_mod.takeError()) };
+            return .{ .status = .failed, .bytes = exceptionBytes(apply_mod.takeError()) };
         };
     }
 
@@ -136,7 +136,7 @@ pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply {
             out.len = s.len;
             return .{ .status = .ok, .bytes = "" };
         },
-        else => .{ .status = .error, .bytes = returned_non_string },
+        else => .{ .status = .failed, .bytes = returned_non_string },
     };
 }
 
@@ -152,7 +152,7 @@ pub fn callBytes(f: Value, in: []const u8) Reply {
         @panic("runtime: out of memory");
     var out: Reader = .{ .buf = buf };
     const reply = call(f, &.{in}, &out);
-    if (reply.status == .error) return reply;
+    if (reply.status == .failed) return reply;
     // Re-point at the runtime's copy so the returned slice outlives `buf`'s
     // role as a plain buffer: `ok` always answers with allocated bytes here.
     return .{ .status = .ok, .bytes = copyOf(out.buf[0..out.len]) };
@@ -163,7 +163,7 @@ pub fn callBytes(f: Value, in: []const u8) Reply {
 const callBytes_buffer = 64 * 1024;
 
 /// A thrown `String` is the callee's own reason, so report it verbatim -- copied
-/// into the runtime allocator, so an `error` reply obeys the same lifetime rule
+/// into the runtime allocator, so a `failed` reply obeys the same lifetime rule
 /// as an `ok` one. Anything else has no bytes to report, so say that instead of
 /// inventing a rendering for arbitrary `Value`s.
 fn exceptionBytes(err: Value) []const u8 {
@@ -271,7 +271,7 @@ test "call answers ok: one argument, two arguments, zero arguments" {
     try std.testing.expectEqualStrings("hi!", bytes(constant, &zero));
 }
 
-test "call answers error when the callee throws" {
+test "call answers failed when the callee throws" {
     var buffer: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buffer);
     apply_mod.initAlloc(fba.allocator());
@@ -281,17 +281,17 @@ test "call answers error when the callee throws" {
     // A thrown String is reported verbatim.
     var one: Reader = .{ .buf = &out_buf };
     const thrown = call(Value.mkClosure(throwStringBody, value.no_env), &.{"in"}, &one);
-    try std.testing.expectEqual(Status.error, thrown.status);
+    try std.testing.expectEqual(Status.failed, thrown.status);
     try std.testing.expectEqualStrings("rejected", thrown.bytes);
 
-    // A thrown non-String still answers error, with a fixed reason.
+    // A thrown non-String still answers failed, with a fixed reason.
     var two: Reader = .{ .buf = &out_buf };
     const other = call(Value.mkClosure(throwIntBody, value.no_env), &.{"in"}, &two);
-    try std.testing.expectEqual(Status.error, other.status);
+    try std.testing.expectEqual(Status.failed, other.status);
     try std.testing.expectEqualStrings(threw_non_string, other.bytes);
 }
 
-test "call answers error when the callee returns a non-String" {
+test "call answers failed when the callee returns a non-String" {
     var buffer: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buffer);
     apply_mod.initAlloc(fba.allocator());
@@ -299,7 +299,7 @@ test "call answers error when the callee returns a non-String" {
     var out_buf: [256]u8 = undefined;
     var out: Reader = .{ .buf = &out_buf };
     const reply = call(Value.mkClosure(intBody, value.no_env), &.{"in"}, &out);
-    try std.testing.expectEqual(Status.error, reply.status);
+    try std.testing.expectEqual(Status.failed, reply.status);
     try std.testing.expectEqualStrings(returned_non_string, reply.bytes);
 }
 
@@ -357,8 +357,8 @@ test "callBytes is call with one buffer" {
     try std.testing.expectEqual(Status.ok, reply.status);
     try std.testing.expectEqualStrings("hello", reply.bytes);
 
-    // An error passes through unchanged: same reason, same status.
+    // A failure passes through unchanged: same reason, same status.
     const refused = callBytes(Value.mkClosure(intBody, value.no_env), "in");
-    try std.testing.expectEqual(Status.error, refused.status);
+    try std.testing.expectEqual(Status.failed, refused.status);
     try std.testing.expectEqualStrings(returned_non_string, refused.bytes);
 }

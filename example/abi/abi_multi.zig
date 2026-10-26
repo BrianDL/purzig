@@ -41,11 +41,11 @@ pub fn main(init: rt.ProcessInit) !void {
 
     const reply = rt.abi.call(f, &.{ "ab", "cd" }, &out);
     switch (reply.status) {
-        // Transport said the call crossed; the bytes are ours.
-        .ok => rt.writeLine(rt.abi.bytes(reply, &out)),
+        // Transport said the call crossed; the bytes are in our Reader.
+        .ok => rt.writeLine(out.buf[0..out.len]),
         // Transport said it did not cross: `reply.bytes` is the reason. A
         // fixture cannot fail this way, but the branch keeps the status
         // impossible to ignore.
-        .error => rt.writeLineErr(reply.bytes),
+        .failed => rt.writeLineErr(reply.bytes),
     }
 }
