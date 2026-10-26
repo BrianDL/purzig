@@ -175,8 +175,8 @@ fn exceptionBytes(err: Value) []const u8 {
 
 /// Copy bytes into the runtime's allocator. The only allocation this file
 /// makes besides `callBytes`'s fixed buffer.
-fn copyOf(bytes: []const u8) []const u8 {
-    const out = apply_mod.alloc().dupe(u8, bytes) catch
+fn copyOf(src: []const u8) []const u8 {
+    const out = apply_mod.alloc().dupe(u8, src) catch
         @panic("runtime: out of memory");
     return out;
 }

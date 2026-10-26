@@ -122,3 +122,4 @@ What was actually checked, statically:
 zig build test-runtime && zig build test-abi && zig build test-abi-multi && zig build test-library \
   && zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
 ```
+Parameter `bytes` in `copyOf` was renamed to `src` to avoid shadowing `pub fn bytes`; nothing was compiled.
