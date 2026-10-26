@@ -33,8 +33,10 @@
 //!      That module is `LibraryArtifacts.module`, and it is the module
 //!      `addExecutable` imports under the fixed name `purs_main`. Every OTHER
 //!      module the run emitted is reachable the same way through
-//!      `LibraryArtifacts.module(name)`, with the name taken from the manifest's
-//!      `modules[]` (see `LibraryArtifacts`).
+//!      `LibraryArtifacts.module(name)`, for the names the caller listed in
+//!      `Options.extra_modules` (see `LibraryArtifacts`). Names are supplied,
+//!      not discovered: Zig 0.16 has no build-script filesystem, so nothing is
+//!      read at configure time.
 //!
 //! Only `addExecutable` goes further: it writes the entry text (a file shipped
 //! in this package, `entry/entry.zig`, embedded at build-script compile time)
@@ -62,6 +64,19 @@ pub const Options = struct {
     /// import, under whatever name the importing root chooses -- `purs_main` in
     /// the entry.
     main_module: []const u8 = "Main",
+
+    /// `addLibrary` only: further PureScript modules of the package to expose
+    /// by name through `LibraryArtifacts.module(name)`, on top of
+    /// `main_module`. `Example`: `&.{ "Api", "Data.Maybe" }`.
+    ///
+    /// Explicit, because the build script must not read `output-zig/` at
+    /// configure time: Zig 0.16 removed `std.fs.cwd()`, so there is no
+    /// supported way for a build script to read a generated file, and a
+    /// configure-time read of a codegen output is a race anyway. A name whose
+    /// file does not exist is a COMPILE error when something compiles the
+    /// module, which is both later and more accurate. `addExecutable` ignores
+    /// this field.
+    extra_modules: []const []const u8 = &.{},
 
     /// Directory containing `spago.yaml`. Defaults to the build root.
     project: ?std.Build.LazyPath = null,
@@ -118,31 +133,37 @@ pub const LibraryArtifacts = struct {
     /// compiled PureScript module and nothing else -- no `main` decl, so a root
     /// that wants a program supplies its own.
     ///
-    /// The same module as `module(opts.main_module)`, when the manifest already
-    /// lists it; kept as a field so existing callers keep compiling. Never
-    /// null: `addCodegen` always creates it, manifest or not, because
-    /// `addExecutable` needs it on a clean checkout before any manifest exists.
+    /// Kept as a field, not looked up by name, so existing callers (and
+    /// `addExecutable`, which needs it before any module list exists) compile
+    /// unchanged. Never null, and always over `opts.main_module`, whether or
+    /// not that name also appears in `extra_modules`.
     module_main: *std.Build.Module,
 
-    /// The Zig module for a generated PureScript module, `runtime` bound, or
-    /// `null` when the package has no module of that name.
+    /// The Zig module over `output-zig/<name>.zig` with `runtime` bound. A
+    /// `name` not listed in `Options.extra_modules` is a caller bug and panics
+    /// at configure time -- callers only ever ask for names they listed.
     ///
     /// ```zig
-    /// const api = lib.module("Api") orelse @panic("no Api");
+    /// const lib = purzig.addLibrary(b, .{ ..., extra_modules = &.{"Api"} });
+    /// const api = lib.module("Api");
     /// root.addImport("api", api);
     /// ```
     ///
-    /// Names come from `output-zig/manifest.json`'s `modules[]`, read at
-    /// configure time with `std.json` -- not hand-rolled, and not by globbing
-    /// `output-zig/`, which does not exist yet on a clean checkout.
-    pub fn module(self: LibraryArtifacts, name: []const u8) ?*std.Build.Module {
-        return self.modules.get(name);
+    /// The file is resolved when the build RUNS, so a listed name that no
+    /// codegen produced fails at compile time with a missing-file error -- not
+    /// here, and not as a wrong build. That is why the names are supplied
+    /// rather than discovered.
+    pub fn module(self: LibraryArtifacts, name: []const u8) *std.Build.Module {
+        return self.modules.get(name) orelse @panic("purzig: module not listed in Options.extra_modules");
     }
 };
 
-/// Every generated module of one package, by PureScript module name. A flat
-/// list rather than a map: a package has tens of modules, lookups happen once
-/// per consumer at configure time, and a list keeps the type printable.
+/// The modules the caller asked for, by PureScript module name. A flat list
+/// rather than a map: a package has tens of modules, lookups happen once per
+/// consumer at configure time, and a list keeps the type printable.
+///
+/// The names are `Options.extra_modules` verbatim -- nothing is discovered, so
+/// nothing can disagree with what the codegen will emit.
 pub const Modules = struct {
     names: []const []const u8,
     mods: []const *std.Build.Module,
@@ -252,21 +273,15 @@ fn addCodegen(b: *std.Build, opts: Options) Codegen {
 
     // ---- 3. the generated modules ----------------------------------------
 
-    // Every module the run emitted, by PureScript module name, from the
-    // manifest's `modules[]`. `std.json`, not a hand-rolled scan: the manifest
-    // is the backend's contract and its rows carry strings with escapes
-    // (`Data.Maybe`), so a real parser is both shorter and less likely to be
-    // wrong. It is read when the build SCRIPT configures, in purzig's own
-    // builder `pb` -- not when the user's build runs.
-    //
-    // A missing manifest means no codegen has run yet, so the names are not
-    // known: the list is empty and `module(name)` answers null until the next
-    // configure. `main` (below) is still created, because `addExecutable`
-    // needs it on a clean checkout before any manifest exists.
-    const names = readModuleNames(b, project) orelse &.{};
-
-    const mods = b.allocator.alloc(*std.Build.Module, names.len) catch @panic("purzig: out of memory");
-    for (names, 0..) |name, i| mods[i] = moduleFor(b, project, opts, runtime, name);
+    // No generated file is read here. Zig 0.16 has no build-script filesystem
+    // (`std.fs.cwd()` is gone), so module names cannot be discovered at
+    // configure time; the caller names them in `opts.extra_modules`. Creating
+    // a module never touches the generated sources, so a missing file is a
+    // compile error where the module is actually compiled -- never a
+    // build-script one.
+    const mods = b.allocator.alloc(*std.Build.Module, opts.extra_modules.len) catch
+        @panic("purzig: out of memory");
+    for (opts.extra_modules, 0..) |name, i| mods[i] = moduleFor(b, project, opts, runtime, name);
 
     const main = moduleFor(b, project, opts, runtime, opts.main_module);
 
@@ -274,7 +289,7 @@ fn addCodegen(b: *std.Build, opts: Options) Codegen {
         .codegen = codegen,
         .runtime = runtime,
         .main = main,
-        .modules = .{ .names = names, .mods = mods },
+        .modules = .{ .names = opts.extra_modules, .mods = mods },
     };
 }
 
@@ -297,47 +312,6 @@ fn moduleFor(
     });
     m.addImport("runtime", runtime);
     return m;
-}
-
-/// The `modules[]` names from `<project>/output-zig/manifest.json`, or null
-/// when the file is not there (nothing has run codegen yet).
-///
-/// Read at the moment this build script is CONFIGURED, which is the only moment
-/// a Zig build script can read a file. A manifest written by a later codegen
-/// run is therefore not seen until the next configure -- true of any
-/// configure-time read of a generated file. That is also why the file is only
-/// ever read for the module NAMES: a stale name can at worst name a file that
-/// does not exist, and the compile says so.
-fn readModuleNames(
-    b: *std.Build,
-    project: std.Build.LazyPath,
-) ?[]const []const u8 {
-    const manifest = std.fs.path.join(b.allocator, &.{
-        project.getPath(b), "output-zig", "manifest.json",
-    }) catch @panic("purzig: out of memory");
-
-    const text = std.fs.cwd().readFileAlloc(
-        b.allocator,
-        manifest,
-        8 * 1024 * 1024,
-    ) catch return null;
-
-    const Manifest = struct {
-        modules: []const struct { name: []const u8 } = &.{},
-    };
-
-    // `std.json`, not a hand-rolled scan: the rows carry strings (`Data.Maybe`)
-    // and the shape is the backend's to change, so a real parser is shorter and
-    // tells us when it disagrees. Unknown keys (`main_module`, `main_export`,
-    // `file`, `ffi`) are ignored: the helper needs the names only.
-    const parsed = std.json.parseFromSlice(Manifest, b.allocator, text, .{
-        .ignore_unknown_fields = true,
-    }) catch @panic("purzig: output-zig/manifest.json is not valid JSON");
-
-    const names = b.allocator.alloc([]const u8, parsed.value.modules.len) catch
-        @panic("purzig: out of memory");
-    for (parsed.value.modules, 0..) |row, i| names[i] = row.name;
-    return names;
 }
 
 pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {

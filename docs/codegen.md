@@ -738,21 +738,32 @@ a test harness, a wasm host, or nothing at all. Nothing is written outside the
 build cache, so a library-only build leaves `output-zig/` holding modules and
 `manifest.json` and no `purzig_entry.zig`.
 
-`module(name)` is the same thing for **any** emitted module, keyed by PureScript
+`module(name)` is the same thing for **any other** module, keyed by PureScript
 module name (`"Api"`, `"Data.Maybe"`, ...), so a consumer whose exports are not
-in `Main` names the module it wants instead of moving code into `Main`:
+in `Main` names the module it wants instead of moving code into `Main`. The name
+has to be **declared**, in `Options.extra_modules`:
 
 ```zig
-const api = lib.module("Api") orelse @panic("no Api module");
+const lib = purzig.addLibrary(b, .{ ..., extra_modules = &.{"Api"} });
+const api = lib.module("Api");
 root.addImport("api", api);
 ```
 
-The names come from `output-zig/manifest.json`'s `modules[]`, parsed with
-`std.json` in the build script at **configure** time. That is the one moment a
-Zig build script can read a file, so on a clean checkout — before any codegen
-has run — the list is empty and `module(name)` answers `null`: configure once
-after a `zig build codegen` and the names are there. `module_main` is unaffected,
-because `addExecutable` needs it before any manifest exists.
+Nothing is discovered, and nothing is parsed: `build/purzig.zig` reads no file
+at configure time. It cannot — Zig 0.16 removed `std.fs.cwd()`, and a build
+script has no convenient `Io`, so there is no supported way to read a generated
+`manifest.json` from a build script. That is not a limitation to work around; a
+configure-time read of a codegen output was a race anyway (the manifest may be
+written by a *later* run, so the names were those of the previous build). An
+explicit list is both simpler to keep correct and always matches what the caller
+actually imports.
+
+A listed name creates a module over `output-zig/<Name>.zig` with `runtime` bound;
+the file need not exist yet, because creating a module reads nothing — Zig
+resolves it when the build runs. A listed name that no codegen emitted therefore
+fails as a missing root source file at compile time, with the caller's own import
+chain, rather than as a build-script error. `module_main` is unaffected and is
+still always created.
 
 Because the generated modules do not exist on a clean checkout, a caller rooting
 its own artifact at `module` must order it after the codegen step itself:
@@ -769,7 +780,7 @@ A host that is not Zig has no `rt.Value`, so the runtime also offers one
 bytes-level call:
 
 ```zig
-pub const Status = enum { ok, error };
+pub const Status = enum { ok, failed };
 pub const Reader = struct { buf: []u8, len: usize = 0 };
 pub const Reply = struct { status: Status, bytes: []const u8 };
 pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply
@@ -793,10 +804,10 @@ result: the reply is never silently truncated.
 
 ### `Status` is transport, never application meaning
 
-`ok` says the call crossed: the callee returned a `String`. `error` says it did
+`ok` says the call crossed: the callee returned a `String`. `failed` says it did
 not: the callee threw, or returned something that is not a `String`, and the
 reason is in `Reply.bytes`. **Neither status says what the bytes MEAN.** A reply
-of `"no"` is `ok`; an error reason is a message, not an error code. Whether a
+of `"no"` is `ok`; a failure reason is a message, not an error code. Whether a
 payload is valid, acceptable or meaningful is decided on the consumer's side of
 the boundary — purzig has no `validate` step and no domain.
 
@@ -816,7 +827,7 @@ Applying that value to arguments is the runtime's job, not the caller's.
 it**, so a caller may drop every buffer immediately after `call` returns; the
 callee is untyped and may keep what it is given. **`out.buf` is the caller's**:
 written, never freed, never retained. On success `out.buf[0..out.len]` is the
-result and `Reply.bytes` is empty; on `error`, `Reply.bytes` is a reason
+result and `Reply.bytes` is empty; on `failed`, `Reply.bytes` is a reason
 allocated the same way and valid for the life of the runtime, which on a native
 target is the process arena reclaimed at exit and on a freestanding one is
 whatever the host handed to `initAlloc`.
