@@ -183,7 +183,14 @@ pub fn build(b: *std.Build) void {
     // in `Main` is involved, and `test-abi` above is untouched.
     // -----------------------------------------------------------------
 
-    const multi_lib = purzig.addLibrary(b, opts);
+    const multi_lib = purzig.addLibrary(b, .{
+        .name = opts.name,
+        .main_module = opts.main_module,
+        .extra_modules = &.{"Api"},
+        .project = opts.project,
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Same ordering as the other library-shaped runs: the bundle first, then
     // behind the program's codegen, because all of them run `spago build` in
@@ -191,22 +198,11 @@ pub fn build(b: *std.Build) void {
     multi_lib.codegen.step.dependOn(&build_compiler.step);
     multi_lib.codegen.step.dependOn(&app.codegen.step);
 
-    // The consumer-side lookup: `Api` by PureScript module name, from the
-    // manifest's `modules[]`. Configure-time, so the FIRST configure of a clean
-    // checkout -- before `spago build` has ever written a manifest -- sees an
-    // empty list. Rather than panic there, fall back to the one path the
-    // convention guarantees: `output-zig/<Name>.zig`, with the runtime bound.
-    // A wrong name then fails as a missing file at compile time, which is the
-    // same error the manifest branch would eventually give.
-    const api_module = multi_lib.module("Api") orelse blk: {
-        const m = b.createModule(.{
-            .root_source_file = b.path("example/output-zig/Api.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        m.addImport("runtime", multi_lib.runtime);
-        break :blk m;
-    };
+    // The consumer-side lookup: `Api` by PureScript module name, over
+    // `output-zig/Api.zig` with the runtime already bound. The name is
+    // declared in `extra_modules` -- the build script reads nothing at
+    // configure time, so a module is a name it was told, not one it found.
+    const api_module = multi_lib.module("Api");
 
     const multi_root = b.createModule(.{
         .root_source_file = b.path("example/abi/abi_multi.zig"),
