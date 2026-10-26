@@ -118,7 +118,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib_root.addImport("runtime", lib.runtime);
-    lib_root.addImport("purs_main", lib.module);
+    lib_root.addImport("purs_main", lib.module_main);
 
     const lib_probe = b.addExecutable(.{
         .name = "library-probe",
@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    abi_root.addImport("purs_main", abi_lib.module);
+    abi_root.addImport("purs_main", abi_lib.module_main);
     abi_root.addImport("runtime", abi_lib.runtime);
 
     const abi_probe = b.addExecutable(.{
@@ -174,6 +174,57 @@ pub fn build(b: *std.Build) void {
     const abi_step = b.step("test-abi", "Call a compiled PureScript function through the byte ABI and check the output");
     abi_step.dependOn(&check_abi.step);
 
+    // -----------------------------------------------------------------
+    // The byte ABI with k arguments, from a non-`Main` module (issue #21).
+    //
+    // Same codegen, but the root asks `addLibrary` for the `Api` module BY
+    // NAME -- the module lookup half of #21 -- and calls `ps.pair`, a
+    // TWO-argument function, through `rt.abi.call` with two buffers. Nothing
+    // in `Main` is involved, and `test-abi` above is untouched.
+    // -----------------------------------------------------------------
+
+    const multi_lib = purzig.addLibrary(b, .{
+        .name = opts.name,
+        .main_module = opts.main_module,
+        .extra_modules = &.{"Api"},
+        .project = opts.project,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Same ordering as the other library-shaped runs: the bundle first, then
+    // behind the program's codegen, because all of them run `spago build` in
+    // the one `example/` project directory.
+    multi_lib.codegen.step.dependOn(&build_compiler.step);
+    multi_lib.codegen.step.dependOn(&app.codegen.step);
+
+    // The consumer-side lookup: `Api` by PureScript module name, over
+    // `output-zig/Api.zig` with the runtime already bound. The name is
+    // declared in `extra_modules` -- the build script reads nothing at
+    // configure time, so a module is a name it was told, not one it found.
+    const api_module = multi_lib.module("Api");
+
+    const multi_root = b.createModule(.{
+        .root_source_file = b.path("example/abi/abi_multi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    multi_root.addImport("api", api_module);
+    multi_root.addImport("runtime", multi_lib.runtime);
+
+    const multi_probe = b.addExecutable(.{
+        .name = "abi-multi-probe",
+        .root_module = multi_root,
+    });
+    multi_probe.step.dependOn(&multi_lib.codegen.step);
+
+    // Not installed: it is a check, not an artifact.
+    const check_multi = b.addRunArtifact(multi_probe);
+    check_multi.expectStdOutEqual("abcd\n");
+
+    const multi_step = b.step("test-abi-multi", "Call a two-argument function in a non-Main module through the byte ABI");
+    multi_step.dependOn(&check_multi.step);
+
     const run_runtime_tests = purzig.addRuntimeTests(b, opts);
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
@@ -183,6 +234,7 @@ pub fn build(b: *std.Build) void {
     all_tests.dependOn(&check_generated.step);
     all_tests.dependOn(&check_library.step);
     all_tests.dependOn(&check_abi.step);
+    all_tests.dependOn(&check_multi.step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,
