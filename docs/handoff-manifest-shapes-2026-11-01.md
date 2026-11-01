@@ -607,3 +607,5 @@ resolve the type's single field. If that ever becomes too loose, the alternative
 is to restore the `"newtype"` refusal — a one-line change in `adtShape` — but it
 should be a vocabulary decision, not a decoder accident, which is why it is
 called out here.
+
+**Repair (later the same day, guards) — 12 guard alternatives corrected:** every alternative of `classifyWord` (all twelve: the `"value"` one, `isDataWord`/`isNewtypeWord`, every string comparison, and the final `otherwise`) was written `| cond -> expr` and has been changed to `| cond = expr`, order/conditions/results untouched; a whole-file scan for `^\s*|.*->` now finds none (the only remaining `|`-with-`->` in `compiler/src/` is `Zig/Emit.purs:590-592`, which is a guard on a `case` arm — legal PureScript, deliberately not changed), and the build is **UNVERIFIED locally** (no `purs`, `spago`, `node` or `zig` was run).

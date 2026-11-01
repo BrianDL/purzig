@@ -213,18 +213,18 @@ markerWord json = case asString json of
 
 classifyWord :: String -> Kind
 classifyWord s
-  | s == "value" -> KValue
-  | isDataWord s -> KData
-  | isNewtypeWord s -> KNewtype
-  | s == "typeSynonym" -> KSynonym
-  | s == "synonym" -> KSynonym
-  | s == "type" -> KSynonym
-  | s == "externData" -> KForeign
-  | s == "externDataDeclaration" -> KForeign
-  | s == "foreignData" -> KForeign
-  | s == "typeClass" -> KClass
-  | s == "class" -> KClass
-  | otherwise -> KOther
+  | s == "value" = KValue
+  | isDataWord s = KData
+  | isNewtypeWord s = KNewtype
+  | s == "typeSynonym" = KSynonym
+  | s == "synonym" = KSynonym
+  | s == "type" = KSynonym
+  | s == "externData" = KForeign
+  | s == "externDataDeclaration" = KForeign
+  | s == "foreignData" = KForeign
+  | s == "typeClass" = KClass
+  | s == "class" = KClass
+  | otherwise = KOther
 
 -- | A `data` declaration may carry its newtype-ness in a second field, and a
 -- | `foreign import data` its foreignness: one `data` marker covers all three,
