@@ -250,3 +250,125 @@ manifest emits still says `"module"` — the label is chosen in `renderExport`.
 | `std.mem.indexOf`, `std.debug.print`, `@embedFile` relative to the containing file | Zig stdlib/`@embedFile` behaviour as documented; **not compiled here** |
 | `Data.Argonaut.Core (caseJson, toArray)`, `Data.Argonaut.Decode (getField)` | `caseJson`/`toArray` are present in `compiler/dist/bundle.js` (used by the CoreFn decoder); `getField` and the `DecodeJson` class are argonaut-codecs' documented surface with a local `DecodeJson Raw` instance so no `DecodeJson Json` instance is needed. `toString`/`toObject` were deliberately NOT used: they are not in the bundle, so `asString` and `field` are spelled through `caseJson` instead |
 | `Data.Array (uncons, index, slice, elem, mapMaybe, catMaybes, null)`, `Data.String.CodeUnits (toCharArray, fromCharArray, charAt)`, `Data.String (split, joinWith, Pattern(..))` | signatures read from the vendored packages in `packages/` |
+
+## 8. Repair (same day): `oneArg` was out of scope in `conShape` — `compiler/` did not compile
+
+Measured on the purzig worker, **not by me** (this container has no `purs`,
+`spago`, `node` or `zig`, and the job forbids installing them), by running
+`spago build` in `compiler/`:
+
+```
+[WARNING 1/1 UnusedName] src/Zig/Abi.purs:763:3
+  763  oneArg f = case args of
+  764    [ inner ] -> f inner
+  765    _ -> SRefused "unsupported type"
+  Name oneArg was introduced but not used.
+  in value declaration conShape
+
+[ERROR 1/1 UnknownName] src/Zig/Abi.purs:757:26
+  757  | conName == "Array" = oneArg (\inner -> SArray (shapeOf table modName pos inner))
+                              ^^^^^^
+  Unknown value oneArg
+```
+
+The two diagnostics together say the local was bound where nothing could see it
+and used where nothing was bound: `conShape` was a **guarded** declaration, and
+a `where` clause hanging off a guarded declaration does not put its bindings in
+scope for the guards' right-hand sides. (This is the same failure class the
+job warned about: a `where` on a guard/arm is not visible to a sibling guard.)
+
+### Where `oneArg` lives now
+
+`compiler/src/Zig/Abi.purs`, **inside `conShape`'s own `where` clause, at two
+spaces — the same binding group as the branches that call it**, defined exactly
+once (it was not renamed, duplicated or inlined):
+
+```purescript
+conShape :: Array TypeEntry -> String -> Pos -> String -> String -> Array Ty -> Shape
+conShape table modName pos conMod conName args = case conName of
+  "Int" -> SInt
+  ...
+  "Array" -> oneArg (\inner -> SArray (shapeOf table modName pos inner))
+  "Record" -> oneArg (\inner -> shapeOf table modName pos inner)
+  "Function" -> arrowRefusal pos
+  "Effect" -> oneArg (\_ -> effectShape pos)
+  _ -> adtShape table modName conMod conName args
+  where
+  -- `Array a` / `Record row` / `Effect a` all take exactly one argument; any
+  -- other arity for them is unrepresentable in the vocabulary.
+  oneArg f = case args of
+    [ inner ] -> f inner
+    _ -> SRefused "unsupported type"
+```
+
+### Why that scope makes it visible
+
+The `where` is no longer attached to a guard chain; it is attached to the
+function's *plain* right-hand side, `case conName of …`. A `where` on a plain
+binding scopes over that entire right-hand side — every case arm included — so
+each arm that calls `oneArg` is inside the scope that binds it. This is not a
+new idiom invented for the repair: the same file already relies on it in
+`exportsForOne`, whose `where`-bound `refusedAll` is called from two `case`
+arms, and in `signature`/`pRow`/`stripPrefixChars`/`exportsFor`, and the measured
+build reported **no** error or warning about any of those.
+
+The dispatch itself is unchanged in meaning: the guard chain was an ordered list
+of `conName == "…"` tests ending in `otherwise`; the case is the same ordered
+list of string-literal patterns ending in `_`. The vocabulary
+(`SInt`/`SNumber`/`SBoolean`/`SChar`/`SString`/`SUnit`/`SArray`/`SRecord`/
+`SAdt`/`SRefused`), every refusal reason string, the width-agnostic `"int"`
+rendering and the manifest encoding are **byte-identical**. This is a scope fix
+only; no shape, no reason string, no encoding changed.
+
+String-literal patterns are proven in this repository, not assumed:
+`example/src/Scratch.purs` has `label "circle" = 1` / `label "rect" = 2`, which
+the in-tree backend compiles (that fixture is what `test-e2e` runs).
+
+### Other guards audited for the same mistake
+
+Rule applied: a helper referenced from a guard must come from an enclosing
+scope, never from a sibling arm's `where`.
+
+- The only guarded declaration in `compiler/src/Zig/Abi.purs` that referenced a
+  *local* helper was `conShape` (`oneArg`). After the repair it has no guards.
+- `classifyKind` still uses guards (`Just s | s == "value" -> KValue`), but it
+  references only its own binder `s` and top-level constructors — there is no
+  `where` involved, so there is nothing to be out of scope.
+- Every remaining `where` in the file (`pRow`: `go`; `stripPrefixChars`: `go`;
+  `exportsFor`: `table`; `exportsForOne`: `refusedAll`; `signature`: `go`;
+  `conShape`: `oneArg`) is attached to a plain binding and each local is used
+  only inside its owner's right-hand side.
+- No name was removed from an import list, so no new `UnusedName` warning was
+  introduced by this repair; the `oneArg` warning disappears with the error
+  because the binding now has a caller in scope.
+- `Zig/Emit.purs`'s guard at :590 was checked and is outside this change: it
+  is a guard on a `case` arm with no `where` of its own, and it references only
+  `unwrap m`, `ctx` and `st`, all bound in enclosing scopes.
+
+### Files touched by the repair
+
+- `compiler/src/Zig/Abi.purs` — `conShape` only (plus its doc comment).
+- `docs/handoff-manifest-shapes-2026-11-01.md` — this section.
+
+Nothing else: `runtime/**`, `example/**`, `build.zig`, `compiler/src/Main.purs`,
+`docs/codegen.md` were **not** touched by the repair — no change there was
+required by a scope fix inside `conShape`.
+
+### Verification status
+
+**The compiler build is UNVERIFIED locally.** I did not run `spago build`,
+`spago bundle`, `zig build`, `purs`, `node` or any container; I claim nothing
+that I ran. What was done instead:
+
+| Check | How, without building |
+|---|---|
+| `oneArg` has exactly one definition and at least one in-scope use | read the edited region; `grep -n oneArg` returns one definition and three call sites, all inside the `case` arms the `where` covers |
+| the scope rule relied on is the one purs obeys here | `exportsForOne`/`refusedAll` in the same file is the identical construct and drew no diagnostic from the measured build |
+| string-literal patterns are legal PureScript | `example/src/Scratch.purs`'s `label "circle" = 1`, compiled by this repo's own fixture set |
+| no vocabulary / refusal string / encoding change | `git diff -- compiler/src/Zig/Abi.purs` touches only the `conShape` block; `renderShape` is untouched |
+| indentation matches the file's style (`where` at 2 spaces, locals at 2) | same shape as `signature`/`pRow`/`exportsFor` |
+
+All acceptance criteria in §6 remain **UNVERIFIED** for the same reason: there
+is no toolchain in this container. The one thing this repair is *for* — that
+`spago build` in `compiler/` gets past `Unknown value oneArg` — must be
+re-measured on the purzig worker.

@@ -745,21 +745,31 @@ recordShape table modName pos fields closed =
 -- | A named type. The primitives are matched by NAME, because they arrive as
 -- | `Prim.Int` from the AST and as bare `Int` from source text; everything else
 -- | is a nominal type, classified from its own declaration.
+-- |
+-- | The dispatch is a `case` on the constructor name rather than a guard chain
+-- | on purpose: a `where` clause attached to a GUARDED declaration does not put
+-- | its bindings in scope for the guards' right-hand sides (the compiler reports
+-- | the local as "introduced but not used" where it is defined and "unknown
+-- | value" where it is called). With a plain right-hand side the `where` covers
+-- | the whole body, case arms included, so `oneArg` below is visible to every
+-- | branch that calls it.
 conShape :: Array TypeEntry -> String -> Pos -> String -> String -> Array Ty -> Shape
-conShape table modName pos conMod conName args
-  | conName == "Int" = SInt
-  | conName == "Number" = SNumber
-  | conName == "Boolean" = SBoolean
-  | conName == "Char" = SChar
-  | conName == "String" = SString
-  | conName == "Unit" = SUnit
-  | conName == "Foreign" = SRefused "foreign type"
-  | conName == "Array" = oneArg (\inner -> SArray (shapeOf table modName pos inner))
-  | conName == "Record" = oneArg (\inner -> shapeOf table modName pos inner)
-  | conName == "Function" = arrowRefusal pos
-  | conName == "Effect" = oneArg (\_ -> effectShape pos)
-  | otherwise = adtShape table modName conMod conName args
+conShape table modName pos conMod conName args = case conName of
+  "Int" -> SInt
+  "Number" -> SNumber
+  "Boolean" -> SBoolean
+  "Char" -> SChar
+  "String" -> SString
+  "Unit" -> SUnit
+  "Foreign" -> SRefused "foreign type"
+  "Array" -> oneArg (\inner -> SArray (shapeOf table modName pos inner))
+  "Record" -> oneArg (\inner -> shapeOf table modName pos inner)
+  "Function" -> arrowRefusal pos
+  "Effect" -> oneArg (\_ -> effectShape pos)
+  _ -> adtShape table modName conMod conName args
   where
+  -- `Array a` / `Record row` / `Effect a` all take exactly one argument; any
+  -- other arity for them is unrepresentable in the vocabulary.
   oneArg f = case args of
     [ inner ] -> f inner
     _ -> SRefused "unsupported type"
