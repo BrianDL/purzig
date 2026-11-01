@@ -43,6 +43,7 @@ pub const io = apply_mod.io;
 pub const apply = apply_mod.apply;
 pub const apply2 = apply_mod.apply2;
 pub const apply3 = apply_mod.apply3;
+pub const applyN = apply_mod.applyN;
 pub const runEffect = apply_mod.runEffect;
 pub const copyValues = apply_mod.copyValues;
 pub const copyFields = apply_mod.copyFields;
