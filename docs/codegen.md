@@ -20,7 +20,13 @@ purs compile --codegen corefn
         -> Zig.Emit                        (this spec)
     output-zig/<Module>.zig                (modules only)
     output-zig/<Module>.ffi.zig            (only where there are foreign imports)
-    output-zig/manifest.json               (what the run wrote)
+    output-zig/manifest.json               (what the run wrote, plus export shapes)
+
+Two inputs come from purs, not one. `corefn.json` is what the emitter compiles;
+`output/<Module>/docs.json` is the ONLY place a type survives, because CoreFn
+annotations are `{meta, sourceSpan}` and nothing else. `Zig.Abi` reads the docs
+and `Main` writes the result into the manifest as `exports` — see "Typed
+exports" below.
 ```
 
 The backend consumes `purescript-backend-optimizer`, not CoreFn directly.
@@ -857,6 +863,9 @@ Two in-repo gates, and the second is why `call` exists:
   "modules": [
     { "name": "Main", "file": "Main.zig", "ffi": null },
     { "name": "Greeting", "file": "Greeting.zig", "ffi": "Greeting.ffi.zig" }
+  ],
+  "exports": [
+    { "module": "Shapes", "name": "fInt", "args": ["int"], "result": "int" }
   ]
 }
 ```
@@ -865,6 +874,8 @@ Two in-repo gates, and the second is why `call` exists:
 order. `ffi` is null unless a `.ffi.zig` was actually written beside it — the
 manifest promises files, so it is answered by the filesystem rather than by the
 module's foreign set.
+
+`exports` is the typed ABI and is described in its own section below.
 
 `main_export` says what `main` is and how to reach it: a PureScript `Effect`
 thunk whose Zig identifier is `@"ps.main"`. With no module exporting `main`,
@@ -876,6 +887,105 @@ build cache, and nothing in purzig reads the manifest. It is emitted so that the
 wasm host ABI and any downstream tool can find the output — and so a consumer of
 `addLibrary` can see which generated module is the one exporting `main` —
 without globbing the directory.
+
+### Typed exports
+
+A consumer cannot call a compiled export without knowing its representation, and
+before issue #33 it could only re-derive that by hand — which is exactly what
+`sophos/purzig-freenet` does, in a reflective encoder over `rt.Value` with its
+own tag tables. `exports` publishes the shapes instead:
+
+```json
+"exports": [
+  { "module": "Shapes", "name": "fInt", "args": ["int"], "result": "int" },
+  { "module": "Shapes", "name": "fArr", "args": [{"array": "int"}], "result": {"array": "int"} },
+  { "module": "Shapes", "name": "fRec", "args": [{"record": {"a": "int", "b": "string"}}], "result": "int" },
+  { "module": "Shapes", "name": "fAdt", "args": [{"adt": {"module": "Shapes", "name": "Shape"}}], "result": "int" },
+  { "module": "Shapes", "name": "fHo", "args": [{"refused": "higher-order argument"}], "result": "int" }
+]
+```
+
+The type comes from `docs.json`. **CoreFn carries no types** — a decl's
+`annotation` is exactly `{meta, sourceSpan}` — so for every module that was
+written, `Zig.Abi` reads the `docs.json` purs puts beside `corefn.json` in
+`output/<Module>/` and maps the type onto one shape. The input is the pair.
+
+#### The vocabulary (fixed — nothing outside this table is published)
+
+| PureScript | Shape |
+|---|---|
+| `Int` | `"int"` |
+| `Number` | `"number"` |
+| `Boolean` | `"boolean"` |
+| `Char` | `"char"` |
+| `String` | `"string"` |
+| `Unit`, and any `Effect` result | `"unit"` |
+| `Array a` | `{"array": <shape>}` |
+| closed record | `{"record": {field: <shape>}}` |
+| data type with a known constructor list | `{"adt": {"module", "name"}}` |
+| anything below | `{"refused": "<reason>"}` |
+
+Every shape string is **width-agnostic**: it is `"int"`, never `"int32"` and
+never `"i32"`. How many bits an `Int` has is an open question in purzig, and it
+must stay changeable without changing the manifest. Nothing else in the
+vocabulary encodes a width either — `"number"` is the language's `Number`, not
+an `f64`.
+
+A record's fields appear in the order the type wrote them, and a row's `args`
+are in argument order, so for a fully typed row `args.len` is the arity. A row
+carrying a refusal is the exception: the refused SLOT is what is unknown, and a
+whole-signature refusal deliberately puts one in `args` and one in `result`.
+
+#### Refusals
+
+A refusal is a **first-class answer, not an error**: `{"refused": "<reason>"}`
+occupies one position, so a row is never dropped and the emit never fails. The
+reasons are:
+
+| Situation | Reason |
+|---|---|
+| a constraint, `Eq a => …` (a dictionary is a first argument) | `"type class dictionary"` |
+| `Foreign`, or a `foreign data` type | `"foreign type"` |
+| `a -> b` as an **argument** | `"higher-order argument"` |
+| `a -> b` as a **result** | `"higher-order result"` |
+| a `forall` that is not the leading one | `"existential or rank-n type"` |
+| `Effect a` as an **argument** | `"effect as argument"` |
+| a bare type variable | `"type variable"` |
+| a record with an open row | `"open record"` |
+| an erased `newtype` | `"newtype"` |
+| a `type` synonym | `"type synonym"` |
+| `Maybe Int`, or any type with type arguments | `"parameterised data type"` |
+| a type constructor nothing declares | `"unknown type"` |
+| type syntax the vocabulary does not model | `"unsupported type"` |
+| the signature could not be recovered at all | `"no type information"` |
+
+Three of these deserve their reasons spelled out:
+
+- **`Effect` as a result is allowed** and renders as `"unit"`: the result of the
+  call is the unit value the thunk's run returns. `Effect` as an *argument* is
+  refused, because a thunk is a closure and the vocabulary has no shape for one.
+- **An `Effect` program's `main` is therefore `args: [], result: "unit"`.**
+- **`{"refused": "no type information"}` in both `args` and `result`** is the
+  whole-row answer for an export whose type could not be read — a missing
+  `docs.json`, unparseable docs, or a declaration with no `type`. It is
+  deliberately in both positions so it cannot be mistaken for a real signature
+  of unknown arity. `Main` logs the module when this happens.
+
+The rows are the docs' **value** declarations that CoreFn also lists in the
+module's export list — data constructors and type-class members are not value
+declarations and are not callable exports, so they get no row. A value the docs
+type but CoreFn does not export is not an export and is skipped; a name CoreFn
+exports that the docs do not type is not published as a guessed shape.
+
+What is never silent is the *failure* case: when a module's `docs.json` is
+missing, does not decode, or yields no value declarations at all, every name in
+CoreFn's export list gets a `{"refused": "no type information"}` row. An empty
+`exports` array therefore means "nothing is exported", never "the types could
+not be read".
+
+`zig build test-exports` is the gate. `example/exports_probe.zig` embeds
+`example/output-zig/manifest.json` and asserts the six rows of
+`example/src/Shapes.purs` verbatim, plus that there are exactly six of them.
 
 ### Freestanding targets
 

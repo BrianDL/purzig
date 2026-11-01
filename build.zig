@@ -225,6 +225,40 @@ pub fn build(b: *std.Build) void {
     const multi_step = b.step("test-abi-multi", "Call a two-argument function in a non-Main module through the byte ABI");
     multi_step.dependOn(&check_multi.step);
 
+    // -----------------------------------------------------------------
+    // The published export shapes (issue #33).
+    //
+    // `Zig.Abi` turns each exported value's `docs.json` type into one shape from
+    // a fixed, width-agnostic vocabulary and `Main` writes them as `exports` in
+    // the manifest. The gate is a Zig probe reading that manifest, in the style
+    // of `abi_probe.zig`: no python, no node, no JSON parser -- it asserts the
+    // exact row text, so a row that is missing OR shaped differently fails.
+    //
+    // One codegen run is enough: `spago build` in `example/` compiles every
+    // module in `src/`, so `Shapes` is in this manifest. The probe `@embedFile`s
+    // the manifest, so it must be COMPILED after that run -- hence the step
+    // dependency, which is also the only ordering it needs.
+    // -----------------------------------------------------------------
+
+    const exports_root = b.createModule(.{
+        .root_source_file = b.path("example/exports_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exports_probe = b.addExecutable(.{
+        .name = "exports-probe",
+        .root_module = exports_root,
+    });
+    exports_probe.step.dependOn(&app.codegen.step);
+
+    // Not installed: it is a check, not an artifact.
+    const check_exports = b.addRunArtifact(exports_probe);
+    check_exports.expectStdOutEqual("ok 6 Shapes export rows\n");
+
+    const exports_step = b.step("test-exports", "Assert the export shapes published in the manifest");
+    exports_step.dependOn(&check_exports.step);
+
     const run_runtime_tests = purzig.addRuntimeTests(b, opts);
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
@@ -235,6 +269,7 @@ pub fn build(b: *std.Build) void {
     all_tests.dependOn(&check_library.step);
     all_tests.dependOn(&check_abi.step);
     all_tests.dependOn(&check_multi.step);
+    all_tests.dependOn(&check_exports.step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,

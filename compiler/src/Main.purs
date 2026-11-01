@@ -10,7 +10,10 @@
 -- | The emitter writes modules only (issue #7). No program is written here at
 -- | all: `build/purzig.zig` generates the entry point into the build cache,
 -- | roots the executable at it, and never reads the manifest. What this program
--- | records is which module exports `main`, so tooling does not have to guess.
+-- | records is which module exports `main`, so tooling does not have to guess,
+-- | and -- since issue #33 -- the SHAPE of every export (`Zig.Abi` reads the
+-- | `docs.json` purs writes beside `corefn.json`, because CoreFn is
+-- | type-erased).
 -- |
 -- | Unlike the CoreFn-direct version this replaces, the whole program is read
 -- | before anything is emitted. `purescript-backend-optimizer` is a
@@ -42,7 +45,7 @@ import Prelude
 
 import Data.Argonaut.Decode.Error (printJsonDecodeError)
 import Data.Argonaut.Parser (jsonParser)
-import Data.Array (catMaybes, filter, find, fromFoldable, length, mapWithIndex, sort)
+import Data.Array (catMaybes, filter, find, fromFoldable, length, mapWithIndex, null, sort)
 import Data.Either (Either(..))
 import Data.List (List)
 import Data.List as List
@@ -65,6 +68,7 @@ import PureScript.Backend.Optimizer.CoreFn.Sort (sortModules)
 import PureScript.Backend.Optimizer.Directives (parseDirectiveFile)
 import PureScript.Backend.Optimizer.Directives.Defaults (defaultDirectives)
 import PureScript.Backend.Optimizer.Semantics.Foreign (coreForeignSemantics, qualified)
+import Zig.Abi as Abi
 import Zig.Emit (emitModule)
 import Zig.Ident (ffiFile, moduleFile, stringLit, topLevel)
 
@@ -80,6 +84,12 @@ zigDir = "output-zig"
 -- | The description of a run, written beside the modules.
 manifestFile :: String
 manifestFile = "manifest.json"
+
+-- | purs writes one of these beside `corefn.json` in `output/<Module>/`. It is
+-- | the ONLY place a type survives: `corefn.json`'s annotations are
+-- | `{meta, sourceSpan}`, so the typed ABI has to be read from here.
+docsFile :: String
+docsFile = "docs.json"
 
 -- | The module that exports `main`. It is compiled exactly like every other
 -- | module; nothing in `output-zig/` is a program.
@@ -199,18 +209,64 @@ codegen (Module coreFnMod) backendMod = do
 finish :: Array (Module Ann) -> Effect Unit
 finish mods = do
   emitted <- catMaybes <$> traverse describe mods
-  let manifestPath = zigDir <> "/" <> manifestFile
-  writeTextFile UTF8 manifestPath (renderManifest emitted)
+  loaded <- catMaybes <$> traverse loadDocs mods
+  let
+    sources = map
+      ( \row ->
+          { moduleName: row.name
+          , exports: row.exports
+          , docs: find (\docsMod -> docsMod.moduleName == row.name) loaded
+          }
+      )
+      emitted
+    exportRows = Abi.exportsFor sources
+    manifestPath = zigDir <> "/" <> manifestFile
+  writeTextFile UTF8 manifestPath (renderManifest emitted exportRows)
   log
-    ( "[purs-backend-zig]   " <> show (length emitted) <> " module(s) -> "
+    ( "[purs-backend-zig]   " <> show (length emitted) <> " module(s), "
+        <> show (length exportRows)
+        <> " export shape(s) -> "
         <> manifestPath
     )
+
+-- | A module's docs, when purs wrote them and they decode.
+-- |
+-- | A missing `docs.json` is not fatal and not silent: the module's exports are
+-- | still published, as `{"refused": "no type information"}`, and the reason is
+-- | logged. `exportsFor` is what guarantees no export is dropped.
+loadDocs :: Module Ann -> Effect (Maybe Abi.DocsModule)
+loadDocs (Module m) = do
+  let name = unwrap m.name
+  let path = corefnDir <> "/" <> name <> "/" <> docsFile
+  present <- exists path
+  if not present then do
+    when (not (null m.exports))
+      ( log
+          ( "[purs-backend-zig]   " <> name
+              <> ": no "
+              <> docsFile
+              <> " -- exports published as \"no type information\""
+          )
+      )
+    pure Nothing
+  else do
+    text <- readTextFile UTF8 path
+    case jsonParser text of
+      Left err -> do
+        log ("[purs-backend-zig]   " <> name <> ": DOCS DECODE FAILED -- " <> err)
+        pure Nothing
+      Right json -> case Abi.decodeDocsModule name json of
+        Nothing -> do
+          log ("[purs-backend-zig]   " <> name <> ": docs.json has no readable declarations")
+          pure Nothing
+        Just docsMod -> pure (Just docsMod)
 
 -- | One row of the manifest.
 type Emitted =
   { name :: String
   , file :: String
   , ffi :: Maybe String
+  , exports :: Array String
   }
 
 -- | A row per generated `.zig` module, in emission order.
@@ -229,17 +285,23 @@ describe (Module m) = do
       { name: name
       , file: moduleFile name
       , ffi: if hasFfi then Just (ffiFile name) else Nothing
+      , exports: map unwrap m.exports
       }
   pure (if generated then Just row else Nothing)
 
--- | The manifest: valid JSON, and enough to find every file this run wrote.
+-- | The manifest: valid JSON, and enough to find every file this run wrote,
+-- | plus the shape of every export.
 -- |
 -- | `main_module` and `main_export` are null together when no module exported
 -- | `main`, in which case there is nothing to root an executable at. No entry
 -- | file is named: the build helper does not read this file, and the filename
 -- | is the helper's business.
-renderManifest :: Array Emitted -> String
-renderManifest rows =
+-- |
+-- | `modules` and `exports` are unchanged and additive respectively: a consumer
+-- | written against the old manifest keeps working, and one that wants types
+-- | reads `exports`.
+renderManifest :: Array Emitted -> Array Abi.Export -> String
+renderManifest rows exportRows =
   let
     entry = find (\e -> e.name == mainModule) rows
   in
@@ -247,7 +309,8 @@ renderManifest rows =
       ( [ "{"
         , "  \"main_module\": " <> maybe "null" (\e -> stringLit e.name) entry <> ","
         , "  \"main_export\": " <> maybe "null" (const renderMainExport) entry <> ","
-        , "  \"modules\": " <> renderModules rows
+        , "  \"modules\": " <> renderModules rows <> ","
+        , "  \"exports\": " <> renderExports exportRows
         , "}"
         ]
       )
@@ -274,6 +337,16 @@ renderRow row =
     <> ", \"ffi\": " <> maybe "null" stringLit row.ffi
     <> " }"
 
+-- | The typed ABI: one row per export, indented and comma-stamped exactly like
+-- | `modules`, so the array stays valid JSON whether or not it is empty.
+-- |
+-- | A row is never omitted because its type was awkward. `args` may hold
+-- | `{"refused": "<reason>"}` in any position, and an export whose signature
+-- | could not be recovered carries that refusal in both `args` and `result`.
+renderExports :: Array Abi.Export -> String
+renderExports rows =
+  String.joinWith "\n"
+    ([ "[" ] <> commaSeparated (map Abi.renderExport rows) <> [ "  ]" ])
 -- | One line per row, indented, with a comma on all but the last -- so the
 -- | array stays valid JSON whether or not it is empty.
 commaSeparated :: Array String -> Array String
