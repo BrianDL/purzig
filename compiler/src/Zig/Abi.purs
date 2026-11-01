@@ -227,15 +227,7 @@ asString :: Json -> Maybe String
 asString = caseJson Nothing (const Nothing) (const Nothing) Just (const Nothing) (const Nothing)
 
 field :: String -> Json -> Maybe Json
-field key json =
-  caseJson
-    Nothing
-    (const Nothing)
-    (const Nothing)
-    (const Nothing)
-    (const Nothing)
-    (\obj -> hushRaw (getField' key obj))
-    json
+field key json = hushRaw (getField key json)
 
 hushRaw :: forall e. Either e Raw -> Maybe Json
 hushRaw result = case result of
