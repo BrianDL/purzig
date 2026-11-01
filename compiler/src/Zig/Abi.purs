@@ -48,6 +48,7 @@
 -- | `docs/handoff-manifest-shapes-2026-11-01.md`.
 module Zig.Abi
   ( DocsModule
+  , Decl
   , Export
   , Shape(..)
   , Source
