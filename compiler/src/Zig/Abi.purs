@@ -50,8 +50,12 @@ module Zig.Abi
   ( DocsModule
   , Decl
   , Export
+  , Kind
   , Shape(..)
+  , ShapeField
   , Source
+  , Ty
+  , TyField
   , decodeDocsModule
   , exportsFor
   , renderExport
