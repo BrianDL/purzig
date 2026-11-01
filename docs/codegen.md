@@ -952,7 +952,6 @@ reasons are:
 | `Effect a` as an **argument** | `"effect as argument"` |
 | a bare type variable | `"type variable"` |
 | a record with an open row | `"open record"` |
-| an erased `newtype` | `"newtype"` |
 | a `type` synonym | `"type synonym"` |
 | `Maybe Int`, or any type with type arguments | `"parameterised data type"` |
 | a type constructor nothing declares | `"unknown type"` |
@@ -976,6 +975,37 @@ module's export list — data constructors and type-class members are not value
 declarations and are not callable exports, so they get no row. A value the docs
 type but CoreFn does not export is not an export and is skipped; a name CoreFn
 exports that the docs do not type is not published as a guessed shape.
+
+#### Named types: `data`, `newtype`, and when a name is unknown
+
+A `TypeConstructor` is resolved against the **declaration** the loaded docs list
+for it, never against its use site. The module qualifier decides where to look —
+an empty qualifier means the module being decoded — and the answer is
+`{"adt": {"module": …, "name": …}}` only when that declaration is a data type
+with a known constructor list at arity zero. **`newtype` is published as `adt`
+too**, because it has exactly such a list; `data` and `newtype` differ in how
+purs represents them, not in what the vocabulary promises. A data type that
+takes type arguments is `"parameterised data type"` (the vocabulary cannot say
+`Maybe` of what) and a synonym is `"type synonym"`.
+
+> **Note on `newtype`.** An `adt` shape names the *type* — its module and proper
+> name — not the constructor layout. purzig's generated code resolves newtype
+> constructors away, so a `newtype Wrapper = Wrapper Int` argument arrives as the
+> `Int` itself; a consumer that needs the erased representation should treat the
+> named type's single field as the payload. Publishing `adt` rather than a
+> refusal keeps the manifest's job ("which nominal type is this") separate from
+> purzig's representation choices, which the vocabulary deliberately does not
+> encode.
+
+A name with **no declaration** behind it still refuses as `"unknown type"`.
+That is the vocabulary's whole rule and it is not traded for coverage: the
+decoder will not invent a module or a constructor list for a type it cannot see
+declared. What it does do is refuse to lose a declaration to a *format* detail:
+a declaration counts as a data type when it carries a `dataDeclType` or a
+constructor list, whatever its `declType` discriminant is spelled like, and the
+type table is keyed by the declaration's proper name even when the docs `title`
+carries the keyword and type arguments (`data Shape a`). Only a name that is
+still undeclared after that refuses.
 
 What is never silent is the *failure* case: when a module's `docs.json` is
 missing, does not decode, or yields no value declarations at all, every name in
