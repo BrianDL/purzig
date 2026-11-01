@@ -59,7 +59,7 @@ module Zig.Abi
 import Prelude
 
 import Data.Argonaut.Core (Json, caseJson, toArray)
-import Data.Argonaut.Decode (class DecodeJson, getField')
+import Data.Argonaut.Decode (class DecodeJson, getField)
 import Data.Array (catMaybes, concatMap, elem, filter, find, index, length, mapMaybe, null, slice, uncons)
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
