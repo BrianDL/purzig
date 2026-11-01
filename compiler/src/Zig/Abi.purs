@@ -114,8 +114,8 @@ type DocsModule = { moduleName :: String, decls :: Array Decl }
 type Decl = { name :: String, kind :: Kind, ty :: Maybe Ty }
 
 -- | What a docs declaration IS. Only a `KValue` becomes an export row; the rest
--- | exist so a type constructor can be classified at its use site (an ADT, an
--- | erased newtype, a synonym, a foreign type, a class).
+-- | exist so a type constructor can be classified at its use site (a `data`
+-- | type, a `newtype` -- both `adt` -- a synonym, a foreign type, a class).
 data Kind = KValue | KData | KNewtype | KSynonym | KForeign | KClass | KOther
 
 --------------------------------------------------------------------------------
@@ -178,40 +178,182 @@ decodeDecl json = do
         Just k -> Just k
         Nothing -> field "dataDeclType" json
   let kind0 = refineKind (classifyKind kindJson) kindData
-  -- No recognised kind marker, but a type: every encoding of a value
-  -- declaration carries one, so treat it as a value rather than dropping the
-  -- export. A data declaration carries `constructors` instead, never `type`.
+  -- Two fallbacks, in this order, for a declaration whose kind marker this
+  -- module did not recognise.
+  --
+  -- A declaration that structurally IS a data declaration -- it carries a
+  -- `dataDeclType` or a constructor list -- is one whatever else it carries,
+  -- and that must be decided BEFORE the presence of a `type` field is allowed
+  -- to say "value". The order is the whole point: a data declaration read as a
+  -- value is dropped from the type table below, and then every use of it
+  -- refuses as an "unknown type" even though the module declares it.
   let kind = case kind0 of
-        KOther -> if isJust tyJson then KValue else KOther
+        KOther -> case dataDeclKind info json of
+          Just declared -> declared
+          Nothing -> if isJust tyJson then KValue else KOther
         other -> other
-  pure { name: title, kind: kind, ty: tyJson >>= decodeType }
+  pure { name: bareDeclName kind title, kind: kind, ty: tyJson >>= decodeType }
 
 classifyKind :: Maybe Json -> Kind
 classifyKind Nothing = KOther
-classifyKind (Just json) = case asString json of
+classifyKind (Just json) = case markerWord json of
   Nothing -> KOther
-  Just s
-    | s == "value" -> KValue
-    | s == "data" -> KData
-    | s == "newtype" -> KNewtype
-    | s == "typeSynonym" -> KSynonym
-    | s == "synonym" -> KSynonym
-    | s == "type" -> KSynonym
-    | s == "externData" -> KForeign
-    | s == "foreignData" -> KForeign
-    | s == "typeClass" -> KClass
-    | s == "class" -> KClass
-    | otherwise -> KOther
+  Just s -> classifyWord s
 
--- | A `data` declaration carries its newtype-ness in a second field when the
--- | docs format keeps them together, which is the difference between "a tagged
--- | union" and "the field itself, erased" -- too big a difference to guess.
+-- | The kind marker itself, as a word. purs writes it as a plain string; a
+-- | tagged encoding (`{"tag": "data"}`) or a `{"value": ..}` wrapper is
+-- | accepted too, because neither costs anything to read and both would
+-- | otherwise look like "no marker at all".
+markerWord :: Json -> Maybe String
+markerWord json = case asString json of
+  Just s -> Just s
+  Nothing -> case field "tag" json >>= asString of
+    Just s -> Just s
+    Nothing -> field "value" json >>= asString
+
+classifyWord :: String -> Kind
+classifyWord s
+  | s == "value" = KValue
+  | isDataWord s = KData
+  | isNewtypeWord s = KNewtype
+  | s == "typeSynonym" = KSynonym
+  | s == "synonym" = KSynonym
+  | s == "type" = KSynonym
+  | s == "externData" = KForeign
+  | s == "externDataDeclaration" = KForeign
+  | s == "foreignData" = KForeign
+  | s == "typeClass" = KClass
+  | s == "class" = KClass
+  | otherwise = KOther
+
+-- | A `data` declaration may carry its newtype-ness in a second field, and a
+-- | `foreign import data` its foreignness: one `data` marker covers all three,
+-- | so the second field decides which. A newtype stays a `KNewtype` rather than
+-- | being folded into `KData` -- which kind a declaration is is asked separately
+-- | from what shape it publishes, and both publish the same `adt` shape.
 refineKind :: Kind -> Maybe Json -> Kind
 refineKind kind dataKind = case dataKind >>= asString of
-  Just "newtype" -> KNewtype
-  Just "foreign" -> KForeign
-  Just "foreignData" -> KForeign
-  _ -> kind
+  Just w ->
+    if isNewtypeWord w then KNewtype
+    else if isForeignWord w then KForeign
+    else kind
+  Nothing -> kind
+
+-- | `Just kind` when a declaration is structurally a data declaration: purs's
+-- | docs give one a `dataDeclType` (`data` / `newtype` / `foreign`) and/or a
+-- | `constructors` array, and NO other declaration kind carries either. Both
+-- | fields are looked for in `info` and beside `title`, because the decoder is
+-- | written against two documented docs encodings and only one of them has been
+-- | measured against a real file.
+-- |
+-- | This is what resolves a LOCAL data type. `Shape` has a known constructor
+-- | list, so a `TypeConstructor` naming it is `{"adt": ...}`; a name whose
+-- | declaration cannot be classified here is not classified at all and keeps
+-- | refusing as an unknown type, because the vocabulary never turns "I do not
+-- | know this type" into a guess.
+-- |
+-- | The dispatch is `if`/`case` only, with no `where` and no guard on this
+-- | declaration, so nothing here can repeat the scope mistake that once made
+-- | `conShape` uncompilable.
+dataDeclKind :: Json -> Json -> Maybe Kind
+dataDeclKind info entry =
+  let
+    word = case field "dataDeclType" info >>= asString of
+      Just w -> Just w
+      Nothing -> field "dataDeclType" entry >>= asString
+
+    hasConstructors =
+      isJust (field "constructors" info >>= toArray)
+        || isJust (field "constructors" entry >>= toArray)
+  in
+    case word of
+      Just w -> wordKind hasConstructors w
+      Nothing -> if hasConstructors then Just KData else Nothing
+
+-- | The kind a `dataDeclType` word names. A word this decoder does not know
+-- | falls back to the constructor list: a declaration that lists constructors
+-- | is a data declaration even if its marker is spelled in a way that is not
+-- | listed here, and one that lists none is not guessed at.
+wordKind :: Boolean -> String -> Maybe Kind
+wordKind hasConstructors w
+  | isNewtypeWord w = Just KNewtype
+  | isForeignWord w = Just KForeign
+  | isDataWord w = Just KData
+  | hasConstructors = Just KData
+  | otherwise = Nothing
+
+-- | The words purs's docs use for a data declaration, in every spelling this
+-- | decoder accepts. Matching is what keeps "this module declares it as a data
+-- | type" from becoming "this looks like a type, so guess".
+isDataWord :: String -> Boolean
+isDataWord w = w == "data" || w == "Data" || w == "adt" || w == "ADT"
+
+isNewtypeWord :: String -> Boolean
+isNewtypeWord w =
+  w == "newtype" || w == "Newtype" || w == "NEWTYPE"
+    || w == "newtypeDeclaration"
+    || w == "NewtypeDeclaration"
+
+isForeignWord :: String -> Boolean
+isForeignWord w =
+  w == "foreign" || w == "Foreign"
+    || w == "foreignData"
+    || w == "externData"
+    || w == "externDataDeclaration"
+    || w == "ForeignType"
+
+-- | The NAME a `TypeConstructor` uses for a declaration, derived from the docs
+-- | `title`.
+-- |
+-- | purs's docs titles for TYPE-level declarations may carry the declaration
+-- | keyword and the type arguments (`data Shape a`), while the type table is
+-- | keyed by the proper name alone (`Shape`) -- the only spelling a
+-- | `TypeConstructor` node carries. Value titles are already bare and are
+-- | returned untouched, so a published export `name` can never be altered by
+-- | this function.
+-- |
+-- | The keyword test is case-SENSITIVE and requires a trailing space, so a type
+-- | whose name merely starts with those letters (`DataType`, `Type`) is not
+-- | truncated.
+bareDeclName :: Kind -> String -> String
+bareDeclName kind title = case kind of
+  KValue -> title
+  KOther -> title
+  _ -> firstWord (dropKeywords (CU.toCharArray title))
+
+firstWord :: Array Char -> String
+firstWord cs = (spanChars isNameChar (skipWs cs)).value
+
+dropKeywords :: Array Char -> Array Char
+dropKeywords cs = case uncons cs of
+  Nothing -> cs
+  Just r ->
+    if isSpaceChar r.head then dropKeywords r.tail
+    else case dropOneKeyword cs of
+      Just rest -> dropKeywords rest
+      Nothing -> cs
+
+dropOneKeyword :: Array Char -> Maybe (Array Char)
+dropOneKeyword cs = tryKeywords cs typeKeywords
+
+-- | The keyword table is a list of WORDS, so the recursion is over that list
+-- | while `cs` stays the same: a keyword that does not match is tried against
+-- | the next one, never against a suffix of itself.
+tryKeywords :: Array Char -> Array String -> Maybe (Array Char)
+tryKeywords cs keywords = case uncons keywords of
+  Nothing -> Nothing
+  Just r -> case stripPrefixChars r.head cs of
+    Nothing -> tryKeywords cs r.tail
+    Just rest -> case uncons rest of
+      Just after ->
+        if isSpaceChar after.head then Just rest
+        else tryKeywords cs r.tail
+      Nothing -> tryKeywords cs r.tail
+
+-- | Declaration keywords a docs title may be prefixed with, in the order they
+-- | are stripped: `foreign import data Foo` loses three.
+typeKeywords :: Array String
+typeKeywords = [ "foreign", "import", "data", "newtype", "type", "class" ]
 
 -- | One JSON object field, or `Nothing`. A `DecodeJson Raw` instance is
 -- | declared here rather than relying on one for `Json` itself: `getField` is
@@ -785,20 +927,31 @@ arrowRefusal pos = case pos of
   AsArg -> SRefused "higher-order argument"
   AsResult -> SRefused "higher-order result"
 
--- | A nominal type is publishable only when it is a data type with no type
--- | arguments: the vocabulary has no way to say "`Maybe` of what", and an
--- | erased newtype is not a tagged value at all.
+-- | A nominal type is publishable only when the declaration it names is a data
+-- | type with no type arguments: the vocabulary has no way to say "`Maybe` of
+-- | what", and publishing the bare name would lose the element type.
+-- |
+-- | `data` AND `newtype` both pass, because the vocabulary's rule is "a data
+-- | type with a KNOWN CONSTRUCTOR LIST" and a newtype has one. A name this
+-- | module can find no declaration for still refuses: the table is the whole
+-- | authority on whether a type is declared, so "unknown type" stays the answer
+-- | for anything the loaded docs do not declare.
 adtShape :: Array TypeEntry -> String -> String -> String -> Array Ty -> Shape
 adtShape table modName conMod conName args =
-  let target = if conMod == "" then modName else conMod
+  let
+    -- An empty qualifier is a local name: it resolves against the module being
+    -- decoded, which is the module whose declarations this table already holds.
+    target = if conMod == "" then modName else conMod
+
+    declared entry =
+      if null args then SAdt entry.moduleName entry.name
+      else SRefused "parameterised data type"
   in
     case findType table target conName of
       Nothing -> SRefused "unknown type"
       Just entry -> case entry.kind of
-        KData ->
-          if null args then SAdt entry.moduleName entry.name
-          else SRefused "parameterised data type"
-        KNewtype -> SRefused "newtype"
+        KData -> declared entry
+        KNewtype -> declared entry
         KSynonym -> SRefused "type synonym"
         KForeign -> SRefused "foreign type"
         KClass -> SRefused "type class dictionary"

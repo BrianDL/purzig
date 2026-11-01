@@ -372,3 +372,240 @@ All acceptance criteria in §6 remain **UNVERIFIED** for the same reason: there
 is no toolchain in this container. The one thing this repair is *for* — that
 `spago build` in `compiler/` gets past `Unknown value oneArg` — must be
 re-measured on the purzig worker.
+
+## 9. Repair (same day): a local `data` type resolved to `{"refused": "unknown type"}`
+
+Measured on the purzig worker, **not by me** (no `purs`, `spago`, `node` or
+`zig` was available to this container and the job forbids running them), by
+running `zig build test-exports` and dumping the generated manifest. Five of the
+six `Shapes` rows were exactly right:
+
+```json
+{ "module": "Shapes", "name": "fInt", "args": ["int"], "result": "int" }
+{ "module": "Shapes", "name": "fStr", "args": ["string"], "result": "string" }
+{ "module": "Shapes", "name": "fArr", "args": [{"array": "int"}], "result": {"array": "int"} }
+{ "module": "Shapes", "name": "fRec", "args": [{"record": {"a": "int", "b": "string"}}], "result": "int" }
+{ "module": "Shapes", "name": "fAdt", "args": [{"refused": "unknown type"}], "result": "int" }   <- wrong
+{ "module": "Shapes", "name": "fHo",  "args": [{"refused": "higher-order argument"}], "result": "int" }
+```
+
+`fAdt :: Shape -> Int` had to be
+`{ "module": "Shapes", "name": "fAdt", "args": [{"adt": {"module": "Shapes", "name": "Shape"}}], "result": "int" }`.
+
+### What that measurement proves, and it is the useful part
+
+`"unknown type"` is produced in exactly one place: `adtShape`, when the type
+table has no entry for the constructor under the module being decoded. The five
+correct rows are decisive about where the fault is **not**:
+
+- `fInt`/`fStr`/`fArr`/`fRec`/`fHo` all went through `decodeType` and the shape
+  mapping with the right answer, so the **type AST decoding is correct**: the
+  `TypeApp`/`TypeConstructor` pipeline, `Prim.Int`/`Prim.String` by name, the
+  `Record`/`RCons` row, and `Function` as an application (which is what makes
+  `(Int -> Int)` an argument and yields `"higher-order argument"`) all work
+  against the real file.
+- `fAdt`'s **result** is `"int"`, so its signature was decoded too. Only the
+  argument failed.
+- A local `Shape` arrives with an empty qualifier or `Shapes`, and both resolve
+  to `Shapes`: `target = if conMod == "" then modName else conMod`.
+- `exportsFor` builds the table from **every** loaded `docs.json`, including the
+  module being decoded, and `entryFor` keeps `KData`/`KNewtype`. So if the
+  declaration had been classified as a data type, the lookup would have hit.
+
+The only remaining path to `"unknown type"` is therefore the DECLARATION: the
+`Shape` entry was in the docs (values from the same module were typed) but did
+not reach the table as a data type. Two ways that happens, and both are fixed:
+
+1. **The kind marker was not recognised.** `decodeDecl`'s fallback was
+   `KOther -> if isJust tyJson then KValue else KOther`, i.e. "no marker I know,
+   but it has a `type`, so it is a value". A data declaration that this decoder
+   did not recognise — and that carries a `type`, or that simply got `KOther` —
+   was then either dropped from the table (`KValue` is not a table entry) or
+   never classified at all.
+2. **The table key was not the bare name.** The table is keyed by the docs
+   `title`; a title carrying the keyword and type arguments (`data Shape a`)
+   never equals the `Shape` a `TypeConstructor` names.
+
+### The fix, in `compiler/src/Zig/Abi.purs`
+
+- `decodeDecl` now decides in this order: a recognised kind marker; then
+  **structure** — `dataDeclKind`, which reads `dataDeclType` and a `constructors`
+  array, neither of which any other declaration kind in purs's docs model
+  carries — and only then "it has a `type`, so it is a value". Structure before
+  the `type` test is the whole point: a data declaration classified as a value is
+  invisible to the type table, and an invisible declaration is exactly an
+  `"unknown type"` at every use site.
+- The marker word itself (`classifyKind`) now also accepts `Data`, `adt`,
+  `ADT`, `Newtype`, `NEWTYPE`, `newtypeDeclaration`, `NewtypeDeclaration`,
+  `externDataDeclaration`, and reads it through `markerWord`, which tolerates a
+  tagged wrapper (`{"tag": "data"}` / `{"value": …}`) instead of treating it as
+  "no marker".
+- `bareDeclName` derives the table key from the `title` for TYPE-level
+  declarations only: it strips leading `foreign import data` / `data` /
+  `newtype` / `type` / `class` keywords (case-sensitive, requiring a trailing
+  space) and then takes the first proper name, so `data Shape a` keys as
+  `Shape`. **Value titles are returned untouched**, so no published export
+  `name` can change.
+- `adtShape` publishes `KNewtype` as `{"adt": …}` as well: the vocabulary's rule
+  is "a data type with a known constructor list", which a newtype has. The
+  `"newtype"` refusal reason is gone; a newtype WITH type arguments still refuses
+  as `"parameterised data type"`, and `foreign data` still refuses as
+  `"foreign type"`. Nothing else in the shape vocabulary, and no other refusal
+  string, changed.
+
+What is deliberately **not** done: the miss is not turned into a guess. There is
+no name-only or fuzzy lookup across modules; if the module the qualifier names
+does not declare the name, the answer is still `{"refused": "unknown type"}`.
+The repair only makes a declaration that IS present in the docs readable.
+
+### The `docs.json` question, again, and answered plainly
+
+**I did not read a real `docs.json`, in this round or the previous one, and no
+copy was obtainable.** Searched in the workspace before editing: no
+`example/output/`, no `example/output-zig/`, no `output/` anywhere in
+`./workspace/sophos/purzig`, no `docs.json` or `manifest.json` anywhere in the
+tree or in this run's storage prefix (`sophos/purzig`), and no purs/purescript
+source or binary on the machine to read the format out of. The only filesystem
+`docs.json`-adjacent facts available are the measured manifest rows quoted above.
+So this section is an **inference from that measurement, not a quotation of the
+file**, and the two encodings the decoder accepts are still both unverified
+against a real file:
+
+- the declaration entries live in a top-level `"declarations"` array, each with
+  a `title` and an `info` object;
+- a value's type is a JSON AST under `info.type`, tagged
+  `{"tag": "TypeApp"|"TypeConstructor"|"ForAll"|"ConstrainedType"|"Record"|"RCons"|"REmpty", "contents": …}`,
+  with a `TypeConstructor`'s `contents` a `[qualifiedModuleName, properName]`
+  pair (the module name as an array of segments, e.g. `["Shapes"]`). The five
+  correct rows are consistent with this and with nothing else tried so far;
+- a data declaration is marked by a `declType`-family word plus `dataDeclType`
+  and/or a `constructors` array — **which spelling, exactly, is unmeasured**, and
+  because the previous decoder's spelling was demonstrably not the one the real
+  file uses, the code now accepts the structural markers as well instead of
+  depending on one word.
+
+The **Shape declaration and its use** therefore cannot be quoted. Inferred
+encoding, given the above:
+
+```json
+// the DECLARATION (inferred, not quoted)
+{ "title": "Shape",
+  "info": { "declType": "data", "dataDeclType": "data", "typeArguments": [],
+            "constructors": [ { "declName": "Circle", "declType": { … } },
+                              { "declName": "Square", "declType": { … } } ] } }
+
+// the USE of Shape in fAdt's type (inferred, not quoted)
+{ "tag": "TypeConstructor", "contents": [ ["Shapes"], "Shape" ] }
+```
+
+`declType`/`dataDeclType` is the field that would mark data vs newtype
+(`dataDeclType` carrying `data` / `newtype` / `foreign`); the decoder treats the
+constructor list and `dataDeclType` as the authoritative structural markers and
+`declType` as the hint, precisely because the hint alone failed on the real file.
+
+**Whether `docs.json` types UNEXPORTED declarations is still unmeasured.** No
+real file was read, so the question is open: `exportsFor` cross-checks the docs
+against CoreFn's export list, so the published rows are correct either way, but
+how much of a module is *typable* at all depends on this and it remains the
+first thing a worker run should answer (dump one module's `declarations` titles
+and compare with its `.purs`). If the answer is "only exports", the typed ABI can
+never cover an internal function and there is nothing to change here; if it is
+"everything", a future issue could publish shapes for non-exported decls without
+touching this decoder.
+
+### Files changed by this repair
+
+- `compiler/src/Zig/Abi.purs` — `decodeDecl`'s kind decision; `classifyKind`
+  split into `markerWord`/`classifyWord`; new `dataDeclKind`, `wordKind`,
+  `isDataWord`/`isNewtypeWord`/`isForeignWord`, `bareDeclName`/`firstWord`/
+  `dropKeywords`/`dropOneKeyword`/`typeKeywords`; `adtShape`'s newtype case.
+- `docs/codegen.md` — the `"newtype"` refusal row is gone; the "Named types"
+  subsection now states the `data`/`newtype`/unknown-name rule and that a
+  declaration's *structure*, not a single marker spelling, decides.
+- `docs/handoff-manifest-shapes-2026-11-01.md` — this section.
+
+Nothing else. `build.zig`, `example/**` and `compiler/src/Main.purs` were not
+touched by this repair; the probe and the step added earlier are unchanged.
+
+### Shape table as implemented (unchanged from §2, one row's rule extended)
+
+| PureScript type | Manifest | Rule in `Zig.Abi` |
+|---|---|---|
+| `Int` | `"int"` | constructor name `Int` (module ignored: `Prim.Int`) |
+| `Number` | `"number"` | `Number` |
+| `Boolean` | `"boolean"` | `Boolean` |
+| `Char` | `"char"` | `Char` |
+| `String` | `"string"` | `String` |
+| `Unit` | `"unit"` | `Unit` |
+| `Effect a` as the **result** | `"unit"` | `effectShape AsResult` |
+| `Array a` | `{"array": <shape>}` | `Array` with one argument |
+| closed record | `{"record": {field: <shape>}}` | `Record` + `RCons`/`REmpty` row, `closed` only |
+| `data` with constructors, arity 0 | `{"adt": {"module": …, "name": …}}` | table entry `KData` |
+| `newtype`, arity 0 | `{"adt": {"module": …, "name": …}}` | table entry `KNewtype` |
+| anything refused | `{"refused": "<reason>"}` | see the table in `docs/codegen.md` |
+
+Every string is width-agnostic (`"int"`, never `"int32"`/`"i32"`); no width
+appears anywhere in `Shape`, `renderShape` or the manifest.
+
+### How a refusal is produced (unchanged)
+
+1. Per position: `shapeOf` maps a forall/constraint/arrow/`Effect`-as-argument/
+   open row/synonym/parameterised/unknown constructor to `SRefused reason`, which
+   `renderShape` writes as `{"refused": "<reason>"}` in that one slot. The row is
+   still emitted; nothing throws.
+2. Per constraint: `signature` prepends `{"refused": "type class dictionary"}`
+   to `args` rather than dropping the dictionary.
+3. Per export: no `docs.json`, undecodable docs, a declaration with no `type`, or
+   a signature that cannot be recovered gives
+   `{"refused": "no type information"}` in BOTH `args` and `result`, and `Main`
+   logs the module.
+
+### Acceptance criteria — status after this repair
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | `zig build test-e2e` prints exactly `Hello, Zig`; `test-library`, `test-abi`, `test-abi-multi` exit 0 | **UNVERIFIED** — no toolchain here. Nothing in the repair touches `Main`'s program path, the library path, the byte ABI or `example/src/Shapes.purs`; `Shapes` is imported by nothing. |
+| 2 | `zig build test-exports` exits 0 and covers all six `Shapes` rows | **UNVERIFIED** — the step and probe already exist and are unchanged; whether the sixth row now reads `{"adt": {"module": "Shapes", "name": "Shape"}}` is exactly what must be re-measured. |
+| 3 | `Shapes` export rows == its annotated top-level functions (6) | **UNVERIFIED at runtime.** By construction: rows are docs value declarations ∩ CoreFn exports; the probe asserts the count is 6. |
+| 4 | Manifest stays valid JSON; `main_module`, `main_export`, `modules` unchanged in shape | **UNVERIFIED at runtime.** `renderManifest` is untouched by this repair; it only adds the `exports` key. |
+| 5 | Every shape string width-agnostic | **VERIFIED by inspection**: `renderShape` is untouched and emits `"int"`; no width exists in the vocabulary. Not executed. |
+| 6 | `git diff --stat` touches only allowed paths | **VERIFIED by inspection**: this repair touches `compiler/src/Zig/Abi.purs`, `docs/codegen.md` and this handoff; `compiler/dist/bundle.js` and `tools/mkpackageset.sh` still show as 0-content-line **mode** changes that were already in the working tree at checkout. |
+
+**Nothing in this section was executed.** No `purs`, `spago`, `zig`, `node`,
+container or build was run, and every claim about the real `docs.json` is marked
+as inference above. The one measurement this repair is built on is the manifest
+dump quoted at the top, which came from the purzig worker.
+
+### If the sixth row still refuses
+
+The fix covers the three ways a present declaration can be missed: an
+unrecognised kind word, a structural marker the discriminator hides, and a
+decorated `title`. If `zig build test-exports` still reports the `fAdt` row, the
+one measurement that settles it is the real file — print the first declaration
+entry of `example/output/Shapes/docs.json`:
+
+```
+node -e 'const d=require("./example/output/Shapes/docs.json");
+         console.log(JSON.stringify(d.declarations.find(x=>x.title.startsWith("Shape")),null,2))'
+```
+
+Which fields that entry carries is then a one-line change to `dataDeclKind` (add
+the marker) or to `bareDeclName` (add the prefix), and nothing else in the file
+needs to move.
+
+### One caveat about the `newtype` rule, recorded rather than hidden
+
+The repair publishes a `newtype` as `{"adt": …}` because the issue asks for it,
+and because the vocabulary's own words are "a data type with a known constructor
+list". It is worth writing down what that means, since it is the one place where
+the vocabulary is about the TYPE rather than the representation: purzig's
+generated code **erases** newtypes — `docs/codegen.md` records that "newtype
+erasure happened upstream", so `newtype Wrapper = Wrapper Int` arrives at a call
+site as the `Int` itself, not as a tagged value. `{"adt": …}` therefore names the
+nominal type (module + proper name), and a consumer that needs the payload must
+resolve the type's single field. If that ever becomes too loose, the alternative
+is to restore the `"newtype"` refusal — a one-line change in `adtShape` — but it
+should be a vocabulary decision, not a decoder accident, which is why it is
+called out here.
+
+**Repair (later the same day, guards) — 12 guard alternatives corrected:** every alternative of `classifyWord` (all twelve: the `"value"` one, `isDataWord`/`isNewtypeWord`, every string comparison, and the final `otherwise`) was written `| cond -> expr` and has been changed to `| cond = expr`, order/conditions/results untouched; a whole-file scan for `^\s*|.*->` now finds none (the only remaining `|`-with-`->` in `compiler/src/` is `Zig/Emit.purs:590-592`, which is a guard on a `case` arm — legal PureScript, deliberately not changed), and the build is **UNVERIFIED locally** (no `purs`, `spago`, `node` or `zig` was run).
