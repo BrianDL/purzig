@@ -234,7 +234,7 @@ field key json =
     (const Nothing)
     (const Nothing)
     (const Nothing)
-    (\obj -> hushRaw (getField key obj))
+    (\obj -> hushRaw (getField' key obj))
     json
 
 hushRaw :: forall e. Either e Raw -> Maybe Json
