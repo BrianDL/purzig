@@ -133,6 +133,24 @@ pub fn apply3(f: Value, a: Value, b: Value, c: Value) Error!Value {
     return apply(try apply(try apply(f, a), b), c);
 }
 
+/// Apply `f` to `args` left to right. `args.len == 0` returns `f` unchanged.
+/// Same error semantics as `apply`: applying a non-callable is an error.
+///
+/// A fold over `apply`, not a second copy of the application logic, so the
+/// fixed arities above and this one cannot drift apart. Arity becomes a loop
+/// bound: a caller holding `k` arguments -- a consumer's own `apply3`, or a
+/// host crossing the byte ABI with a variable argument list -- needs neither a
+/// fixed-arity helper nor a hand-written `apply2` + `apply` chain.
+///
+/// No allocation at all here; whatever `apply` allocates, it allocates itself.
+pub fn applyN(f: Value, args: []const Value) Error!Value {
+    var out = f;
+    for (args) |argument| {
+        out = try apply(out, argument);
+    }
+    return out;
+}
+
 /// Run an `Effect a`. An Effect is a thunk, which in a one-argument-closure
 /// world means a closure that ignores a unit argument.
 pub fn runEffect(eff: Value) Error!Value {
