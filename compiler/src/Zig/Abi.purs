@@ -224,7 +224,7 @@ instance decodeRawJson :: DecodeJson Raw where
 -- | compiled backend in `compiler/dist/bundle.js`, and the family differs only
 -- | in which argument it projects.
 asString :: Json -> Maybe String
-asString = caseJson Nothing (const Nothing) (const Nothing) Just (const Nothing) (const Nothing)
+asString = caseJson (const Nothing) (const Nothing) (const Nothing) Just (const Nothing) (const Nothing)
 
 field :: String -> Json -> Maybe Json
 field key json = case toObject json of
