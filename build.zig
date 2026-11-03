@@ -232,6 +232,55 @@ pub fn build(b: *std.Build) void {
     multi_step.dependOn(&check_multi.step);
 
     // -----------------------------------------------------------------
+    // The byte-exact call path (issue #27).
+    //
+    // Same codegen, another module: `Bytes` is in `extra_modules`, so it is
+    // reachable by name like `Api` above. Its two declarations traffic in
+    // `Array Int` -- bytes -- rather than `String`, and `example/abi/abi_raw.zig`
+    // calls them through `rt.abi.callRaw` with `[0xff, 0x00, 0xfe]`: input that
+    // is not text at all, which is what `call`/`callBytes` cannot carry.
+    // Asserted as OUTPUT, so the gate is that the bytes came back changed by
+    // nothing -- not merely that the call type-checked.
+    // -----------------------------------------------------------------
+
+    const raw_lib = purzig.addLibrary(b, .{
+        .name = opts.name,
+        .main_module = opts.main_module,
+        .extra_modules = &.{"Bytes"},
+        .project = opts.project,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Same ordering as every other library-shaped run: the bundle first, then
+    // behind the program's codegen, because all of them run `spago build` in the
+    // one `example/` project directory.
+    raw_lib.codegen.step.dependOn(&build_compiler.step);
+    raw_lib.codegen.step.dependOn(&app.codegen.step);
+
+    const raw_root = b.createModule(.{
+        .root_source_file = b.path("example/abi/abi_raw.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    raw_root.addImport("bytes", raw_lib.module("Bytes"));
+    raw_root.addImport("runtime", raw_lib.runtime);
+
+    const raw_probe = b.addExecutable(.{
+        .name = "abi-raw-probe",
+        .root_module = raw_root,
+    });
+    raw_probe.step.dependOn(&raw_lib.codegen.step);
+
+    // Not installed: it is a check, not an artifact. Hex for the round trip and
+    // a decimal for the byte the callee read out of the same input.
+    const abi_raw = b.addRunArtifact(raw_probe);
+    abi_raw.expectStdOutEqual("ff 00 fe\n255\n");
+
+    const abi_raw_step = b.step("test-abi-raw", "Call a compiled PureScript function with non-text bytes through the byte ABI");
+    abi_raw_step.dependOn(&abi_raw.step);
+
+    // -----------------------------------------------------------------
     // The published export shapes (issue #33).
     //
     // `Zig.Abi` turns each exported value's `docs.json` type into one shape from
@@ -393,6 +442,7 @@ pub fn build(b: *std.Build) void {
     // The diagnostics gate is part of `test` as well as its own step: a gate
     // nobody runs is the complaint that produced it.
     all_tests.dependOn(diag_step);
+    all_tests.dependOn(&abi_raw.step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,

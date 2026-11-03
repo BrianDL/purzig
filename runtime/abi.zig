@@ -13,12 +13,24 @@
 //! ## Status is transport, never application meaning
 //!
 //! `Status.ok` says only that the call crossed: the callee returned a `String`
-//! and `Reply.bytes` is it. `Status.failed` says the call did not cross: the
-//! callee raised, or it returned something that is not a `String`. Neither
-//! status says anything about what the bytes SAY -- a reply of `"no"` is `ok`,
-//! and a failure reason is not an error code. Whatever a consumer wants its
-//! payload to mean, it decides on its side of the boundary. purzig does not
-//! know what "valid" is.
+//! (`call`) or a byte-like value (`callRaw`) and the bytes are the result.
+//! `Status.failed` says the call did not cross: the callee raised, or it
+//! returned something that is not `String`-shaped (`call`) / not byte-like
+//! (`callRaw`). Neither status says anything about what the bytes SAY -- a
+//! reply of `"no"` is `ok`, and a failure reason is not an error code. Whatever
+//! a consumer wants its payload to mean, it decides on its side of the boundary.
+//! purzig does not know what "valid" is.
+//!
+//! ## Two paths, one difference: the UTF-8 step
+//!
+//! `call` is the TEXT path: each input slice becomes a `String`, so the callee
+//! sees PureScript `String`s. That is right for text and wrong for everything
+//! else, because a `[]const u8` is not text in general and a `String` is
+//! assumed to be one. `callRaw` is the BYTE path: each input slice becomes an
+//! `Array Int` with one integer per byte, and the result is read back the same
+//! way -- `String` bytes, or an `Array Int` whose elements are all in `0..255`.
+//! No `String` is built on the way in, so no step on that path looks at the
+//! bytes as anything but bytes. Nothing else about the two differs.
 //!
 //! ## Memory
 //!
@@ -31,7 +43,9 @@
 //! - each element of `ins` is COPIED into that allocator before the callee sees
 //!   it. The callee is untyped -- it may keep the string in a ref, a record or a
 //!   captured environment -- and an element may be a temporary in the caller's
-//!   frame. After the copy the caller may drop every element immediately.
+//!   frame. After the copy the caller may drop every element immediately. On
+//!   the byte path the copy is the `Value` slice itself (see `byteArray`): the
+//!   bytes are read once, into `Int`s, and no slice of the caller's is kept.
 //! - `out.buf` is the caller's: written, never freed, never retained.
 //! - Nothing else here is ever freed: a reply's `bytes` are valid for the life
 //!   of the runtime. They point at the string the callee returned, at a copy of
@@ -43,7 +57,9 @@
 //! exactly two things, and both leave a reason in `bytes`:
 //!
 //! 1. the callee raised a PureScript exception (`Effect.Exception.throw`);
-//! 2. the callee returned something that is not a `String`.
+//! 2. the callee returned something that is not a `String` -- or, on the byte
+//!    path, something that is not byte-like: an `Int`, a record, a closure, or
+//!    an `Array` holding an element that is not a byte in `0..255`.
 //!
 //! An `f` that is not applicable with `ins.len` arguments -- an `Int`, or a
 //! two-argument function applied once -- panics inside `rt.apply`. That is a
@@ -97,11 +113,25 @@ pub const Reply = struct {
 const threw_non_string = "PureScript exception with a non-String value";
 const returned_non_string = "PureScript function returned a non-String value";
 
+/// The byte path's reply reasons. Fixed literals for the same reason: reporting
+/// a refusal must not be able to fail for want of memory.
+const returned_non_bytes = "PureScript function returned a value that is not byte-like";
+const returned_non_byte_element = "PureScript function returned an array element outside 0..255";
+
+/// Which of the two paths a call takes. The only difference between them is
+/// whether an input becomes a `String` or an `Array Int`, and whether the reply
+/// is read as a `String` or as bytes -- everything else, including the copy of
+/// every input and the handling of a thrown value, is shared.
+const Shape = enum { text, raw };
+
 /// Apply `f` to `ins` IN ORDER, then read the result with `out`.
 ///
 /// Each element is one argument: `ins.len` is the arity, applied left to right
 /// through `rt.apply`, so this is exactly the nested-`apply` chain the
 /// generated code writes for an application node.
+///
+/// This is the TEXT path: every element becomes a PureScript `String`.
+/// `callRaw` is the same call for bytes.
 ///
 /// - `ins.len == 0`: `f` is used as the result (`f` is then a `String`, e.g. a
 ///   `String`-valued definition such as a top-level constant);
@@ -114,14 +144,43 @@ const returned_non_string = "PureScript function returned a non-String value";
 /// Panics only when `f` is not applicable with `ins.len` arguments, or when
 /// `out.buf` cannot hold the result; every other failure is `Status.failed`.
 pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply {
+    return applyInputs(f, ins, .text, out);
+}
+
+/// Apply `f` to `ins` (each copied into the runtime allocator first), then
+/// expose the result as raw bytes. No UTF-8 validation anywhere on the path.
+///
+/// The byte counterpart of `call`, and the same call in every other respect:
+/// `ins.len` is the arity, arguments are applied left to right, a thrown value
+/// is `failed` with its reason, `out.buf` is the caller's, `ins.len == 0` is
+/// legal and uses `f` itself as the result.
+///
+/// What differs is the one step that makes `call` a text path: each element
+/// becomes an `Array Int` of its bytes (through `byteArray`) instead of a
+/// `String`, so the callee receives the bytes exactly as given -- a byte above
+/// `0x7f`, or a sequence that is not a code point, is an `Int` like any other.
+/// The reply is read back symmetrically: a `String`'s bytes, or an `Array Int`
+/// whose elements are all in `0..255`. Anything else -- an `Int`, a record, a
+/// closure, an array holding a non-`Int` or an out-of-range `Int` -- is
+/// `Status.failed` with a reason, never a truncating conversion.
+pub fn callRaw(f: Value, ins: []const []const u8, out: *Reader) Reply {
+    return applyInputs(f, ins, .raw, out);
+}
+
+/// The one call both paths share: copy-then-apply every input, then read the
+/// result the way `shape` says.
+fn applyInputs(f: Value, ins: []const []const u8, shape: Shape, out: *Reader) Reply {
     var current = f;
 
     for (ins) |in| {
         // Copy first: the callee may keep the argument, and `in` is the
         // caller's -- possibly a temporary that dies at the end of this loop.
-        const argument = copyOf(in);
+        const argument = switch (shape) {
+            .text => Value.mkString(copyOf(in)),
+            .raw => byteArray(in),
+        };
 
-        current = apply_mod.apply(current, Value.mkString(argument)) catch {
+        current = apply_mod.apply(current, argument) catch {
             // `apply` fails only with `error.PsException`, which always carries
             // the thrown value in the runtime's side channel. Consuming it here
             // is what keeps a later catch from seeing a stale one.
@@ -129,15 +188,55 @@ pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply {
         };
     }
 
-    return switch (current) {
-        .string => |s| {
-            if (out.buf.len < s.len) @panic("runtime: abi.Reader too small for the reply");
-            @memcpy(out.buf[0..s.len], s);
-            out.len = s.len;
-            return .{ .status = .ok, .bytes = "" };
-        },
+    return switch (shape) {
+        .text => writeText(current, out),
+        .raw => writeRaw(current, out),
+    };
+}
+
+/// A result on the text path: a `String`, or a refusal.
+fn writeText(result: Value, out: *Reader) Reply {
+    return switch (result) {
+        .string => |s| writeSlice(s, out),
         else => .{ .status = .failed, .bytes = returned_non_string },
     };
+}
+
+/// A result on the byte path: the bytes of a `String`, or the bytes an
+/// `Array Int` spells. Everything else is a refusal rather than a conversion --
+/// an `Int` is one number and not a byte, and an element outside `0..255` has
+/// no byte to be, so truncating either would be data loss reported as success.
+fn writeRaw(result: Value, out: *Reader) Reply {
+    const elements = switch (result) {
+        .string => |s| return writeSlice(s, out),
+        .array => |items| items,
+        else => return .{ .status = .failed, .bytes = returned_non_bytes },
+    };
+
+    var n: usize = 0;
+    for (elements) |element| {
+        const byte = switch (element) {
+            .integer => |i| i,
+            else => return .{ .status = .failed, .bytes = returned_non_byte_element },
+        };
+        if (byte < 0 or byte > 255) {
+            return .{ .status = .failed, .bytes = returned_non_byte_element };
+        }
+        if (n >= out.buf.len) @panic("runtime: abi.Reader too small for the reply");
+        out.buf[n] = @intCast(byte);
+        n += 1;
+    }
+    out.len = n;
+    return .{ .status = .ok, .bytes = "" };
+}
+
+/// Write a `String`'s bytes into `out`. Shared by both paths: a `String` result
+/// is bytes on the byte path too.
+fn writeSlice(s: []const u8, out: *Reader) Reply {
+    if (out.buf.len < s.len) @panic("runtime: abi.Reader too small for the reply");
+    @memcpy(out.buf[0..s.len], s);
+    out.len = s.len;
+    return .{ .status = .ok, .bytes = "" };
 }
 
 /// Call `f`, a one-argument compiled PureScript function, with `in` as its one
@@ -174,11 +273,35 @@ fn exceptionBytes(err: Value) []const u8 {
 }
 
 /// Copy bytes into the runtime's allocator. The only allocation this file
-/// makes besides `callBytes`'s fixed buffer.
+/// makes besides `callBytes`'s fixed buffer and `byteArray`'s element slice.
 fn copyOf(src: []const u8) []const u8 {
     const out = apply_mod.alloc().dupe(u8, src) catch
         @panic("runtime: out of memory");
     return out;
+}
+
+/// The one mapping from raw bytes to a `Value`: one `Int` per byte, in an
+/// `Array`.
+///
+/// Reuses the `array` variant of `Value` (`value.zig`: "`array: []const Value`")
+/// rather than adding a union arm for bytes. Every `switch` over `Value` in the
+/// runtime would have to grow that arm, and a compiled `Array Int -> Int` is
+/// already callable with no representation change at all -- the awkwardness of
+/// spelling bytes as integers is smaller than the cost of a thirteenth variant
+/// no generated code can produce. `Value.mkArray` is the constructor, so not
+/// even `value.zig` changes.
+///
+/// Public because a caller sometimes wants a result that is deliberately NOT
+/// byte-like -- an `Int`, a record, a closure -- and `callRaw`'s reply side
+/// refuses those; such a caller builds the argument with this and applies the
+/// function itself. It is also the single place the byte -> `Int` convention
+/// lives, so a fixture and `callRaw` cannot drift apart.
+pub fn byteArray(in: []const u8) Value {
+    if (in.len == 0) return Value.mkArray(&.{});
+    const items = apply_mod.alloc().alloc(Value, in.len) catch
+        @panic("runtime: out of memory");
+    for (in, items) |byte, *slot| slot.* = Value.mkInt(byte);
+    return Value.mkArray(items);
 }
 
 // --- tests -----------------------------------------------------------------
@@ -241,6 +364,38 @@ fn recordBody(env: []const Value, argument: Value) Error!Value {
     _ = env;
     seen = argument.asString();
     return argument;
+}
+
+/// The byte path's stand-in for `\xs -> xs`: it hands the argument back, so the
+/// reply is byte-for-byte what the caller sent.
+fn echoRawBody(env: []const Value, argument: Value) Error!Value {
+    _ = env;
+    return argument;
+}
+
+/// The byte path's stand-in for `readByte xs = case xs of [] -> -1; b : _ -> b`:
+/// it reads element 0 with the runtime's own accessor, which is what proves the
+/// callee sees an `Array` of `Int`s rather than a `String`.
+fn firstByteBody(env: []const Value, argument: Value) Error!Value {
+    _ = env;
+    const xs = argument.asArray();
+    if (xs.len == 0) return Value.mkInt(-1);
+    return Value.mkInt(xs[0].asInt());
+}
+
+/// A reply that is an `Array` whose one element is outside `0..255`. Copied
+/// into the arena, as generated code copies array literals.
+fn wideBody(env: []const Value, argument: Value) Error!Value {
+    _ = env;
+    _ = argument;
+    return Value.mkArray(apply_mod.copyValues(&.{Value.mkInt(256)}));
+}
+
+/// A reply that is an `Array` holding a non-`Int` element.
+fn charBody(env: []const Value, argument: Value) Error!Value {
+    _ = env;
+    _ = argument;
+    return Value.mkArray(apply_mod.copyValues(&.{Value.mkChar('a')}));
 }
 
 
@@ -361,4 +516,128 @@ test "callBytes is call with one buffer" {
     const refused = callBytes(Value.mkClosure(intBody, value.no_env), "in");
     try std.testing.expectEqual(Status.failed, refused.status);
     try std.testing.expectEqualStrings(returned_non_string, refused.bytes);
+}
+
+test "callRaw round-trips bytes, bytes above 0x7f included" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    // 0xff and 0xfe are not UTF-8 lead bytes at the END of a sequence and 0x00
+    // is a NUL: on the `call` path this is exactly the input that cannot exist.
+    const input = [_]u8{ 0xff, 0x00, 0xfe };
+
+    var out_buf: [256]u8 = undefined;
+    var out: Reader = .{ .buf = &out_buf };
+    const reply = callRaw(Value.mkClosure(echoRawBody, value.no_env), &.{&input}, &out);
+
+    try std.testing.expectEqual(Status.ok, reply.status);
+    try std.testing.expectEqualSlices(u8, &input, bytes(reply, &out));
+}
+
+test "callRaw hands the callee an Array of bytes, and a compiled function can read one" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    const input = [_]u8{ 0xff, 0x00, 0xfe };
+
+    var out_buf: [256]u8 = undefined;
+    var out: Reader = .{ .buf = &out_buf };
+    const reply = callRaw(Value.mkClosure(firstByteBody, value.no_env), &.{&input}, &out);
+
+    // `firstByteBody` returns an `Int`, which the byte path refuses -- but the
+    // `Int` it READ is the point: 0xff arrived as 255, not as a `String`.
+    try std.testing.expectEqual(Status.failed, reply.status);
+    try std.testing.expectEqualStrings(returned_non_bytes, reply.bytes);
+
+    // The same read through the runtime directly, which is how a caller that
+    // wants a non-byte result gets one.
+    const read = try apply_mod.apply(Value.mkClosure(firstByteBody, value.no_env), byteArray(&input));
+    try std.testing.expectEqual(@as(i32, 255), read.asInt());
+    // And an empty array is still an array the callee can inspect.
+    const none = try apply_mod.apply(Value.mkClosure(firstByteBody, value.no_env), byteArray(""));
+    try std.testing.expectEqual(@as(i32, -1), none.asInt());
+}
+
+test "callRaw answers ok for ins.len == 0" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    const input = [_]u8{ 0xff, 0x00, 0xfe };
+
+    // Two shapes of a zero-argument raw call: `f` IS the result, so it has to be
+    // the byte-like value already -- an `Array Int` here, a `String` below.
+    var out_buf: [256]u8 = undefined;
+
+    var array_out: Reader = .{ .buf = &out_buf };
+    const from_array = callRaw(byteArray(&input), &.{}, &array_out);
+    try std.testing.expectEqual(Status.ok, from_array.status);
+    try std.testing.expectEqualSlices(u8, &input, bytes(from_array, &array_out));
+
+    var string_out: Reader = .{ .buf = &out_buf };
+    const from_string = callRaw(Value.mkString("hi!"), &.{}, &string_out);
+    try std.testing.expectEqual(Status.ok, from_string.status);
+    try std.testing.expectEqualStrings("hi!", bytes(from_string, &string_out));
+}
+
+test "callRaw answers failed for a result that is not byte-like" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    var out_buf: [256]u8 = undefined;
+
+    // An `Int` is one number, not a byte.
+    var one: Reader = .{ .buf = &out_buf };
+    const plain_int = callRaw(Value.mkClosure(intBody, value.no_env), &.{"in"}, &one);
+    try std.testing.expectEqual(Status.failed, plain_int.status);
+    try std.testing.expectEqualStrings(returned_non_bytes, plain_int.bytes);
+
+    // An element outside 0..255 is refused rather than truncated to one byte.
+    var two: Reader = .{ .buf = &out_buf };
+    const wide = callRaw(Value.mkClosure(wideBody, value.no_env), &.{"in"}, &two);
+    try std.testing.expectEqual(Status.failed, wide.status);
+    try std.testing.expectEqualStrings(returned_non_byte_element, wide.bytes);
+
+    // So is an element that is not an `Int` at all.
+    var three: Reader = .{ .buf = &out_buf };
+    const ch = callRaw(Value.mkClosure(charBody, value.no_env), &.{"in"}, &three);
+    try std.testing.expectEqual(Status.failed, ch.status);
+    try std.testing.expectEqualStrings(returned_non_byte_element, ch.bytes);
+}
+
+test "callRaw reports a thrown String verbatim, like call" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    var out_buf: [256]u8 = undefined;
+
+    var one: Reader = .{ .buf = &out_buf };
+    const thrown = callRaw(Value.mkClosure(throwStringBody, value.no_env), &.{"in"}, &one);
+    try std.testing.expectEqual(Status.failed, thrown.status);
+    try std.testing.expectEqualStrings("rejected", thrown.bytes);
+
+    var two: Reader = .{ .buf = &out_buf };
+    const other = callRaw(Value.mkClosure(throwIntBody, value.no_env), &.{"in"}, &two);
+    try std.testing.expectEqual(Status.failed, other.status);
+    try std.testing.expectEqualStrings(threw_non_string, other.bytes);
+}
+
+test "callRaw copies its input, so the caller may drop it" {
+    var buffer: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    apply_mod.initAlloc(fba.allocator());
+
+    var input = [_]u8{ 0xff, 0x00, 0xfe };
+
+    var out_buf: [256]u8 = undefined;
+    var out: Reader = .{ .buf = &out_buf };
+    const reply = callRaw(Value.mkClosure(echoRawBody, value.no_env), &.{&input}, &out);
+    @memset(&input, 0x41);
+
+    try std.testing.expectEqual(Status.ok, reply.status);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0xfe }, bytes(reply, &out));
 }

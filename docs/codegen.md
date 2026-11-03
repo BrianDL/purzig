@@ -790,6 +790,8 @@ pub const Status = enum { ok, failed };
 pub const Reader = struct { buf: []u8, len: usize = 0 };
 pub const Reply = struct { status: Status, bytes: []const u8 };
 pub fn call(f: Value, ins: []const []const u8, out: *Reader) Reply
+pub fn callRaw(f: Value, ins: []const []const u8, out: *Reader) Reply
+pub fn byteArray(in: []const u8) Value              // bytes -> Array Int
 pub fn bytes(reply: Reply, out: *const Reader) []const u8
 pub fn callBytes(f: Value, in: []const u8) Reply   // = call(f, &.{in}, ...)
 ```
@@ -802,6 +804,24 @@ a `String`-valued constant), `1`, or `k`: the arguments are applied left to
 right, so `pair a b = a <> b` called with `{"ab", "cd"}` answers `abcd`.
 `callBytes` is the one-slice wrapper, unchanged for existing callers.
 
+**`call` is the TEXT path, `callRaw` the BYTE path, and the difference is one
+step: the UTF-8 one.** `call` builds a PureScript `String` out of each input
+slice, so the callee's parameter is a `String` and the bytes have to be text.
+`callRaw` builds the same argument as an `Array Int` -- one integer per byte,
+`Value.array` of `Value.integer`, which `runtime/value.zig` already has, so no
+`Value` variant changes and a compiled `Array Int -> Int` is callable as it
+stands -- so nothing on the path ever asks what the bytes mean. The reply is
+symmetric: `callRaw` answers with the bytes of a `String`, or with the bytes an
+`Array Int` spells (each element in `0..255`), and anything else -- an `Int`, a
+record, a closure, an array holding a non-`Int` or an out-of-range `Int` -- is
+`failed` with a reason, never a truncating conversion. Everything else is
+identical: `ins.len` is the arity (`0` is legal and uses `f` itself as the
+result), inputs are applied left to right, each input is copied into the
+runtime's allocator first, `out.buf` is the caller's, and `Status` stays
+transport-only. A caller that wants a result the raw reply refuses reads the
+`Value` itself, building the argument with `rt.abi.byteArray` -- the one place
+the byte-to-`Int` convention lives.
+
 A callee that is not applicable with that many arguments — an `Int`, or a
 two-argument function applied once — **panics** inside `rt.apply`. That is a bug
 in the Zig program linking the runtime, not input a consumer can supply, so
@@ -810,12 +830,14 @@ result: the reply is never silently truncated.
 
 ### `Status` is transport, never application meaning
 
-`ok` says the call crossed: the callee returned a `String`. `failed` says it did
-not: the callee threw, or returned something that is not a `String`, and the
-reason is in `Reply.bytes`. **Neither status says what the bytes MEAN.** A reply
-of `"no"` is `ok`; a failure reason is a message, not an error code. Whether a
-payload is valid, acceptable or meaningful is decided on the consumer's side of
-the boundary — purzig has no `validate` step and no domain.
+`ok` says the call crossed: the callee returned a `String` — or, on `callRaw`,
+a byte-like value (a `String`, or an `Array Int` of bytes). `failed` says it did
+not: the callee threw, or returned something that is not a `String` (not
+byte-like, on the raw path), and the reason is in `Reply.bytes`. **Neither
+status says what the bytes MEAN.** A reply of `"no"` is `ok`; a failure reason is
+a message, not an error code. Whether a payload is valid, acceptable or
+meaningful is decided on the consumer's side of the boundary — purzig has no
+`validate` step and no domain.
 
 This is the entry point for a platform package, and it is **internal to them for
 now** — not a stable public surface. Typed wrappers (generated from the
@@ -838,7 +860,7 @@ allocated the same way and valid for the life of the runtime, which on a native
 target is the process arena reclaimed at exit and on a freestanding one is
 whatever the host handed to `initAlloc`.
 
-Two in-repo gates, and the second is why `call` exists:
+Three in-repo gates, and the second is why `call` exists:
 
 - `example/abi/abi_probe.zig` binds `const f = try purs_main.@"ps.echo"();` and
   calls `rt.abi.callBytes(f, "hi")`; `zig build test-abi` asserts stdout is
@@ -849,8 +871,14 @@ Two in-repo gates, and the second is why `call` exists:
   stdout is exactly `abcd`. Two buffers, a two-argument function and a module
   that is not the entry — the three things a real consumer needs and
   `callBytes` alone could not reach.
+- `example/abi/abi_raw.zig` binds `Bytes` by name, hands `rt.abi.callRaw` the
+  bytes `[0xff, 0x00, 0xfe]` and prints the reply as hex, then reads the first
+  of those bytes in PureScript (`firstByte`) and prints it as a decimal;
+  `zig build test-abi-raw` asserts stdout is exactly `ff 00 fe` / `255`. Not one
+  of those three bytes is text, which is the property under test.
 
-`main`'s own output is unchanged by either: `Api` is a separate module.
+`main`'s own output is unchanged by any of the three: `Api` and `Bytes` are
+separate modules.
 
 ### The manifest
 
