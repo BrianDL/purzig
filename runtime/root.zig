@@ -61,10 +61,11 @@ pub const setLazyInit = lazy_mod.setLazyInit;
 pub const forceLazy = lazy_mod.forceLazy;
 pub const newMutArray = marray_mod.newMutArray;
 
-/// The bytes call path: `abi.Status`, `abi.Reply` and the single function that
-/// crosses from bytes to a compiled module and back. The one module of the
-/// surface rather than a re-exported declaration, so the contract stays fixed
-/// while everything above may be rewritten.
+/// The bytes call path: `abi.Status`, `abi.Reply`, and the functions that cross
+/// from bytes to a compiled module and back -- `abi.call`/`abi.callBytes` for
+/// text (`String` arguments), `abi.callRaw` for bytes (no UTF-8 step anywhere).
+/// The one module of the surface rather than a re-exported declaration, so the
+/// contract stays fixed while everything above may be rewritten.
 pub const abi = @import("abi.zig");
 
 test {
