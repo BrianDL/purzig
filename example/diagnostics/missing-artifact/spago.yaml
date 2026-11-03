@@ -1,0 +1,22 @@
+# FILE: example/diagnostics/missing-artifact/spago.yaml
+#
+# Fixture for issue #31, case 3 -- a MISSING ARTIFACT.
+#
+# The project's only module is `Other`, while the build is told
+# `main_module = "Main"`. `spago build` succeeds, the backend writes
+# `output-zig/Other.zig` and exits 0, so nothing failed -- and the build then
+# tries to compile `output-zig/Main.zig`, which does not exist. Zig's own error
+# names a file inside generated code, which says nothing about WHICH
+# `Options.main_module` was wrong, so purzig checks for the artifact itself and
+# says so.
+#
+# `zig build test-diagnostics` asserts the build fails, that the phase is
+# `missing artifact`, and that the message names the file the build expected.
+package:
+  name: purzig-diagnostics-missing-artifact
+  dependencies: []
+workspace:
+  packageSet:
+    path: .purzig/packages.json
+  backend:
+    cmd: purzig

@@ -1,0 +1,28 @@
+# FILE: example/diagnostics/backend-ffi/spago.yaml
+#
+# Fixture for issue #31, case 2 -- a BACKEND failure.
+#
+# `src/Ffi.purs` declares a foreign import and this project ships no
+# `src/Ffi.zig`, so the purzig backend reports
+#
+#     [purs-backend-zig]   Ffi: MISSING FFI -- 1 foreign import(s) declared but
+#     no .../src/Ffi.zig
+#
+# and then EMITS ANYWAY. `spago build` exits 0, which is why the old build
+# carried on and failed much later, inside generated Zig, on a missing
+# `.ffi.zig` import. That is the finding this fixture records: the backend does
+# not fail its process for a module it rejects; it logs, and continues. So
+# purzig's reporter reads those log lines and turns them into a failed build
+# whose text contains the backend's OWN message.
+#
+# `zig build test-diagnostics` asserts exactly that: the build fails, the phase
+# is `backend failure`, and the report contains `MISSING FFI` and the `.zig` path
+# the backend named -- not only `Failed to build with backend purzig`.
+package:
+  name: purzig-diagnostics-backend-ffi
+  dependencies: []
+workspace:
+  packageSet:
+    path: .purzig/packages.json
+  backend:
+    cmd: purzig

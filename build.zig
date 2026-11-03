@@ -45,9 +45,15 @@ pub fn build(b: *std.Build) void {
     // runs this step and never fetches the optimizer's git dependency.
     // -----------------------------------------------------------------
 
-    const build_compiler = b.addSystemCommand(&.{ "spago", "bundle" });
-    build_compiler.setCwd(b.path("compiler"));
-    build_compiler.has_side_effects = true;
+    // Wrapped in purzig's failure reporter, so a bundle that fails to build
+    // prints the compiler's own output rather than only `failed command`. It
+    // is the same helper a consumer gets: `spago bundle`, not `spago build`,
+    // because only bundle produces the file the shim execs.
+    const build_compiler = purzig.addReportedCommand(b, .{
+        .label = "spago bundle",
+        .project = b.path("compiler"),
+        .argv = &.{ "spago", "bundle" },
+    });
 
     const compiler_step = b.step("compiler", "Build the PureScript->Zig backend itself");
     compiler_step.dependOn(&build_compiler.step);
@@ -259,6 +265,120 @@ pub fn build(b: *std.Build) void {
     const exports_step = b.step("test-exports", "Assert the export shapes published in the manifest");
     exports_step.dependOn(&check_exports.step);
 
+    // -----------------------------------------------------------------
+    // Diagnostics (issue #31): a failing build must print the compiler's own
+    // output, and name the phase.
+    //
+    // `run spago failure` plus `process exited with error code 1` conflated
+    // three different failures and threw away the one thing that says what to
+    // fix -- purs's error block. Each fixture below is a real `spago build`
+    // against a project in `example/diagnostics/`, run through the SAME
+    // reporter the build uses (`purzig.addReportedCommand`), in its assertion
+    // mode: the command is expected to fail, and the report -- markers, phase
+    // sentence, and the child's untruncated output -- must contain every
+    // needle listed here. So this gate fails if the text ever goes back to a
+    // bare `run spago failure`, and it asserts on the FAIL path rather than
+    // by eye.
+    //
+    // One fixture per phase the issue asks to be named, because the fix
+    // differs per phase:
+    //
+    //   missing-import    type-check failure: purs rejected the source. Purposely
+    //                     imports `Data.Array` without declaring `arrays`.
+    //   backend-ffi       backend failure: purs type-checked, the backend could
+    //                     not emit Zig. A foreign import with no Zig FFI.
+    //   missing-artifact  missing artifact: nothing failed, but
+    //                     `output-zig/Main.zig` is not there to compile.
+    //
+    // A fourth failure -- `backend unavailable`, the shim not being on PATH,
+    // which is what a hand `spago build` hits -- cannot be provoked from here
+    // without breaking the shim on purpose, so it is asserted by construction
+    // instead: `purzig.addProjectSetup` writes the `.purzig/spago` wrapper that
+    // makes a hand run agree, and the reporter names it. See
+    // `docs/handoff-purzig-build-diagnostics-2026-11-03.md`.
+    // -----------------------------------------------------------------
+
+    const diag_step = b.step("test-diagnostics", "Assert a failing build prints the compiler's output and names the phase");
+
+    const Fixture = struct {
+        dir: []const u8,
+        main_module: ?[]const u8,
+        require: []const []const u8,
+        require_re: []const []const u8,
+    };
+
+    const fixture_list = [_]Fixture{
+        .{
+            .dir = "example/diagnostics/missing-import",
+            .main_module = null,
+            .require = &.{
+                "--- purzig: `spago build` failed (exit ",
+                "--- end of `spago build` output ---",
+                "type-check failure",
+                "ModuleNotFound",
+                "Module Data.Array was not found",
+            },
+            // The file and the line:column, as purs printed them. A regex so
+            // the assertion is on the SHAPE (file:line:column), not on the
+            // column purs happens to choose.
+            .require_re = &.{"src/Main\\.purs:9:[0-9]+"},
+        },
+        .{
+            .dir = "example/diagnostics/backend-ffi",
+            .main_module = null,
+            .require = &.{
+                "--- purzig: `spago build` exited 0, but the purzig backend",
+                "--- end of `spago build` output ---",
+                "backend failure",
+                "MISSING FFI",
+                "src/Ffi.zig",
+            },
+            .require_re = &.{},
+        },
+        .{
+            .dir = "example/diagnostics/missing-artifact",
+            .main_module = "Main",
+            .require = &.{
+                "--- purzig: `spago build` exited 0, but output-zig/Main.zig is missing",
+                "--- end of `spago build` output ---",
+                "missing artifact",
+                "Options.main_module",
+            },
+            .require_re = &.{},
+        },
+    };
+
+    for (fixture_list) |fixture| {
+        const project = b.path(fixture.dir);
+
+        // The same preparation a real codegen run gets: the package set, the
+        // backend shim, and `.purzig/spago`. Without it `spago build` here
+        // would be exactly the hand run that fails with no backend.
+        const fixture_setup = purzig.addProjectSetup(b, .{
+            .name = "diagnostics",
+            .project = project,
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const probe = purzig.addReportedCommand(b, .{
+            .label = "spago build",
+            .project = project,
+            .main_module = fixture.main_module,
+            .argv = &.{ "spago", "build" },
+            .expect_failure = true,
+            .require = fixture.require,
+            .require_re = fixture.require_re,
+        });
+        probe.step.dependOn(fixture_setup);
+
+        // The shim execs the bundle, which this repository builds from source
+        // (`zig build compiler`), exactly as `app.codegen` waits for it.
+        probe.step.dependOn(&build_compiler.step);
+
+        diag_step.dependOn(&probe.step);
+    }
+
     const run_runtime_tests = purzig.addRuntimeTests(b, opts);
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
@@ -270,6 +390,9 @@ pub fn build(b: *std.Build) void {
     all_tests.dependOn(&check_abi.step);
     all_tests.dependOn(&check_multi.step);
     all_tests.dependOn(&check_exports.step);
+    // The diagnostics gate is part of `test` as well as its own step: a gate
+    // nobody runs is the complaint that produced it.
+    all_tests.dependOn(diag_step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,

@@ -22,11 +22,17 @@
 //!      Nothing is installed anywhere the user can see, and there is no global.
 //!
 //!   2. `spago build` runs, which compiles PureScript to corefn and then execs
-//!      the shim once per build. The backend writes `output-zig/<Module>.zig`
-//!      beside the project, and copies each package's `<Module>.zig` FFI in as
-//!      `<Module>.ffi.zig` itself -- the build system is not involved in that.
-//!      It also writes `output-zig/manifest.json`, describing the modules it
-//!      produced. It writes no program.
+//!      the shim once per build. It runs through `build/purzig-run.sh`, which
+//!      captures the command's stdout and stderr MERGED and prints all of it,
+//!      between markers, when the step fails -- and names the phase: a
+//!      type-check failure, a backend failure, a backend that could not be
+//!      reached at all, or a missing artifact (issue #31). A successful run
+//!      prints nothing, so a green build's log is as quiet as it was. The
+//!      backend writes `output-zig/<Module>.zig` beside the project, and copies
+//!      each package's `<Module>.zig` FFI in as `<Module>.ffi.zig` itself -- the
+//!      build system is not involved in that. It also writes
+//!      `output-zig/manifest.json`, describing the modules it produced. It
+//!      writes no program.
 //!
 //!   3. `output-zig/<main_module>.zig` is wrapped in a Zig module with
 //!      `runtime` bound, so that a root importing it needs no other wiring.
@@ -229,47 +235,24 @@ fn addCodegen(b: *std.Build, opts: Options) Codegen {
         .optimize = opts.optimize,
     });
 
-    // ---- 1. the shim -------------------------------------------------------
+    // ---- 1. the shim, the set, and the manual-run wrapper ------------------
 
-    // Absolute, because the spago step runs with a different cwd.
-    const bundle = absFromRoot(pb, "compiler/dist/bundle.js");
-    const bin_dir = absFromRoot(b, ".zig-cache/purzig-bin");
-
-    const shim = b.addSystemCommand(&.{
-        "sh", "-c",
-        b.fmt(
-            "set -e; mkdir -p '{s}'; " ++
-                "printf '#!/bin/sh\\nexec node \"{s}\" \"$@\"\\n' > '{s}/purzig'; " ++
-                "chmod +x '{s}/purzig'",
-            .{ bin_dir, bundle, bin_dir, bin_dir },
-        ),
-    });
-    shim.has_side_effects = true;
-
-    // The set ships inside the dependency, so it is by construction the one
-    // belonging to the tag the user pinned in build.zig.zon. Copying it next to
-    // their spago.yaml means their config names a fixed path and the tag appears
-    // in exactly one place. Tolerates a missing set so the in-repo fixture,
-    // which resolves packages by path instead, still builds.
-    const set = b.addSystemCommand(&.{
-        "sh", "-c",
-        "mkdir -p .purzig && cp \"$1\" .purzig/packages.json 2>/dev/null || true",
-        "sh", absFromRoot(pb, "packages.json"),
-    });
-    set.setCwd(project);
-    set.has_side_effects = true;
+    const setup = addProjectSetup(b, opts);
 
     // ---- 2. codegen -------------------------------------------------------
 
-    // `has_side_effects` because spago writes into its own project tree rather
-    // than anywhere Zig models. Spago does its own caching.
-    const codegen = b.addSystemCommand(&.{ "spago", "build" });
-    codegen.setCwd(project);
-    codegen.has_side_effects = true;
-    codegen.step.dependOn(&shim.step);
-    codegen.step.dependOn(&set.step);
-
-    codegen.addPathDir(bin_dir);
+    // Wrapped in `addReportedCommand`, so a FAILED `spago build` prints purs's
+    // (or the backend's) own output in full and says which phase failed. A
+    // successful one prints nothing: the quiet-on-success rule is what lets a
+    // green build's log stay as it is.
+    const codegen = addReportedCommand(b, .{
+        .label = "spago build",
+        .project = project,
+        .main_module = opts.main_module,
+        .argv = &.{ "spago", "build" },
+        .purzig = opts.purzig,
+    });
+    codegen.step.dependOn(setup);
 
     // ---- 3. the generated modules ----------------------------------------
 
@@ -312,6 +295,173 @@ fn moduleFor(
     });
     m.addImport("runtime", runtime);
     return m;
+}
+
+/// The absolute directory the generated `purzig` shim is written to. Absolute
+/// because the shim is reached through `PATH` from a step whose cwd is the
+/// user's project, not this build root.
+fn shimDir(b: *std.Build) []const u8 {
+    return absFromRoot(b, ".zig-cache/purzig-bin");
+}
+
+/// Everything that has to be true on disk before `spago build` can run, as one
+/// step -- exported so a check can PREPARE a project without running the build
+/// (`build.zig`'s `test-diagnostics` does exactly that for its fixtures).
+///
+/// Three things, all regenerated on every build:
+///
+///   * `.zig-cache/purzig-bin/purzig` -- the one-line shim that execs the
+///     bundle. `spago.yaml` says `backend: { cmd: purzig }` and cannot
+///     interpolate a path only the Zig build knows, so the shim is found by
+///     NAME, through a `PATH` entry added to the `spago build` step alone;
+///   * `<project>/.purzig/packages.json` -- purzig's package set, copied from
+///     the dependency, so the set belongs to the tag pinned in
+///     `build.zig.zon` and the user's config names one fixed path. A missing
+///     set is tolerated (`|| true`): the in-repo fixture resolves packages by
+///     path instead;
+///   * `<project>/.purzig/purzig` and `<project>/.purzig/spago` -- the same
+///     shim again, and a wrapper that puts its directory on `PATH` and then
+///     runs the real `spago`. This is the answer to "a hand run disagrees with
+///     a purzig run on the same tree" (issue #31, part 3):
+///     `<project>/.purzig/spago build` is the manual invocation that matches,
+///     and the failure reporter NAMES this wrapper when `spago build` failed
+///     because no backend was reachable at all -- which an unexplained
+///     `Failed to build with backend purzig` never did.
+///
+/// `packages.json` comes from purzig's own tree (`pb`), the shim directory from
+/// the caller's (`b`): the set must be the pinned one, the cache is the
+/// caller's.
+pub fn addProjectSetup(b: *std.Build, opts: Options) *std.Build.Step {
+    const pb = if (opts.purzig) |dep| dep.builder else b;
+    const project = opts.project orelse b.path(".");
+    const bin_dir = shimDir(b);
+    const bundle = absFromRoot(pb, "compiler/dist/bundle.js");
+
+    // Both of these run through the same reporter as every other command
+    // purzig runs: a shim that cannot be written, or a package set that cannot
+    // be copied, prints what `sh` said instead of only "failed command".
+    //
+    // Written to a temporary name and renamed: every codegen run in a build
+    // shares this directory, so two steps may write the shim at the same time.
+    // A rename is never observed half-written; a `>` in place can be.
+    const shim = addReportedCommand(b, .{
+        .label = "purzig backend shim",
+        .project = project,
+        .argv = &.{
+            "sh", "-c",
+            b.fmt(
+                "set -e; mkdir -p '{s}'; " ++
+                    "printf '#!/bin/sh\\nexec node \"{s}\" \"$@\"\\n' > '{s}/purzig.tmp'; " ++
+                    "chmod +x '{s}/purzig.tmp'; mv -f '{s}/purzig.tmp' '{s}/purzig'",
+                .{ bin_dir, bundle, bin_dir, bin_dir, bin_dir, bin_dir },
+            ),
+            "sh",
+        },
+        .purzig = opts.purzig,
+    });
+
+    // POSIX sh only, positional arguments only: the project directory is this
+    // step's cwd, so `$1` is purzig's `packages.json` and `$2` the bundle, and
+    // no path has to be quoted into the script text.
+    const setup_script: []const u8 =
+        \\set -e
+        \\mkdir -p .purzig
+        \\cp "$1" .purzig/packages.json 2>/dev/null || true
+        \\printf '#!/bin/sh\\nexec node "%s" "$@"\\n' "$2" > .purzig/purzig.tmp
+        \\chmod +x .purzig/purzig.tmp
+        \\mv -f .purzig/purzig.tmp .purzig/purzig
+        \\printf '#!/bin/sh\\nPATH="%s:$PATH"\\nexport PATH\\nexec spago "$@"\\n' "$(pwd -P)/.purzig" > .purzig/spago.tmp
+        \\chmod +x .purzig/spago.tmp
+        \\mv -f .purzig/spago.tmp .purzig/spago
+    ;
+
+    const set = addReportedCommand(b, .{
+        .label = "purzig project setup",
+        .project = project,
+        .argv = &.{
+            "sh", "-c", setup_script, "sh",
+            absFromRoot(pb, "packages.json"),
+            bundle,
+        },
+        .purzig = opts.purzig,
+    });
+    set.step.dependOn(&shim.step);
+    return &set.step;
+}
+
+/// How to run an external command so that a failure explains itself. See
+/// `addReportedCommand`.
+pub const ReportedCommand = struct {
+    /// Name used in the markers and in the phase sentence: `spago build`.
+    label: []const u8,
+
+    /// Directory the command runs in, as for `Options.project`.
+    project: std.Build.LazyPath,
+
+    /// The command and its arguments, e.g. `&.{ "spago", "build" }`.
+    argv: []const []const u8,
+
+    /// When set, a run that EXITS 0 must still have produced
+    /// `output-zig/<main_module>.zig`. The `missing artifact` phase exists
+    /// because a backend that finishes cleanly can leave the build with
+    /// nothing to compile, and the Zig error that follows names a file inside
+    /// generated code rather than the cause.
+    main_module: ?[]const u8 = null,
+
+    /// Assertion mode, for a gate: the command is EXPECTED to fail, every
+    /// `require` string and `require_re` expression must appear in the report,
+    /// and the step succeeds only then. `build.zig`'s `test-diagnostics` uses
+    /// it, so the text the gate asserts is the text a user reads -- same
+    /// script, same phase names, same markers.
+    expect_failure: bool = false,
+    require: []const []const u8 = &.{},
+    require_re: []const []const u8 = &.{},
+
+    /// As `Options.purzig`: purzig's own tree is where the reporter and the
+    /// bundle live, and a downstream caller's builder cannot see them.
+    purzig: ?*std.Build.Dependency = null,
+};
+
+/// Run an external command through purzig's failure reporter
+/// (`build/purzig-run.sh`).
+///
+/// The reporter merges the child's stdout and stderr -- in the order the child
+/// wrote them -- into one file, and on failure prints the whole thing between
+/// markers:
+///
+/// ```
+/// --- purzig: `spago build` failed (exit 1) — output follows ---
+/// purzig: type-check failure — purs rejected the source, ...
+/// --- `spago build` output ---
+/// [ERROR 1/1 ModuleNotFound] src/Main.purs:8:1
+/// ...
+/// --- end of `spago build` output ---
+/// ```
+///
+/// Nothing is truncated. On success nothing is printed at all, which is the
+/// other half of the contract: a green build's log does not change.
+pub fn addReportedCommand(b: *std.Build, cmd: ReportedCommand) *std.Build.Step.Run {
+    const pb = if (cmd.purzig) |dep| dep.builder else b;
+    const reporter = absFromRoot(pb, "build/purzig-run.sh");
+
+    const run = b.addSystemCommand(&.{ "sh", reporter });
+    run.addArgs(&.{ "--label", cmd.label, "--shim-dir", shimDir(b) });
+    if (cmd.main_module) |m| run.addArgs(&.{ "--main-module", m });
+    if (cmd.expect_failure) run.addArg("--expect-failure");
+    for (cmd.require) |needle| run.addArgs(&.{ "--require", needle });
+    for (cmd.require_re) |re| run.addArgs(&.{ "--require-re", re });
+    run.addArg("--");
+    run.addArgs(cmd.argv);
+
+    run.setCwd(cmd.project);
+    // The shim is reached by NAME, because `spago.yaml` says `cmd: purzig`.
+    run.addPathDir(shimDir(b));
+    // spago writes into its own project tree, which Zig does not model.
+    run.has_side_effects = true;
+    // The build summary should name what failed (`run spago build`), not
+    // `run sh`: a summary line is part of the diagnostic.
+    run.setName(b.fmt("run {s}", .{cmd.label}));
+    return run;
 }
 
 pub fn addExecutable(b: *std.Build, opts: Options) Artifacts {

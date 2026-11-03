@@ -1,0 +1,28 @@
+# FILE: example/diagnostics/missing-import/spago.yaml
+#
+# Fixture for issue #31, case 1 -- a TYPE-CHECK failure.
+#
+# `src/Main.purs` imports `Data.Array` on purpose while this project does not
+# declare `arrays`, so purs cannot find the module and reports
+#
+#     [ERROR 1/1 ModuleNotFound] src/Main.purs:9:1
+#       Module Data.Array was not found.
+#
+# `zig build test-diagnostics` asserts that purzig PRINTS that: the module name,
+# the file, and the line:column. Before issue #31 all a build said was
+# `run spago failure`, and a consumer's first mistyped import cost two repair
+# round trips.
+#
+# No `extraPackages` and no dependencies: this fixture needs a package to be
+# MISSING, not resolved, so it stays offline and takes no time. The package set
+# is named anyway, because a consumer's config does and because purzig copies it
+# into `.purzig/packages.json` before spago starts -- a manual `spago build` in
+# this directory needs it for the same reason.
+package:
+  name: purzig-diagnostics-missing-import
+  dependencies: []
+workspace:
+  packageSet:
+    path: .purzig/packages.json
+  backend:
+    cmd: purzig
