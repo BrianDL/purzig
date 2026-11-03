@@ -297,6 +297,117 @@ test "currying through a captured environment" {
     try std.testing.expectEqual(@as(i32, 5), result.asInt());
 }
 
+// A curried function of any arity, in the same shape as `addTakeFirst` above:
+// one argument in, and -- while arguments remain -- a fresh closure over the
+// running total, built with the runtime's own constructors. Arguments are
+// accumulated as decimal digits, so the result spells out the ORDER they were
+// applied in: 123 for `1, 2, 3`, and 321 for the same values the other way
+// round. Order is what a fold can get wrong and a sum cannot reveal.
+fn digitsCurried(env: []const Value, argument: Value) Error!Value {
+    const remaining = env[0].asInt();
+    const total = Value.mkInt(env[1].asInt() * 10 + argument.asInt());
+    if (remaining == 1) return total;
+    return Value.mkClosure(digitsCurried, copyValues(&.{ Value.mkInt(remaining - 1), total }));
+}
+
+// The starting value: no arguments consumed yet, nothing accumulated.
+fn curriedDigits(arity: i32) Value {
+    return Value.mkClosure(digitsCurried, copyValues(&.{ Value.mkInt(arity), Value.mkInt(0) }));
+}
+
+test "applyN with one argument agrees with plain application" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const inc = Value.mkClosure(incBody, value.no_env);
+
+    // The fixed arities are the reference: one argument through `applyN` is
+    // one `apply`, nothing more and nothing less.
+    try std.testing.expectEqual(
+        (try apply(inc, Value.mkInt(5))).asInt(),
+        (try applyN(inc, &.{Value.mkInt(5)})).asInt(),
+    );
+    try std.testing.expectEqual(@as(i32, 6), (try applyN(inc, &.{Value.mkInt(5)})).asInt());
+
+    // One argument saturates a curried function of arity one.
+    const one = curriedDigits(1);
+    try std.testing.expectEqual(@as(i32, 7), (try applyN(one, &.{Value.mkInt(7)})).asInt());
+}
+
+test "applyN with two arguments agrees with apply2" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const two = curriedDigits(2);
+    const args = [_]Value{ Value.mkInt(1), Value.mkInt(2) };
+
+    // Left to right: 12, not 21.
+    try std.testing.expectEqual(@as(i32, 12), (try applyN(two, &args)).asInt());
+    try std.testing.expectEqual(
+        (try apply2(two, args[0], args[1])).asInt(),
+        (try applyN(two, &args)).asInt(),
+    );
+}
+
+test "applyN with three arguments agrees with apply3" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const three = curriedDigits(3);
+    const args = [_]Value{ Value.mkInt(1), Value.mkInt(2), Value.mkInt(3) };
+
+    // Left to right: 123, not 321.
+    try std.testing.expectEqual(@as(i32, 123), (try applyN(three, &args)).asInt());
+
+    // The variadic fold and the fixed arity, on the same input. Never compare
+    // the two alone: both could be wrong together. The literal above anchors
+    // `applyN`, and `apply3` is the reference this must not drift from.
+    try std.testing.expectEqual(
+        (try apply3(three, args[0], args[1], args[2])).asInt(),
+        (try applyN(three, &args)).asInt(),
+    );
+}
+
+test "applyN with four arguments reaches a curried function of arity four" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    // One argument past the highest fixed arity -- the case the old surface
+    // could not say at all.
+    const four = curriedDigits(4);
+    const args = [_]Value{ Value.mkInt(1), Value.mkInt(2), Value.mkInt(3), Value.mkInt(4) };
+
+    // Left to right: 1234.
+    try std.testing.expectEqual(@as(i32, 1234), (try applyN(four, &args)).asInt());
+
+    // The same fold as the fixed arities can spell: `apply3`, then one `apply`.
+    const viaFixed = try apply(try apply3(four, args[0], args[1], args[2]), args[3]);
+    try std.testing.expectEqual(viaFixed.asInt(), (try applyN(four, &args)).asInt());
+}
+
+test "applyN with no arguments returns the function itself" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    init(std.testing.io, arena.allocator());
+
+    const add = Value.mkClosure(addTakeFirst, copyValues(&.{Value.mkInt(2)}));
+    const same = try applyN(add, &.{});
+
+    // Identity, not a lookalike: the same body over the same captured
+    // environment, so an `applyN` that returned a unit, a fresh closure, or
+    // one application of something fails here instead of merely not crashing.
+    try std.testing.expectEqual(add.closure.func, same.closure.func);
+    try std.testing.expectEqual(add.closure.env.len, same.closure.env.len);
+    try std.testing.expect(add.closure.env.ptr == same.closure.env.ptr);
+
+    // Unchanged also in behaviour: still the two-argument add it was.
+    try std.testing.expectEqual(@as(i32, 5), (try apply2(same, Value.mkInt(2), Value.mkInt(3))).asInt());
+}
+
 fn throwBody(env: []const Value, argument: Value) Error!Value {
     _ = env;
     return throwValue(argument);
