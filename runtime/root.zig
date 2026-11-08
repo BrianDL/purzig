@@ -68,8 +68,18 @@ pub const newMutArray = marray_mod.newMutArray;
 /// contract stays fixed while everything above may be rewritten.
 pub const abi = @import("abi.zig");
 
+/// The canonical byte form of `Value`: `version`, `MAX_DEPTH`, `Error`, the
+/// `tag` table, `Writer`/`Reader`, `encode`, `encodeTo` and `decode`. A property
+/// of the value representation rather than of any one consumer, so it is a
+/// module of the surface: a host that has to hand a `Value` to a compiled
+/// program, or read one back, needs nothing else. Pure Zig with an
+/// allocator passed in -- no `std.Io`, no process -- so it also compiles
+/// unchanged on a freestanding target.
+pub const valuecodec = @import("valuecodec.zig");
+
 test {
     _ = value;
+    _ = valuecodec;
     _ = apply_mod;
     _ = curry_mod;
     _ = lazy_mod;

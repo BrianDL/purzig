@@ -428,6 +428,33 @@ pub fn build(b: *std.Build) void {
         diag_step.dependOn(&probe.step);
     }
 
+    // -----------------------------------------------------------------
+    // The canonical value codec (issue #45).
+    //
+    // `runtime/valuecodec.zig` is the byte form of `rt.Value`, moved here from
+    // the consumer that used to carry the only copy. Its tests are pure Zig:
+    // no purs, spago, node, wasm runtime or `std.Io`, so this step is the cheap
+    // one to run while editing the codec, and the one that says the wire format
+    // still is what the format's docs say it is.
+    //
+    // `test-runtime` runs the SAME tests as well: `runtime/root.zig` imports
+    // the codec in its `test` block, so `zig build test` (which depends on
+    // `addRuntimeTests`) cannot go green without them. This step adds the
+    // narrower entry point, not a second copy of the coverage.
+    // -----------------------------------------------------------------
+
+    const codec_root = b.createModule(.{
+        .root_source_file = b.path("runtime/valuecodec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const codec_tests = b.addTest(.{ .root_module = codec_root });
+    const run_codec_tests = b.addRunArtifact(codec_tests);
+
+    const valuecodec_step = b.step("test-valuecodec", "Test the canonical value codec alone (no purs, spago or node)");
+    valuecodec_step.dependOn(&run_codec_tests.step);
+
     const run_runtime_tests = purzig.addRuntimeTests(b, opts);
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
