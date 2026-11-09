@@ -11,8 +11,14 @@
 //!     hands back the generated module `output-zig/<main_module>.zig` with the
 //!     runtime bound, and the caller decides what to root at it: its own
 //!     `main`, a test harness, a wasm host, or nothing at all.
+//!   * `addTool` -- the same codegen again, plus a CLI: a library's exports
+//!     reachable from a shell, `<tool> run <export> [<infile>]` (issue #45).
+//!     `entry/tool.zig` is the program (shipped, not generated, like the
+//!     entry), and the names it answers to arrive as a `tool_registry` module
+//!     written into the cache. Always the HOST target: a tool is made to be run
+//!     by the build that built it.
 //!
-//! Both shapes start here:
+//! All shapes start here:
 //!
 //!   1. A `purzig` executable must exist on PATH, because the user's
 //!      `spago.yaml` says `backend: { cmd: purzig }` and spago resolves that
@@ -504,6 +510,228 @@ pub fn addLibrary(b: *std.Build, opts: Options) LibraryArtifacts {
         .modules = gen.modules,
         .module_main = gen.main,
     };
+}
+
+/// What `addTool` hands back.
+///
+/// Deliberately not `Artifacts`: there is no `module_main` to hand out (a tool
+/// is not something a caller roots anything at), and the exe is already
+/// installed, which `Artifacts.exe` is not.
+pub const ToolArtifacts = struct {
+    /// The linked CLI, already installed (`b.installArtifact`): a tool exists to
+    /// be run from a shell, and leaving that line to the caller would make
+    /// "forgot to install" a downstream bug report.
+    exe: *std.Build.Step.Compile,
+
+    /// The `spago build` invocation, exactly as `Artifacts.codegen`: exposed so
+    /// an in-repo build can order it after building the backend from source.
+    /// `addTool` already orders the exe after it.
+    codegen: *std.Build.Step.Run,
+
+    /// The Zig runtime module, exactly as `Artifacts.runtime`.
+    runtime: *std.Build.Module,
+};
+
+/// The tool's own options. No `target`: a tool is always built for the HOST.
+///
+/// The reason is not convenience. A tool is the shape you reach for when the
+/// BUILD needs to call PureScript -- generate a file, check a golden output,
+/// seed a database -- so the binary has to run where the build runs. Building it
+/// for `opts.target` would produce a cross-compiled CLI that the very step
+/// wanting it cannot execute.
+///
+/// `exports` is the one field `Options` has no analogue for: the names the CLI
+/// accepts, in `list` order. It is spelled out rather than read from
+/// `output-zig/manifest.json` because a build script cannot read it (see
+/// `Options.extra_modules`) -- and because a name you did not write down is a
+/// name this tool should refuse.
+pub const ToolOptions = struct {
+    /// The installed binary's name, and the word `--version` prints before the
+    /// version.
+    name: []const u8,
+
+    /// Directory containing `spago.yaml`. Defaults to the build root.
+    project: ?std.Build.LazyPath = null,
+
+    /// PureScript module the exports belong to first. Also the module `run`
+    /// looks a name up in before trying `extra_modules`.
+    main_module: []const u8 = "Main",
+
+    /// Further PureScript modules whose decls `run` may name, on top of
+    /// `main_module`. Same meaning as in `Options`, and the first module to
+    /// have the decl wins.
+    extra_modules: []const []const u8 = &.{},
+
+    /// The decls `<tool> list` prints and `<tool> run` accepts, in order. Each
+    /// is a top-level PureScript binding of `main_module` (or of one of
+    /// `extra_modules`): `&.{ "encode", "decode", "empty" }`.
+    exports: []const []const u8,
+
+    optimize: std.builtin.OptimizeMode,
+
+    /// The purzig dependency, from `b.dependency("purzig", .{})`.
+    /// Leave null only when `b` *is* purzig.
+    purzig: ?*std.Build.Dependency = null,
+};
+
+/// purzig's version, as `<tool> --version` reports it. Must track
+/// `build.zig.zon`'s `.version`: nothing reads that field at configure time.
+pub const version: []const u8 = "0.3.0";
+
+/// A library, plus the CLI that runs it: codegen as usual, then
+/// `entry/tool.zig` rooted at an executable that reaches the generated modules
+/// through a generated registry, installed so the caller (or its build graph)
+/// can run it.
+///
+/// What this writes, and where: the registry source goes through
+/// `b.addWriteFiles()`, so it lands in the build cache and never in the
+/// consumer's tree. Codegen still writes `output-zig/` and `.purzig/` beside
+/// the project, exactly as every other shape does -- that is codegen's contract,
+/// not this function's -- and the only artifact `addTool` itself produces is the
+/// installed binary.
+///
+/// ```zig
+/// const tool = purzig.addTool(b, .{
+///     .name = "todomvc-tool",
+///     .project = b.path("api"),
+///     .exports = &.{ "encode", "decode", "empty" },
+///     .optimize = optimize,
+///     .purzig = purzig_dep,
+/// });
+/// const run = b.addRunArtifact(tool.exe);
+/// run.addArg("empty");
+/// ```
+pub fn addTool(b: *std.Build, opts: ToolOptions) ToolArtifacts {
+    // HOST, always -- see `ToolOptions`. Not `opts.target`, which is why this
+    // struct does not have one.
+    const target = b.graph.host;
+
+    const gen = addCodegen(b, .{
+        .name = opts.name,
+        .main_module = opts.main_module,
+        .extra_modules = opts.extra_modules,
+        .project = opts.project,
+        .target = target,
+        .optimize = opts.optimize,
+        .purzig = opts.purzig,
+    });
+
+    // purzig's own files resolve against purzig's builder; see `addCodegen`.
+    const pb = if (opts.purzig) |dep| dep.builder else b;
+
+    // ---- the registry: what the shipped entry cannot know ----------------
+
+    // Cache, not project: a codegen run leaves `output-zig/` in the user's
+    // tree, and a tool must not add a second kind of litter beside it.
+    const write_registry = b.addWriteFiles();
+    const registry_file = write_registry.add("purzig_tool_registry.zig", registrySource(b, opts));
+
+    const registry = b.createModule(.{
+        .root_source_file = registry_file,
+        .target = target,
+        .optimize = opts.optimize,
+    });
+    registry.addImport("purs_main", gen.main);
+    for (opts.extra_modules, 0..) |_, i| {
+        registry.addImport(b.fmt("purzig_mod_{d}", .{i}), gen.modules.mods[i]);
+    }
+
+    // ---- the shipped entry ------------------------------------------------
+
+    // `entry/tool.zig` IS the program, byte for byte -- rooted where it lives
+    // rather than embedded and copied into the cache, because unlike
+    // `entry/entry.zig` it has nothing to substitute and no reason to be
+    // duplicated. Its imports are module bindings (`runtime`, `tool_registry`),
+    // so the file's own location in the dependency is irrelevant to them.
+    const root = b.createModule(.{
+        .root_source_file = pb.path("entry/tool.zig"),
+        .target = target,
+        .optimize = opts.optimize,
+    });
+    root.addImport("runtime", gen.runtime);
+    root.addImport("tool_registry", registry);
+
+    const exe = b.addExecutable(.{
+        .name = opts.name,
+        .root_module = root,
+    });
+    exe.step.dependOn(&gen.codegen.step);
+    b.installArtifact(exe);
+
+    return .{ .exe = exe, .codegen = gen.codegen, .runtime = gen.runtime };
+}
+
+/// The registry module's source text. Generated because it is the one place
+/// that knows both halves: the names the caller configured, and the generated
+/// modules that carry them.
+///
+/// It is a table, not code. `entry/tool.zig` does the resolving at comptime
+/// (`@hasDecl(m.mod, "ps." ++ name)`), so a name that the codegen did not emit
+/// is a runtime "no such export" rather than a build failure -- the consumer's
+/// `.exports` list and the codegen's output are allowed to disagree, and
+/// diagnosing that is the tool's job.
+fn registrySource(b: *std.Build, opts: ToolOptions) []const u8 {
+    const a = b.allocator;
+    var out: std.ArrayList(u8) = .empty;
+
+    append(&out, a,
+        \\//! GENERATED by purzig's `addTool` into the build cache. Do not edit.
+        \\//!
+        \\//! What `entry/tool.zig` cannot know by itself: the names it answers to,
+        \\//! the version it reports, and which generated modules to look those
+        \\//! names up in. The entry is shipped source compiled as-is, so this
+        \\//! table arrives as a module instead of being substituted into it.
+        \\
+        \\const purs_main = @import("purs_main");
+        \\
+    );
+
+    for (opts.extra_modules, 0..) |_, i| {
+        appendFmt(&out, a, "const purzig_mod_{d} = @import(\"purzig_mod_{d}\");\n", .{ i, i });
+    }
+    append(&out, a,
+        \\
+        \\/// One generated module, and the PureScript module it was compiled from.
+        \\pub const NamedModule = struct {
+        \\    name: []const u8,
+        \\    /// A TYPE, not a value: this struct only ever lives at comptime.
+        \\    mod: type,
+        \\};
+        \\
+        \\/// In lookup order: the export's own module first, then `extra_modules`.
+        \\pub const modules = [_]NamedModule{
+        \\
+    );
+    appendFmt(&out, a, "    .{{ .name = \"{s}\", .mod = purs_main }},\n", .{opts.main_module});
+    for (opts.extra_modules, 0..) |name, i| {
+        appendFmt(&out, a, "    .{{ .name = \"{s}\", .mod = purzig_mod_{d} }},\n", .{ name, i });
+    }
+
+    appendFmt(&out, a,
+        \\}};
+        \\
+        \\/// `--version` prints `<tool_name> <version>`.
+        \\pub const tool_name: []const u8 = "{s}";
+        \\pub const version: []const u8 = "{s}";
+        \\
+        \\/// `list` prints these one per line, in this order; `run` accepts no
+        \\/// other name.
+        \\pub const exports = [_][]const u8{{
+        \\
+    , .{ opts.name, version });
+    for (opts.exports) |name| appendFmt(&out, a, "    \"{s}\",\n", .{name});
+    append(&out, a, "};\n");
+
+    return out.items;
+}
+
+fn append(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) void {
+    out.appendSlice(allocator, text) catch @panic("purzig: out of memory");
+}
+
+fn appendFmt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    const text = std.fmt.allocPrint(allocator, fmt, args) catch @panic("purzig: out of memory");
+    append(out, allocator, text);
 }
 
 /// Tests for the hand-written Zig runtime. Needs no purs, spago or node, so it

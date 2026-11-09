@@ -29,3 +29,11 @@ main = do
 -- | `main`'s output is unaffected.
 echo :: String -> String
 echo s = s <> "!"
+
+-- | The tool fixture's ZERO-argument export (issue #45): `example-tool run seed`
+-- | is called with no input bytes at all, and its value becomes the output
+-- | bytes. `Unit` is the smallest thing the codec can encode and the realistic
+-- | seed file -- it says the pipeline reached here and nothing more -- so it is
+-- | what `zig build test-tool` asserts two bytes for. `main` is unaffected.
+seed :: Unit
+seed = unit

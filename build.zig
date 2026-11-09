@@ -13,9 +13,13 @@ const purzig = @import("build/purzig.zig");
 pub const Options = purzig.Options;
 pub const Artifacts = purzig.Artifacts;
 pub const LibraryArtifacts = purzig.LibraryArtifacts;
+pub const ToolOptions = purzig.ToolOptions;
+pub const ToolArtifacts = purzig.ToolArtifacts;
 pub const addExecutable = purzig.addExecutable;
 pub const addLibrary = purzig.addLibrary;
+pub const addTool = purzig.addTool;
 pub const addRuntimeTests = purzig.addRuntimeTests;
+pub const version = purzig.version;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -459,6 +463,91 @@ pub fn build(b: *std.Build) void {
     const runtime_step = b.step("test-runtime", "Test the hand-written Zig runtime");
     runtime_step.dependOn(&run_runtime_tests.step);
 
+    // -----------------------------------------------------------------
+    // The tool (issue #45, part 2): a compiled export, run from a shell.
+    //
+    // Same codegen as the library above, plus `entry/tool.zig`: a CLI that
+    // takes `<export> [<infile>]`, codec-decodes the input into a `rt.Value`,
+    // applies the export and codec-encodes the result to stdout. The gate runs
+    // the binary from THIS build graph and asserts the exact bytes on stdout,
+    // because "the tool works" means the pipe does -- the codec's own tests
+    // already say the codec does -- and a byte vector that is wrong by one is
+    // the failure mode a compile check cannot see.
+    //
+    // `seed` and `greet` are `Main`'s: one zero-argument export (no input bytes
+    // at all means no arguments) and one one-argument export, so the gate
+    // covers both halves of the arity rule. Nothing else in `Main` changes, so
+    // `test-e2e`'s `Hello, Zig` is unaffected.
+    // -----------------------------------------------------------------
+
+    const tool = purzig.addTool(b, .{
+        .name = "example-tool",
+        .project = b.path("example"),
+        .main_module = "Main",
+        .exports = &.{ "seed", "greet" },
+        .optimize = optimize,
+        // .purzig stays null: here, b IS purzig.
+    });
+
+    // Same ordering as every other codegen run in this file: our bundle is
+    // built from source, and all of them run `spago build` in the one
+    // `example/` project directory.
+    tool.codegen.step.dependOn(&build_compiler.step);
+    tool.codegen.step.dependOn(&app.codegen.step);
+
+    const tool_step = b.step("test-tool", "Run the example through the tool CLI and check its stdout bytes");
+
+    // `list`: the `.exports` names, one per line, in the order they were given.
+    const tool_list = b.addRunArtifact(tool.exe);
+    tool_list.addArg("list");
+    tool_list.expectStdOutEqual("seed\ngreet\n");
+    tool_step.dependOn(&tool_list.step);
+
+    // `--version`: the name and purzig's version, nothing else.
+    const tool_version = b.addRunArtifact(tool.exe);
+    tool_version.addArg("--version");
+    tool_version.expectStdOutEqual(b.fmt("example-tool {s}\n", .{purzig.version}));
+    tool_step.dependOn(&tool_version.step);
+
+    // `run seed` with no input at all: zero arguments, so the export's VALUE is
+    // the output. `seed :: Unit` is the codec's `0x01` version byte and `0x00`
+    // for the unit tag -- two bytes out of an empty stdin, which is what "this
+    // pipeline ran" looks like as a file.
+    const tool_seed = b.addRunArtifact(tool.exe);
+    tool_seed.addArgs(&.{ "run", "seed" });
+    tool_seed.expectStdOutEqual("\x01\x00");
+    tool_step.dependOn(&tool_seed.step);
+
+    // `run greet <infile>`: one codec value in, one codec value out. The infile
+    // is the codec's own bytes for the string `hi` -- version, string tag, a
+    // 4-byte little-endian length, then UTF-8 -- and `greet` returns
+    // `Hello, hi`, so the expectation is the same shape with a longer payload.
+    // Written through `addWriteFiles`, so the fixture bytes come from this file
+    // rather than from a checked-in binary.
+    const greet_in = b.addWriteFiles().add("greet-arg.bin", "\x01\x04\x02\x00\x00\x00hi");
+    const tool_greet = b.addRunArtifact(tool.exe);
+    tool_greet.addArgs(&.{ "run", "greet" });
+    tool_greet.addFileArg(greet_in);
+    tool_greet.expectStdOutEqual("\x01\x04\x09\x00\x00\x00Hello, hi");
+    tool_step.dependOn(&tool_greet.step);
+
+    // A name that `.exports` does not contain is exit 2, and stderr names it.
+    // The exit code is what a shell script branches on; the text is asserted by
+    // the consumer-side fixture, which is where a tool's stderr is read.
+    const tool_unknown = b.addRunArtifact(tool.exe);
+    tool_unknown.addArgs(&.{ "run", "nonexistent" });
+    tool_unknown.expectExitCode(2);
+    tool_step.dependOn(&tool_unknown.step);
+
+    // A buffer whose first byte is not the codec's `0x01` is a refusal, not a
+    // wrong answer: exit 1, and nothing on stdout.
+    const stale_in = b.addWriteFiles().add("stale-version.bin", "\x02\x00");
+    const tool_stale = b.addRunArtifact(tool.exe);
+    tool_stale.addArgs(&.{ "run", "greet" });
+    tool_stale.addFileArg(stale_in);
+    tool_stale.expectExitCode(1);
+    tool_step.dependOn(&tool_stale.step);
+
     const all_tests = b.step("test", "Run every check");
     all_tests.dependOn(&run_runtime_tests.step);
     all_tests.dependOn(&check_generated.step);
@@ -470,6 +559,7 @@ pub fn build(b: *std.Build) void {
     // nobody runs is the complaint that produced it.
     all_tests.dependOn(diag_step);
     all_tests.dependOn(&abi_raw.step);
+    all_tests.dependOn(tool_step);
 
     // -----------------------------------------------------------------
     // The package set. Regenerate and commit whenever `packages/` changes,
